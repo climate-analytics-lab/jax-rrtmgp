@@ -33,6 +33,14 @@ dev = [
     "parameterized"
 ]
 
+[tool.setuptools.package-data]
+rrtmgp = [
+    "optics/rrtmgp_data/*.nc",
+    "optics/test_data/*.json",
+    "optics/test_data/*.csv",
+    "optics/test_data/*.nc",
+]
+
 [project.urls]
 homepage = "https://github.com/climate-analytics-lab/jax-rrtmgp"
 repository = "https://github.com/climate-analytics-lab/jax-rrtmgp"
