@@ -14,6 +14,7 @@
 
 """Implementation of a radiative transfer solver."""
 
+import dataclasses
 from collections.abc import Sequence
 from typing import TypeAlias
 
@@ -117,6 +118,8 @@ class RRTMGP:
       p_ref_xxc: Array,
       sg_map: dict[str, Array],
       use_scan: bool = False,
+      zenith: float | None = None,
+      irrad: float | None = None,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -136,6 +139,14 @@ class RRTMGP:
         'lw_flux_up_full': Full longwave upward flux profile [W/m²]
         'lw_flux_down_full': Full longwave downward flux profile [W/m²]
     """
+    atm_state = self.atmospheric_state
+    if zenith is not None or irrad is not None:
+      atm_state = dataclasses.replace(
+          atm_state,
+          **({"zenith": zenith} if zenith is not None else {}),
+          **({"irrad": irrad} if irrad is not None else {}),
+      )
+
     # Temperature may have NaNs in the halos (this is intentional).  These NaNs
     # cause problems later on, so fill in the halo values with linear
     # extrapolations.  Note that NaNs in other fields do not cause issues
@@ -161,7 +172,7 @@ class RRTMGP:
     q_c = jnp.clip(q_c, 0.0, None)
 
     # Reconstruct the volume mixing ratio (vmr) of relevant gas species.
-    vmr_lib = self.atmospheric_state.vmr
+    vmr_lib = atm_state.vmr
     vmr_fields = (
         lookup_volume_mixing_ratio.reconstruct_vmr_fields_from_pressure(
             vmr_lib, p_ref_xxc
@@ -182,7 +193,7 @@ class RRTMGP:
         temperature,
         molecules_per_area,
         self.optics_lib,
-        self.atmospheric_state,
+        atm_state,
         vmr_fields,
         sfc_temperature,
         cloud_r_eff_liq=cloud_r_eff_liq,
@@ -196,7 +207,7 @@ class RRTMGP:
         temperature,
         molecules_per_area,
         self.optics_lib,
-        self.atmospheric_state,
+        atm_state,
         vmr_fields,
         cloud_r_eff_liq=cloud_r_eff_liq,
         cloud_path_liq=liq_water_path,
@@ -267,7 +278,7 @@ class RRTMGP:
           temperature,
           molecules_per_area,
           self.optics_lib,
-          self.atmospheric_state,
+          atm_state,
           vmr_fields,
           sfc_temperature,
           cloud_r_eff_liq=None,
@@ -281,7 +292,7 @@ class RRTMGP:
           temperature,
           molecules_per_area,
           self.optics_lib,
-          self.atmospheric_state,
+          atm_state,
           vmr_fields,
           cloud_r_eff_liq=None,
           cloud_path_liq=None,
