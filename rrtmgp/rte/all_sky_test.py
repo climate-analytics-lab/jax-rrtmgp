@@ -336,6 +336,115 @@ class AllSkyTest(unittest.TestCase):
         atol=0,
     )
 
+  def test_per_gpoint_cloud_path_reduces_to_broadcast(self):
+    """Per-g-point cloud paths must equal broadcast paths when sub-columns are
+    identical across all g-points.
+
+    This is the McICA-stratiform sanity check: if every stochastic sub-column
+    is the same as the mean cloud profile, McICA-style per-g-point inputs must
+    produce the same fluxes as the column-only API. Use the compact lookup
+    tables to keep n_gpt small enough for the broadcast to fit in memory.
+    """
+    site = 0
+    use_compact_lookup = True
+
+    (
+        pressure_allsites,
+        pressure_level_allsites,
+        temperature_allsites,
+        temperature_level_allsites,
+        vmr_profiles_allsites,
+        _,
+    ) = _setup_atmospheric_profiles()
+
+    radiation_params = _setup_radiation_params(use_compact_lookup)
+    atmos_state = atmospheric_state.from_config(
+        radiation_params.atmospheric_state_cfg
+    )
+    optics_lib = optics.optics_factory(radiation_params.optics, atmos_state.vmr)
+
+    n_horiz = 2
+    convert_to_3d = functools.partial(
+        test_util.convert_to_3d_array_and_tile, dim=2, num_repeats=n_horiz
+    )
+    sfc_temperature = temperature_level_allsites[site, 1] * jnp.ones(
+        (n_horiz, n_horiz), dtype=jnp.float_
+    )
+    vmr_fields = {
+        k: convert_to_3d(v[site, :]) for k, v in vmr_profiles_allsites.items()
+    }
+    p = convert_to_3d(pressure_allsites[site, :])
+    pressure_level = convert_to_3d(pressure_level_allsites[site, :])
+    temperature = convert_to_3d(temperature_allsites[site, :])
+
+    r_liq = 1.2e-5
+    r_ice = 9.5e-5 / 2
+    cld_path = 1e-2
+    ones = jnp.ones_like(p)
+    ind_valid_p_range = jnp.logical_and(p > 10000, p < 90000)
+    r_eff_liq = jnp.where(
+        jnp.logical_and(ind_valid_p_range, temperature > 263), r_liq * ones, 0.0
+    )
+    cld_path_liq = jnp.where(
+        jnp.logical_and(ind_valid_p_range, temperature > 263),
+        cld_path * ones,
+        0.0,
+    )
+    r_eff_ice = jnp.where(
+        jnp.logical_and(ind_valid_p_range, temperature < 273), r_ice * ones, 0.0
+    )
+    cld_path_ice = jnp.where(
+        jnp.logical_and(ind_valid_p_range, temperature < 273),
+        cld_path * ones,
+        0.0,
+    )
+
+    molecules = _air_molecules_per_area(pressure_level, vmr_fields['h2o'])
+
+    # Reference: column-only (broadcast) cloud paths.
+    ref_lw = two_stream.solve_lw(
+        p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+        sfc_temperature,
+        cloud_r_eff_liq=r_eff_liq, cloud_path_liq=cld_path_liq,
+        cloud_r_eff_ice=r_eff_ice, cloud_path_ice=cld_path_ice,
+    )
+    ref_sw = two_stream.solve_sw(
+        p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+        cloud_r_eff_liq=r_eff_liq, cloud_path_liq=cld_path_liq,
+        cloud_r_eff_ice=r_eff_ice, cloud_path_ice=cld_path_ice,
+    )
+
+    # Build per-g-point arrays by tiling the single profile across n_gpt.
+    n_gpt_lw = optics_lib.n_gpt_lw
+    n_gpt_sw = optics_lib.n_gpt_sw
+    cpl_lw_per_gpt = jnp.broadcast_to(cld_path_liq, (n_gpt_lw,) + cld_path_liq.shape)
+    cpi_lw_per_gpt = jnp.broadcast_to(cld_path_ice, (n_gpt_lw,) + cld_path_ice.shape)
+    cpl_sw_per_gpt = jnp.broadcast_to(cld_path_liq, (n_gpt_sw,) + cld_path_liq.shape)
+    cpi_sw_per_gpt = jnp.broadcast_to(cld_path_ice, (n_gpt_sw,) + cld_path_ice.shape)
+
+    # Per-g-point cloud paths must produce the same fluxes. Pass `None` for
+    # the broadcast paths to confirm precedence: the per-g-point input is the
+    # sole source of cloud condensate.
+    out_lw = two_stream.solve_lw(
+        p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+        sfc_temperature,
+        cloud_r_eff_liq=r_eff_liq, cloud_path_liq=None,
+        cloud_r_eff_ice=r_eff_ice, cloud_path_ice=None,
+        cloud_path_liq_per_gpt=cpl_lw_per_gpt,
+        cloud_path_ice_per_gpt=cpi_lw_per_gpt,
+    )
+    out_sw = two_stream.solve_sw(
+        p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+        cloud_r_eff_liq=r_eff_liq, cloud_path_liq=None,
+        cloud_r_eff_ice=r_eff_ice, cloud_path_ice=None,
+        cloud_path_liq_per_gpt=cpl_sw_per_gpt,
+        cloud_path_ice_per_gpt=cpi_sw_per_gpt,
+    )
+
+    for key in ('flux_up', 'flux_down', 'flux_net'):
+      np.testing.assert_allclose(out_lw[key], ref_lw[key], rtol=1e-6, atol=1e-6)
+      np.testing.assert_allclose(out_sw[key], ref_sw[key], rtol=1e-6, atol=1e-6)
+
 
 if __name__ == '__main__':
   unittest.main()

@@ -120,6 +120,10 @@ class RRTMGP:
       use_scan: bool = False,
       zenith: float | None = None,
       irrad: float | None = None,
+      cloud_path_liq_lw_per_gpt: Array | None = None,
+      cloud_path_ice_lw_per_gpt: Array | None = None,
+      cloud_path_liq_sw_per_gpt: Array | None = None,
+      cloud_path_ice_sw_per_gpt: Array | None = None,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -127,6 +131,13 @@ class RRTMGP:
     and the two-stream radiative transfer equation is solved for the net fluxes
     at the grid cell faces.  Based on the overall net radiative flux of the grid
     cell, a local heating rate is determined.
+
+    For canonical McICA, the caller can supply per-g-point cloud water paths
+    via `cloud_path_{liq,ice}_{lw,sw}_per_gpt`, each shaped
+    `[n_gpt_{lw,sw}, nx, ny, nz]`. When provided, these replace the broadcast
+    cloud paths derived from `q_liq` and `q_ice` inside the per-g-point loop,
+    so each g-point sees its own stochastic sub-column. The clear-sky branch
+    is unaffected.
 
     Returns:
       A dictionary containing the following keys:
@@ -201,6 +212,8 @@ class RRTMGP:
         cloud_r_eff_ice=cloud_r_eff_ice,
         cloud_path_ice=ice_water_path,
         use_scan=use_scan,
+        cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
+        cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
     )
     sw_fluxes = two_stream.solve_sw(
         p_ref_xxc,
@@ -214,6 +227,8 @@ class RRTMGP:
         cloud_r_eff_ice=cloud_r_eff_ice,
         cloud_path_ice=ice_water_path,
         use_scan=use_scan,
+        cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
+        cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
     )
 
     # Compute the heating rate in K/s.
