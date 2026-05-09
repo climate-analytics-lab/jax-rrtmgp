@@ -133,6 +133,8 @@ def solve_lw(
     cloud_r_eff_ice: Array | None = None,
     cloud_path_ice: Array | None = None,
     use_scan: bool = False,
+    cloud_path_liq_per_gpt: Array | None = None,
+    cloud_path_ice_per_gpt: Array | None = None,
 ) -> dict[str, Array]:
   """Solves two-stream radiative transfer equation over the longwave spectrum.
 
@@ -165,6 +167,12 @@ def solve_lw(
     cloud_path_ice: The cloud ice water path in each atmospheric grid cell
       [kg/m²].
     use_scan: Whether to use scan or for loops for the recurrent operation.
+    cloud_path_liq_per_gpt: Optional per-g-point cloud liquid water path with
+      leading axis of size `n_gpt_lw`, e.g. shape `[n_gpt_lw, nx, ny, nz]`.
+      When provided, the per-g-point slice replaces `cloud_path_liq` inside the
+      g-point loop. Intended for McICA, where the upstream sub-column generator
+      produces a separate binary cloud profile per g-point.
+    cloud_path_ice_per_gpt: Same as above, for ice water path.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -179,6 +187,16 @@ def solve_lw(
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_lw)
 
   def step_fn(igpt, cumulative_flux):
+    cpl = (
+        cloud_path_liq_per_gpt[igpt]
+        if cloud_path_liq_per_gpt is not None
+        else cloud_path_liq
+    )
+    cpi = (
+        cloud_path_ice_per_gpt[igpt]
+        if cloud_path_ice_per_gpt is not None
+        else cloud_path_ice
+    )
     optical_props_2stream = _compute_local_properties_lw(
         pressure,
         temperature,
@@ -188,9 +206,9 @@ def solve_lw(
         vmr_fields,
         sfc_temperature,
         cloud_r_eff_liq,
-        cloud_path_liq,
+        cpl,
         cloud_r_eff_ice,
-        cloud_path_ice,
+        cpi,
     )
 
     # Boundary conditions.
@@ -236,6 +254,8 @@ def solve_sw(
     cloud_r_eff_ice: Array | None = None,
     cloud_path_ice: Array | None = None,
     use_scan: bool = False,
+    cloud_path_liq_per_gpt: Array | None = None,
+    cloud_path_ice_per_gpt: Array | None = None,
 ) -> dict[str, Array]:
   """Solves the two-stream radiative transfer equation for shortwave.
 
@@ -264,6 +284,12 @@ def solve_sw(
     cloud_path_ice: The cloud ice water path in each atmospheric grid cell
       [kg/m²].
     use_scan: Whether to use scan or for loops for the recurrent operation.
+    cloud_path_liq_per_gpt: Optional per-g-point cloud liquid water path with
+      leading axis of size `n_gpt_sw`, e.g. shape `[n_gpt_sw, nx, ny, nz]`.
+      When provided, the per-g-point slice replaces `cloud_path_liq` inside the
+      g-point loop. Intended for McICA, where the upstream sub-column generator
+      produces a separate binary cloud profile per g-point.
+    cloud_path_ice_per_gpt: Same as above, for ice water path.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -279,6 +305,16 @@ def solve_sw(
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_sw)
 
   def step_fn(igpt, partial_fluxes):
+    cpl = (
+        cloud_path_liq_per_gpt[igpt]
+        if cloud_path_liq_per_gpt is not None
+        else cloud_path_liq
+    )
+    cpi = (
+        cloud_path_ice_per_gpt[igpt]
+        if cloud_path_ice_per_gpt is not None
+        else cloud_path_ice
+    )
     sw_optical_props = optics_lib.compute_sw_optical_properties(
         pressure,
         temperature,
@@ -286,9 +322,9 @@ def solve_sw(
         igpt,
         vmr_fields,
         cloud_r_eff_liq,
-        cloud_path_liq,
+        cpl,
         cloud_r_eff_ice,
-        cloud_path_ice,
+        cpi,
     )
     optical_props_2stream = monochromatic_two_stream.sw_cell_properties(
         zenith,
