@@ -14,6 +14,7 @@
 
 """End-to-end tests for `RRTMGP.compute_heating_rate`."""
 
+import dataclasses
 import functools
 from pathlib import Path
 from typing import TypeAlias
@@ -195,6 +196,112 @@ class RRTMGPVMROverrideTest(unittest.TestCase):
     np.testing.assert_array_equal(
         np.asarray(echoed[rrtmgp_common.KEY_STORED_RADIATION]),
         np.asarray(baseline[rrtmgp_common.KEY_STORED_RADIATION]),
+    )
+
+
+class RRTMGPAerosolTest(unittest.TestCase):
+  """Regression tests for the per-band aerosol_optics_{lw,sw} kwargs."""
+
+  def _make_zero_aerosol(self, n_bnd: int, shape: tuple[int, int, int]):
+    z = jnp.zeros((n_bnd,) + shape, dtype=jnp.float_)
+    return {'optical_depth': z, 'ssa': z, 'asymmetry_factor': z}
+
+  def test_zero_aerosol_matches_baseline(self):
+    """Passing an all-zero aerosol bundle is a no-op vs. not passing one."""
+    cfg = _build_radiative_transfer_cfg()
+    rt = rrtmgp.RRTMGP(cfg, dz=500.0)
+    inputs = _build_inputs()
+
+    baseline = rt.compute_heating_rate(**inputs)
+
+    shape = inputs['p_ref_xxc'].shape
+    aer_lw = self._make_zero_aerosol(rt.optics_lib.gas_optics_lw.n_bnd, shape)
+    aer_sw = self._make_zero_aerosol(rt.optics_lib.gas_optics_sw.n_bnd, shape)
+    zeroed = rt.compute_heating_rate(
+        **inputs, aerosol_optics_lw=aer_lw, aerosol_optics_sw=aer_sw
+    )
+
+    # Zero tau contributes nothing in combine_optical_properties — but the
+    # extra combination step touches the ssa via a `max(tau, EPSILON)` guard,
+    # so the two paths agree only to floating-point precision, not bit-exact.
+    np.testing.assert_allclose(
+        np.asarray(zeroed[rrtmgp_common.KEY_STORED_RADIATION]),
+        np.asarray(baseline[rrtmgp_common.KEY_STORED_RADIATION]),
+        rtol=1e-5,
+        atol=1e-9,
+    )
+
+  def test_sw_aerosol_reduces_surface_flux(self):
+    """Increasing SW aerosol optical depth must reduce the surface
+    down-flux (scattering + absorption attenuates the direct + diffuse beam).
+    """
+    cfg = dataclasses.replace(
+        _build_radiative_transfer_cfg(),
+        save_lw_sw_heating_rates=True,
+    )
+    rt = rrtmgp.RRTMGP(cfg, dz=500.0)
+    inputs = _build_inputs()
+
+    baseline = rt.compute_heating_rate(**inputs)
+
+    shape = inputs['p_ref_xxc'].shape
+    n_bnd_sw = rt.optics_lib.gas_optics_sw.n_bnd
+    # A modestly absorbing/scattering aerosol uniformly distributed in the
+    # column: tau=0.05 per layer per band, ssa=0.9, g=0.7. This is sulfate-ish
+    # and well above floating-point noise.
+    aer_sw = {
+        'optical_depth': 0.05 * jnp.ones((n_bnd_sw,) + shape, dtype=jnp.float_),
+        'ssa': 0.9 * jnp.ones((n_bnd_sw,) + shape, dtype=jnp.float_),
+        'asymmetry_factor': 0.7 * jnp.ones(
+            (n_bnd_sw,) + shape, dtype=jnp.float_
+        ),
+    }
+    perturbed = rt.compute_heating_rate(**inputs, aerosol_optics_sw=aer_sw)
+
+    # Surface SW down flux at the first physical level (above the surface halo)
+    # must drop when aerosols are added.
+    hw = 1
+    baseline_surf = np.asarray(baseline['sw_flux_down_full'][:, :, 0])
+    perturbed_surf = np.asarray(perturbed['sw_flux_down_full'][:, :, 0])
+    self.assertTrue(
+        np.all(perturbed_surf < baseline_surf),
+        msg=(
+            'SW aerosol did not reduce surface down-flux everywhere. '
+            f'min(baseline - perturbed) = {np.min(baseline_surf - perturbed_surf):.3e} W/m²'
+        ),
+    )
+    del hw
+
+  def test_lw_aerosol_changes_toa_outgoing(self):
+    """Adding an absorbing LW aerosol must change TOA outgoing LW flux."""
+    cfg = _build_radiative_transfer_cfg()
+    rt = rrtmgp.RRTMGP(cfg, dz=500.0)
+    inputs = _build_inputs()
+
+    baseline = rt.compute_heating_rate(**inputs)
+
+    shape = inputs['p_ref_xxc'].shape
+    n_bnd_lw = rt.optics_lib.gas_optics_lw.n_bnd
+    # Pure absorber: tau=0.1, ssa=0 (no scattering — typical for LW dust).
+    aer_lw = {
+        'optical_depth': 0.1 * jnp.ones((n_bnd_lw,) + shape, dtype=jnp.float_),
+        'ssa': jnp.zeros((n_bnd_lw,) + shape, dtype=jnp.float_),
+        'asymmetry_factor': jnp.zeros(
+            (n_bnd_lw,) + shape, dtype=jnp.float_
+        ),
+    }
+    perturbed = rt.compute_heating_rate(**inputs, aerosol_optics_lw=aer_lw)
+
+    baseline_toa = np.asarray(baseline['lw_flux_up_full'][:, :, -1])
+    perturbed_toa = np.asarray(perturbed['lw_flux_up_full'][:, :, -1])
+    max_diff = np.max(np.abs(baseline_toa - perturbed_toa))
+    self.assertGreater(
+        max_diff,
+        1e-3,
+        msg=(
+            'LW aerosol left TOA outgoing flux unchanged '
+            f'(max |Δ| = {max_diff:.3e} W/m²).'
+        ),
     )
 
 

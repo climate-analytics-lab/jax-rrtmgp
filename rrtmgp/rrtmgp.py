@@ -125,6 +125,8 @@ class RRTMGP:
       cloud_path_liq_sw_per_gpt: Array | None = None,
       cloud_path_ice_sw_per_gpt: Array | None = None,
       vmr_fields: dict[str, Array] | None = None,
+      aerosol_optics_lw: dict[str, Array] | None = None,
+      aerosol_optics_sw: dict[str, Array] | None = None,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -149,6 +151,15 @@ class RRTMGP:
     consistent with the simulation's humidity state; any caller-supplied
     `'h2o'` is therefore ignored. The same `vmr_fields` are used for the
     clear-sky diagnostic when enabled.
+
+    Per-band aerosol optical properties can be supplied via
+    `aerosol_optics_{lw,sw}`, each a dict with keys `'optical_depth'`, `'ssa'`,
+    and `'asymmetry_factor'`, each shaped `[n_bnd_{lw,sw}, nx, ny, nz]`. The
+    per-band slice is mixed in alongside the gas + cloud optical properties
+    using the mass-weighted combine inside the per-g-point loop. Values are
+    passed through unmodified (no delta-scaling). LW and SW are independent —
+    pass one or both. Aerosols are also applied to the clear-sky diagnostic
+    (CMIP convention: "clear-sky" = cloud-free, aerosols included).
 
     Returns:
       A dictionary containing the following keys:
@@ -232,6 +243,7 @@ class RRTMGP:
         use_scan=use_scan,
         cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
+        aerosol_optics=aerosol_optics_lw,
     )
     sw_fluxes = two_stream.solve_sw(
         p_ref_xxc,
@@ -247,6 +259,7 @@ class RRTMGP:
         use_scan=use_scan,
         cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
+        aerosol_optics=aerosol_optics_sw,
     )
 
     # Compute the heating rate in K/s.
@@ -319,6 +332,7 @@ class RRTMGP:
           cloud_r_eff_ice=None,
           cloud_path_ice=None,
           use_scan=use_scan,
+          aerosol_optics=aerosol_optics_lw,
       )
       sw_fluxes_clearsky = two_stream.solve_sw(
           p_ref_xxc,
@@ -332,6 +346,7 @@ class RRTMGP:
           cloud_r_eff_ice=None,
           cloud_path_ice=None,
           use_scan=use_scan,
+          aerosol_optics=aerosol_optics_sw,
       )
       # Compute the heating rate in K/s.
       lw_heating_rate_clearsky = two_stream.compute_heating_rate(
