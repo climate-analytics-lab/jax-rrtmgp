@@ -46,6 +46,7 @@ def _compute_local_properties_lw(
     cloud_path_liq: Array | None = None,
     cloud_r_eff_ice: Array | None = None,
     cloud_path_ice: Array | None = None,
+    aerosol_optics_slice: dict[str, Array] | None = None,
 ) -> dict[str, Array]:
   """Compute local optical properties for longwave radiative transfer."""
   if isinstance(sfc_temperature, float):
@@ -67,6 +68,14 @@ def _compute_local_properties_lw(
       cloud_r_eff_ice,
       cloud_path_ice,
   )
+
+  # Mix in aerosol contributions for this band, if supplied. Aerosol tau/ssa/g
+  # are passed through as-is (no delta-scaling applied), matching the convention
+  # of simple aerosol parameterisations.
+  if aerosol_optics_slice is not None:
+    lw_optical_props = optics_lib.combine_optical_properties(
+        lw_optical_props, aerosol_optics_slice
+    )
 
   # Compute Planck sources: `planck_src`, `planck_src_bottom`, `planck_src_top`,
   # and `planck_src_sfc`.
@@ -135,6 +144,7 @@ def solve_lw(
     use_scan: bool = False,
     cloud_path_liq_per_gpt: Array | None = None,
     cloud_path_ice_per_gpt: Array | None = None,
+    aerosol_optics: dict[str, Array] | None = None,
 ) -> dict[str, Array]:
   """Solves two-stream radiative transfer equation over the longwave spectrum.
 
@@ -173,6 +183,13 @@ def solve_lw(
       g-point loop. Intended for McICA, where the upstream sub-column generator
       produces a separate binary cloud profile per g-point.
     cloud_path_ice_per_gpt: Same as above, for ice water path.
+    aerosol_optics: Optional dictionary of per-band aerosol optical properties.
+      Must contain keys `'optical_depth'`, `'ssa'`, and `'asymmetry_factor'`,
+      each shaped `[n_bnd_lw, nx, ny, nz]`. The per-g-point band slice (using
+      `gas_optics_lw.g_point_to_bnd`) is combined with the gas+cloud optical
+      properties via the mass-weighted mix in
+      `OpticsScheme.combine_optical_properties`. Aerosol values are passed
+      through as-is (no delta-scaling). Requires the `RRTMOptics` scheme.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -186,6 +203,13 @@ def solve_lw(
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_lw)
 
+  if aerosol_optics is not None:
+    assert isinstance(optics_lib, optics.RRTMOptics), (
+        'aerosol_optics requires the RRTMOptics scheme (needs per-band'
+        ' g_point_to_bnd mapping).'
+    )
+    g_point_to_bnd_lw = optics_lib.gas_optics_lw.g_point_to_bnd
+
   def step_fn(igpt, cumulative_flux):
     cpl = (
         cloud_path_liq_per_gpt[igpt]
@@ -197,6 +221,10 @@ def solve_lw(
         if cloud_path_ice_per_gpt is not None
         else cloud_path_ice
     )
+    aer_slice = None
+    if aerosol_optics is not None:
+      ibnd = g_point_to_bnd_lw[igpt]
+      aer_slice = {k: v[ibnd] for k, v in aerosol_optics.items()}
     optical_props_2stream = _compute_local_properties_lw(
         pressure,
         temperature,
@@ -209,6 +237,7 @@ def solve_lw(
         cpl,
         cloud_r_eff_ice,
         cpi,
+        aerosol_optics_slice=aer_slice,
     )
 
     # Boundary conditions.
@@ -256,6 +285,7 @@ def solve_sw(
     use_scan: bool = False,
     cloud_path_liq_per_gpt: Array | None = None,
     cloud_path_ice_per_gpt: Array | None = None,
+    aerosol_optics: dict[str, Array] | None = None,
 ) -> dict[str, Array]:
   """Solves the two-stream radiative transfer equation for shortwave.
 
@@ -290,6 +320,13 @@ def solve_sw(
       g-point loop. Intended for McICA, where the upstream sub-column generator
       produces a separate binary cloud profile per g-point.
     cloud_path_ice_per_gpt: Same as above, for ice water path.
+    aerosol_optics: Optional dictionary of per-band aerosol optical properties.
+      Must contain keys `'optical_depth'`, `'ssa'`, and `'asymmetry_factor'`,
+      each shaped `[n_bnd_sw, nx, ny, nz]`. The per-g-point band slice (using
+      `gas_optics_sw.g_point_to_bnd`) is combined with the gas+cloud optical
+      properties via the mass-weighted mix in
+      `OpticsScheme.combine_optical_properties`. Aerosol values are passed
+      through as-is (no delta-scaling). Requires the `RRTMOptics` scheme.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -303,6 +340,13 @@ def solve_sw(
     # Convert the chemical formulas of the gas species to RRTM-consistent
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_sw)
+
+  if aerosol_optics is not None:
+    assert isinstance(optics_lib, optics.RRTMOptics), (
+        'aerosol_optics requires the RRTMOptics scheme (needs per-band'
+        ' g_point_to_bnd mapping).'
+    )
+    g_point_to_bnd_sw = optics_lib.gas_optics_sw.g_point_to_bnd
 
   def step_fn(igpt, partial_fluxes):
     cpl = (
@@ -326,6 +370,15 @@ def solve_sw(
         cloud_r_eff_ice,
         cpi,
     )
+    # Mix in aerosol contributions for this band, if supplied. Done after the
+    # gas+cloud combination (where cloud has already been delta-scaled in SW),
+    # so the aerosol tau/ssa/g are passed through as-is.
+    if aerosol_optics is not None:
+      ibnd = g_point_to_bnd_sw[igpt]
+      aer_slice = {k: v[ibnd] for k, v in aerosol_optics.items()}
+      sw_optical_props = optics_lib.combine_optical_properties(
+          sw_optical_props, aer_slice
+      )
     optical_props_2stream = monochromatic_two_stream.sw_cell_properties(
         zenith,
         sw_optical_props['optical_depth'],

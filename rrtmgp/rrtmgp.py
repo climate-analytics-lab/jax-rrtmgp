@@ -124,6 +124,9 @@ class RRTMGP:
       cloud_path_ice_lw_per_gpt: Array | None = None,
       cloud_path_liq_sw_per_gpt: Array | None = None,
       cloud_path_ice_sw_per_gpt: Array | None = None,
+      vmr_fields: dict[str, Array] | None = None,
+      aerosol_optics_lw: dict[str, Array] | None = None,
+      aerosol_optics_sw: dict[str, Array] | None = None,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -138,6 +141,25 @@ class RRTMGP:
     cloud paths derived from `q_liq` and `q_ice` inside the per-g-point loop,
     so each g-point sees its own stochastic sub-column. The clear-sky branch
     is unaffected.
+
+    Per-cell gas concentrations can be supplied via `vmr_fields`, a dict keyed
+    by chemical formula (e.g. `'o3'`, `'co2'`, `'ch4'`, `'n2o'`) mapping to a
+    3D `[nx, ny, nz]` volume mixing ratio array. These override both the
+    sounding-based reconstruction from pressure (`o3` by default) and the
+    global-mean fallbacks loaded from `vmr_global_means.json`. The `h2o` entry
+    is always recomputed from `q_t` and `q_c` to keep the radiative water
+    consistent with the simulation's humidity state; any caller-supplied
+    `'h2o'` is therefore ignored. The same `vmr_fields` are used for the
+    clear-sky diagnostic when enabled.
+
+    Per-band aerosol optical properties can be supplied via
+    `aerosol_optics_{lw,sw}`, each a dict with keys `'optical_depth'`, `'ssa'`,
+    and `'asymmetry_factor'`, each shaped `[n_bnd_{lw,sw}, nx, ny, nz]`. The
+    per-band slice is mixed in alongside the gas + cloud optical properties
+    using the mass-weighted combine inside the per-g-point loop. Values are
+    passed through unmodified (no delta-scaling). LW and SW are independent —
+    pass one or both. Aerosols are also applied to the clear-sky diagnostic
+    (CMIP convention: "clear-sky" = cloud-free, aerosols included).
 
     Returns:
       A dictionary containing the following keys:
@@ -182,15 +204,22 @@ class RRTMGP:
     q_ice = jnp.clip(q_ice, 0.0, None)
     q_c = jnp.clip(q_c, 0.0, None)
 
-    # Reconstruct the volume mixing ratio (vmr) of relevant gas species.
+    # Reconstruct the volume mixing ratio (vmr) of relevant gas species from
+    # the sounding-based lookup. Then apply any caller-supplied per-cell
+    # overrides on top; this is how upstream models inject ozone climatologies,
+    # CO2/CH4/N2O forcing, etc. Finally, h2o is always set from the simulation
+    # humidity state so it stays consistent with q_t/q_c (any caller h2o entry
+    # is intentionally clobbered).
     vmr_lib = atm_state.vmr
-    vmr_fields = (
+    merged_vmr_fields = (
         lookup_volume_mixing_ratio.reconstruct_vmr_fields_from_pressure(
             vmr_lib, p_ref_xxc
         )
     )
-    # Derive the water vapor vmr from the simulation state itself.
-    vmr_fields['h2o'] = _humidity_to_volume_mixing_ratio(q_t, q_c)
+    if vmr_fields is not None:
+      merged_vmr_fields.update(vmr_fields)
+    merged_vmr_fields['h2o'] = _humidity_to_volume_mixing_ratio(q_t, q_c)
+    vmr_fields = merged_vmr_fields
 
     # Compute molecules
     molecules_per_area = _air_molecules_per_area(p_ref_xxc, vmr_fields['h2o'])
@@ -214,6 +243,7 @@ class RRTMGP:
         use_scan=use_scan,
         cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
+        aerosol_optics=aerosol_optics_lw,
     )
     sw_fluxes = two_stream.solve_sw(
         p_ref_xxc,
@@ -229,6 +259,7 @@ class RRTMGP:
         use_scan=use_scan,
         cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
+        aerosol_optics=aerosol_optics_sw,
     )
 
     # Compute the heating rate in K/s.
@@ -301,6 +332,7 @@ class RRTMGP:
           cloud_r_eff_ice=None,
           cloud_path_ice=None,
           use_scan=use_scan,
+          aerosol_optics=aerosol_optics_lw,
       )
       sw_fluxes_clearsky = two_stream.solve_sw(
           p_ref_xxc,
@@ -314,6 +346,7 @@ class RRTMGP:
           cloud_r_eff_ice=None,
           cloud_path_ice=None,
           use_scan=use_scan,
+          aerosol_optics=aerosol_optics_sw,
       )
       # Compute the heating rate in K/s.
       lw_heating_rate_clearsky = two_stream.compute_heating_rate(
