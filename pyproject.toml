@@ -1,9 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "jax-rrtmgp"
 description = "JAX-based implementation of RRTMGP radiative transfer for atmospheric modeling."
 readme = "README.md"
 requires-python = ">=3.11"
-version = "0.1"
+version = "0.1.0"
 license = {file = "LICENSE"}
 authors = [
     {name = "parkerjeff", email="parkerjeff@google.com"},
@@ -32,6 +36,9 @@ dev = [
     "pytest",
     "parameterized"
 ]
+
+[tool.setuptools.packages.find]
+include = ["rrtmgp*"]
 
 [tool.setuptools.package-data]
 rrtmgp = [
