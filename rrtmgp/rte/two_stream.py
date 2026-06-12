@@ -348,6 +348,23 @@ def solve_sw(
     )
     g_point_to_bnd_sw = optics_lib.gas_optics_sw.g_point_to_bnd
 
+  # Sun-at-or-below-horizon handling. This used to be a `jax.lax.cond` that
+  # skipped the entire g-point solve at night. That short-circuit is silently
+  # destroyed the moment a caller `vmap`s this solver over columns with a
+  # per-column `zenith` (the GCM use case): `vmap` lowers a `cond` with a
+  # batched predicate into a `select` that runs *both* branches and broadcasts
+  # every operand the day branch captures across the whole column batch --
+  # including the loop-invariant gas-optics `kmajor` table (~3 MB), which
+  # balloons to ~31 GB at ~9000 columns (issue #8). Computing unconditionally
+  # keeps those tables a single shared operand under `vmap`. To stay finite for
+  # the night columns (the raw `exp(-tau / cos(zenith))` terms in the shortwave
+  # solve diverge to +inf once `cos(zenith) <= 0`), the solve is fed a
+  # horizon-clamped zenith and the night columns are zeroed out afterwards.
+  night = zenith >= 0.5 * jnp.pi
+  # Overhead sun (cos = 1) is the most benign valid angle; the resulting night
+  # fluxes are masked to zero below, so this placeholder never reaches output.
+  safe_zenith = jnp.where(night, jnp.zeros_like(jnp.asarray(zenith)), zenith)
+
   def step_fn(igpt, partial_fluxes):
     cpl = (
         cloud_path_liq_per_gpt[igpt]
@@ -380,7 +397,7 @@ def solve_sw(
           sw_optical_props, aer_slice
       )
     optical_props_2stream = monochromatic_two_stream.sw_cell_properties(
-        zenith,
+        safe_zenith,
         sw_optical_props['optical_depth'],
         sw_optical_props['ssa'],
         sw_optical_props['asymmetry_factor'],
@@ -400,7 +417,7 @@ def solve_sw(
         optical_depth=sw_optical_props['optical_depth'],
         toa_flux=toa_flux,
         sfc_albedo_direct=sfc_albedo,
-        zenith=zenith,
+        zenith=safe_zenith,
         use_scan=use_scan,
     )
 
@@ -420,22 +437,20 @@ def solve_sw(
   flux_keys = ['flux_up', 'flux_down', 'flux_net']
   fluxes_0 = {key: jnp.zeros_like(temperature) for key in flux_keys}
 
-  def _compute_fluxes(_):
-    fluxes = jax.lax.fori_loop(0, optics_lib.n_gpt_sw, step_fn, fluxes_0)
-    # There are problematic values for the fluxes at the top boundary (the top
-    # halo), so fix using a quadratic polynomial to evaluate the flux at the top
-    # boundary.
-    for key in flux_keys:
-      fluxes[key] = _replace_top_flux(fluxes[key])
-    return fluxes
-
-  # Use JAX control flow to avoid Python boolean conversion on tracers
-  return jax.lax.cond(
-      zenith >= 0.5 * jnp.pi,
-      lambda _: fluxes_0,
-      _compute_fluxes,
-      operand=None,
-  )
+  fluxes = jax.lax.fori_loop(0, optics_lib.n_gpt_sw, step_fn, fluxes_0)
+  # There are problematic values for the fluxes at the top boundary (the top
+  # halo), so fix using a quadratic polynomial to evaluate the flux at the top
+  # boundary.
+  for key in flux_keys:
+    fluxes[key] = _replace_top_flux(fluxes[key])
+  # Zero out columns where the sun is at or below the horizon. `night` is a
+  # scalar (single column) or, under a column `vmap`, a per-column scalar; it
+  # broadcasts over the trailing spatial/vertical axes of each flux field.
+  fluxes = {
+      key: jnp.where(night, jnp.zeros_like(val), val)
+      for key, val in fluxes.items()
+  }
+  return fluxes
 
 
 def compute_heating_rate(

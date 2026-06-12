@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 from typing import TypeAlias
 
@@ -444,6 +445,99 @@ class AllSkyTest(unittest.TestCase):
     for key in ('flux_up', 'flux_down', 'flux_net'):
       np.testing.assert_allclose(out_lw[key], ref_lw[key], rtol=1e-6, atol=1e-6)
       np.testing.assert_allclose(out_sw[key], ref_sw[key], rtol=1e-6, atol=1e-6)
+
+  def test_solve_sw_vmap_keeps_gas_optics_tables_shared(self):
+    """Regression guard for issue #8 (per-column gas-optics table broadcast).
+
+    When `solve_sw` is vmapped over columns with a per-column `zenith` (the GCM
+    use case), the loop-invariant gas-optics tables must remain a single shared
+    operand -- they must not be broadcast across the column batch. The shortwave
+    night handling used to be a `jax.lax.cond(zenith >= pi/2)` wrapping the
+    g-point loop; under `vmap` that cond lowered to a `select` that ran both
+    branches and broadcast the ~3 MB `kmajor` table across every column
+    (~31 GB of scratch at 9216 columns). This test confirms (1) no such
+    per-column table broadcast appears in the compiled HLO and (2) the
+    night-masking semantics survive `vmap`: columns with the sun at or below the
+    horizon return zero fluxes, and daytime columns match a direct single-column
+    solve.
+    """
+    site = 0
+    (
+        pressure_allsites,
+        pressure_level_allsites,
+        temperature_allsites,
+        _,
+        vmr_profiles_allsites,
+        _,
+    ) = _setup_atmospheric_profiles()
+    # Compact lookup keeps n_gpt small so the test compiles quickly.
+    radiation_params = _setup_radiation_params(use_compact_lookup=True)
+    atmos_state = atmospheric_state.from_config(
+        radiation_params.atmospheric_state_cfg
+    )
+    optics_lib = optics.optics_factory(radiation_params.optics, atmos_state.vmr)
+
+    convert_to_3d = functools.partial(
+        test_util.convert_to_3d_array_and_tile, dim=2, num_repeats=1
+    )
+    vmr_fields = {
+        k: convert_to_3d(v[site, :]) for k, v in vmr_profiles_allsites.items()
+    }
+    p = convert_to_3d(pressure_allsites[site, :])
+    pressure_level = convert_to_3d(pressure_level_allsites[site, :])
+    temperature = convert_to_3d(temperature_allsites[site, :])
+    molecules = _air_molecules_per_area(pressure_level, vmr_fields['h2o'])
+
+    # Per-column zeniths: a mix of daytime (< pi/2) and sun-below-horizon
+    # (>= pi/2) columns, so the predicate is genuinely batched under vmap.
+    zeniths = jnp.array([0.2, 0.7, 1.3, 1.7, 2.2, 2.9], dtype=jnp.float_)
+    n_col = int(zeniths.shape[0])
+    is_night = np.asarray(zeniths) >= 0.5 * np.pi
+
+    def run_col(zenith: Array) -> dict[str, Array]:
+      st = dataclasses.replace(atmos_state, zenith=zenith)
+      return two_stream.solve_sw(
+          p, temperature, molecules, optics_lib, st, vmr_fields
+      )
+
+    vmapped = jax.vmap(run_col)
+
+    # (1) Memory guard: the bug materialises an [n_col, *kmajor.shape] buffer.
+    # Match its leading dims in the optimized HLO; legitimate per-column buffers
+    # are shaped [n_col, nx, ny, nz] and never collide with the table dims.
+    hlo = jax.jit(vmapped).lower(zeniths).compile().as_text()
+    ks = optics_lib.gas_optics_sw.kmajor.shape  # e.g. (14, 60, 9, 112)
+    broadcast_needle = f'f32[{n_col},{ks[0]},{ks[1]},{ks[2]}'
+    self.assertNotIn(
+        broadcast_needle,
+        hlo,
+        msg=(
+            f'gas-optics kmajor table is broadcast per-column '
+            f'("{broadcast_needle}" found in compiled HLO); see issue #8.'
+        ),
+    )
+
+    # (2) Semantics guard under vmap.
+    out = vmapped(zeniths)
+    for key in ('flux_up', 'flux_down', 'flux_net'):
+      vals = np.asarray(out[key])
+      self.assertTrue(
+          np.all(np.isfinite(vals)), msg=f'{key} has non-finite values'
+      )
+      # Sun at/below horizon -> exactly zero flux.
+      np.testing.assert_array_equal(
+          vals[is_night], np.zeros_like(vals[is_night])
+      )
+      # Daytime columns carry nonzero shortwave flux.
+      self.assertTrue(np.any(vals[~is_night] != 0.0))
+
+    # Daytime vmap columns must match a direct single-column solve.
+    for i in np.nonzero(~is_night)[0]:
+      ref = run_col(zeniths[i])
+      for key in ('flux_up', 'flux_down', 'flux_net'):
+        np.testing.assert_allclose(
+            np.asarray(out[key][i]), np.asarray(ref[key]), rtol=1e-6, atol=1e-6
+        )
 
 
 if __name__ == '__main__':
