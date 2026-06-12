@@ -18,6 +18,7 @@ import collections
 from collections.abc import Sequence
 import dataclasses
 import inspect
+import os
 import string
 from typing import Callable, TypeAlias
 
@@ -25,6 +26,36 @@ import jax
 import jax.numpy as jnp
 
 Array: TypeAlias = jax.Array
+
+# Backend for the gas-optics table lookups (`lookup_values`):
+#   "gather" — direct advanced indexing (`vals[tuple(idx)]`). The default:
+#              substantially faster on GPU/CPU, where the dense one-hot einsum
+#              has to stream the whole table every call (see
+#              climate-analytics-lab/jax-rrtmgp#6: ~2.8x faster radiation at GCM
+#              resolution).
+#   "matmul" — one-hot vectors + einsum. Avoids the gather op, which is slow on
+#              TPU; uses the matrix-multiply unit instead. TPU users should
+#              select this via $RRTMGP_LOOKUP_IMPL=matmul or `set_lookup_impl`.
+_LOOKUP_IMPL = os.environ.get("RRTMGP_LOOKUP_IMPL", "gather")
+if _LOOKUP_IMPL not in ("matmul", "gather"):
+  _LOOKUP_IMPL = "gather"
+
+
+def set_lookup_impl(impl: str) -> None:
+  """Select the table-lookup backend: 'matmul' or 'gather'.
+
+  Must be set before the gas-optics functions are traced/compiled; changing it
+  afterwards has no effect on already-compiled functions.
+  """
+  global _LOOKUP_IMPL
+  if impl not in ("matmul", "gather"):
+    raise ValueError(f"impl must be 'matmul' or 'gather', got {impl!r}")
+  _LOOKUP_IMPL = impl
+
+
+def get_lookup_impl() -> str:
+  """Return the active table-lookup backend ('matmul' or 'gather')."""
+  return _LOOKUP_IMPL
 
 
 @dataclasses.dataclass
@@ -72,10 +103,13 @@ def lookup_values(vals: Array, idx_list: Sequence[Array]) -> Array:
     An array having the same shape as an element of `idx_list` where the indices
     have been replaced by the corresponding value from `vals`.
   """
-  # To avoid the `gather` op, which is very slow on TPU's, we convert the
-  # integer indices to a one-hot representation that can leverage the high
-  # throughput of the matrix-multiply unit, and express the lookup reduction
-  # operation with `einsum`.
+  # On TPU the gather op is slow, so the one-hot + einsum formulation (which
+  # runs on the matrix-multiply unit) is preferred. On GPU/CPU a direct gather
+  # is substantially faster: the einsum streams the full table through the MXU
+  # on every call, whereas the gather only reads the corners it needs. See
+  # climate-analytics-lab/jax-rrtmgp#6. The backend defaults by platform.
+  if _LOOKUP_IMPL == "gather":
+    return lookup_values_direct_indexing(vals, idx_list)
   eq = _einsum_expression_from_lookup_table(vals)
   inputs = [
       jax.nn.one_hot(idx, vals.shape[i], dtype=vals.dtype)
@@ -101,7 +135,7 @@ def lookup_values_direct_indexing(vals, idx_list: Sequence[Array]) -> Array:
     An array having the same shape as an element of `idx_list` where the indices
     have been replaced by the corresponding value from `vals`.
   """
-  return vals[idx_list]
+  return vals[tuple(idx_list)]
 
 
 def evaluate_weighted_lookup(
@@ -392,6 +426,10 @@ def interpolate(
     An `Array` of the same shape as any of the index arrays, but with the
     indices replaced by the interpolated coefficients.
   """
+  if _LOOKUP_IMPL == "gather":
+    # interpolate_orig routes through evaluate_weighted_lookup, which honours
+    # the direct-indexing gather backend selected above.
+    return interpolate_orig(coeffs, interpolant_fns)
   return interpolate_optimized(coeffs, interpolant_fns)
 
 
