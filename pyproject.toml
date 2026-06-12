@@ -7,7 +7,7 @@ name = "jax-rrtmgp"
 description = "JAX-based implementation of RRTMGP radiative transfer for atmospheric modeling."
 readme = "README.md"
 requires-python = ">=3.11"
-version = "0.1.0"
+version = "0.2.0"
 license = {file = "LICENSE"}
 authors = [
     {name = "parkerjeff", email="parkerjeff@google.com"},
