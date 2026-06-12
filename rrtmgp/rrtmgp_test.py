@@ -199,6 +199,48 @@ class RRTMGPVMROverrideTest(unittest.TestCase):
     )
 
 
+class RRTMGPBandSelectionTest(unittest.TestCase):
+  """``compute_lw`` / ``compute_sw`` skip a band cleanly (jax-gcm #516)."""
+
+  def test_band_selection_splits_cleanly(self):
+    cfg = _build_radiative_transfer_cfg()
+    rt = rrtmgp.RRTMGP(cfg, dz=500.0)
+    inputs = _build_inputs()
+
+    both = rt.compute_heating_rate(**inputs)
+    lw_only = rt.compute_heating_rate(**inputs, compute_sw=False)
+    sw_only = rt.compute_heating_rate(**inputs, compute_lw=False)
+
+    sw_keys = ('sw_flux_up_full', 'sw_flux_down_full')
+    lw_keys = ('lw_flux_up_full', 'lw_flux_down_full')
+
+    # The computed band is identical to the both-bands run; the skipped band
+    # is exactly zero.
+    for k in lw_keys:
+      np.testing.assert_array_equal(
+          np.asarray(lw_only[k]), np.asarray(both[k]))
+      np.testing.assert_array_equal(
+          np.asarray(sw_only[k]), np.zeros_like(np.asarray(both[k])))
+    for k in sw_keys:
+      np.testing.assert_array_equal(
+          np.asarray(sw_only[k]), np.asarray(both[k]))
+      np.testing.assert_array_equal(
+          np.asarray(lw_only[k]), np.zeros_like(np.asarray(both[k])))
+
+    # Total heating of the both-bands run is the sum of the single-band runs.
+    total = np.asarray(both[rrtmgp_common.KEY_STORED_RADIATION])
+    lw = np.asarray(lw_only[rrtmgp_common.KEY_STORED_RADIATION])
+    sw = np.asarray(sw_only[rrtmgp_common.KEY_STORED_RADIATION])
+    np.testing.assert_allclose(total, lw + sw, rtol=1e-6, atol=1e-12)
+
+  def test_both_bands_disabled_raises(self):
+    cfg = _build_radiative_transfer_cfg()
+    rt = rrtmgp.RRTMGP(cfg, dz=500.0)
+    inputs = _build_inputs()
+    with self.assertRaises(ValueError):
+      rt.compute_heating_rate(**inputs, compute_lw=False, compute_sw=False)
+
+
 class RRTMGPAerosolTest(unittest.TestCase):
   """Regression tests for the per-band aerosol_optics_{lw,sw} kwargs."""
 

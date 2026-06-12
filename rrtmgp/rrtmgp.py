@@ -127,6 +127,8 @@ class RRTMGP:
       vmr_fields: dict[str, Array] | None = None,
       aerosol_optics_lw: dict[str, Array] | None = None,
       aerosol_optics_sw: dict[str, Array] | None = None,
+      compute_lw: bool = True,
+      compute_sw: bool = True,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -228,6 +230,15 @@ class RRTMGP:
     liq_water_path = _compute_cloud_path(rho_xxc, q_liq, self._dz, sg_map)
     ice_water_path = _compute_cloud_path(rho_xxc, q_ice, self._dz, sg_map)
 
+    # ``compute_lw`` / ``compute_sw`` let a caller solve only one band and skip
+    # the other entirely (a real compute saving, not a mask). The skipped band's
+    # fluxes are filled with zeros that match the computed band's shape, so all
+    # downstream diagnostics/heating-rate code is unchanged. At least one band
+    # must be computed. Use case: a GCM driver that runs LW everywhere but
+    # restricts the SW solve to the sunlit columns (jax-gcm #516).
+    if not (compute_lw or compute_sw):
+      raise ValueError("At least one of compute_lw / compute_sw must be True.")
+
     lw_fluxes = two_stream.solve_lw(
         p_ref_xxc,
         temperature,
@@ -244,7 +255,7 @@ class RRTMGP:
         cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
         aerosol_optics=aerosol_optics_lw,
-    )
+    ) if compute_lw else None
     sw_fluxes = two_stream.solve_sw(
         p_ref_xxc,
         temperature,
@@ -260,7 +271,13 @@ class RRTMGP:
         cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
         aerosol_optics=aerosol_optics_sw,
-    )
+    ) if compute_sw else None
+
+    # Fill the skipped band with zeros shaped like the computed band.
+    if lw_fluxes is None:
+      lw_fluxes = {k: jnp.zeros_like(v) for k, v in sw_fluxes.items()}
+    if sw_fluxes is None:
+      sw_fluxes = {k: jnp.zeros_like(v) for k, v in lw_fluxes.items()}
 
     # Compute the heating rate in K/s.
     lw_heating_rate = two_stream.compute_heating_rate(
@@ -333,7 +350,7 @@ class RRTMGP:
           cloud_path_ice=None,
           use_scan=use_scan,
           aerosol_optics=aerosol_optics_lw,
-      )
+      ) if compute_lw else None
       sw_fluxes_clearsky = two_stream.solve_sw(
           p_ref_xxc,
           temperature,
@@ -347,7 +364,13 @@ class RRTMGP:
           cloud_path_ice=None,
           use_scan=use_scan,
           aerosol_optics=aerosol_optics_sw,
-      )
+      ) if compute_sw else None
+      if lw_fluxes_clearsky is None:
+        lw_fluxes_clearsky = {
+            k: jnp.zeros_like(v) for k, v in sw_fluxes_clearsky.items()}
+      if sw_fluxes_clearsky is None:
+        sw_fluxes_clearsky = {
+            k: jnp.zeros_like(v) for k, v in lw_fluxes_clearsky.items()}
       # Compute the heating rate in K/s.
       lw_heating_rate_clearsky = two_stream.compute_heating_rate(
           lw_fluxes_clearsky['flux_net'], p_ref_xxc
