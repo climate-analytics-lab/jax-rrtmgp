@@ -24,6 +24,16 @@ jobs:
         run: python -m pip install --upgrade pip build
       - name: Build sdist and wheel
         run: python -m build
+      - name: Verify release tag matches built version
+        # Fail fast if a vX.Y.Z release was cut without bumping `version` in
+        # pyproject.toml, instead of surfacing an opaque PyPI "400 File already
+        # exists" from the publish job. `github.ref_name` is passed via env to
+        # avoid script injection from the tag name.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python -m pip install --upgrade packaging
+          python .github/scripts/check_release_version.py "$TAG"
       - name: Check distribution metadata
         run: |
           python -m pip install --upgrade twine
