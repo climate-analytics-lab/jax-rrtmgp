@@ -400,11 +400,17 @@ def _compute_minor_optical_depth(
     )
 
   minor_start_idx = minor_bnd_start[ibnd]
+  # Both branches must return the same integer dtype: ``minor_start_idx`` keeps
+  # the loaded table's int32, whereas ``jnp.int_`` is int64 when x64 is enabled
+  # (e.g. when a float64 host such as the MAM4-JAX aerosol core turns on
+  # ``jax_enable_x64``), so ``lax.cond`` would reject the int32/int64 mismatch.
+  # Pin the false branch to ``minor_start_idx``'s dtype so the cond is
+  # x64-agnostic.
   i0 = jax.lax.cond(
       minor_start_idx >= 0,
       true_fun=lambda: minor_start_idx,
       false_fun=lambda: jnp.array(
-          minor_absorber_intervals, dtype=jnp.int_
+          minor_absorber_intervals, dtype=minor_start_idx.dtype
       ),
   )
   tau_minor_0 = jnp.zeros_like(temperature)
