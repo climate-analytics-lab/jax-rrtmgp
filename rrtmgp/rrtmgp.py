@@ -120,8 +120,6 @@ class RRTMGP:
       use_scan: bool = False,
       zenith: float | None = None,
       irrad: float | None = None,
-      sfc_alb: float | Array | None = None,
-      sfc_emis: float | Array | None = None,
       cloud_path_liq_lw_per_gpt: Array | None = None,
       cloud_path_ice_lw_per_gpt: Array | None = None,
       cloud_path_liq_sw_per_gpt: Array | None = None,
@@ -129,6 +127,11 @@ class RRTMGP:
       vmr_fields: dict[str, Array] | None = None,
       aerosol_optics_lw: dict[str, Array] | None = None,
       aerosol_optics_sw: dict[str, Array] | None = None,
+      # New optional parameters go at the END of the signature so existing
+      # positional callers (e.g. of the McICA cloud-path arrays) keep their
+      # bindings.
+      sfc_alb: float | Array | None = None,
+      sfc_emis: float | Array | None = None,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
