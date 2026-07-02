@@ -127,6 +127,11 @@ class RRTMGP:
       vmr_fields: dict[str, Array] | None = None,
       aerosol_optics_lw: dict[str, Array] | None = None,
       aerosol_optics_sw: dict[str, Array] | None = None,
+      # New optional parameters go at the END of the signature so existing
+      # positional callers (e.g. of the McICA cloud-path arrays) keep their
+      # bindings.
+      sfc_alb: float | Array | None = None,
+      sfc_emis: float | Array | None = None,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -141,6 +146,14 @@ class RRTMGP:
     cloud paths derived from `q_liq` and `q_ice` inside the per-g-point loop,
     so each g-point sees its own stochastic sub-column. The clear-sky branch
     is unaffected.
+
+    The surface boundary condition can be overridden per call via `sfc_alb`
+    (broadband SW surface albedo) and `sfc_emis` (broadband LW surface
+    emissivity). Like `zenith`/`irrad`, these replace the corresponding
+    `AtmosphericStateCfg` scalars for this call only, and may be traced
+    values — e.g. per-column albedos from a host model's surface scheme
+    under vmap. Anything broadcastable against the `[nx, ny]` surface plane
+    is accepted. When omitted, the configured scalars are used.
 
     Per-cell gas concentrations can be supplied via `vmr_fields`, a dict keyed
     by chemical formula (e.g. `'o3'`, `'co2'`, `'ch4'`, `'n2o'`) mapping to a
@@ -173,11 +186,23 @@ class RRTMGP:
         'lw_flux_down_full': Full longwave downward flux profile [W/m²]
     """
     atm_state = self.atmospheric_state
-    if zenith is not None or irrad is not None:
+    if (
+        zenith is not None
+        or irrad is not None
+        or sfc_alb is not None
+        or sfc_emis is not None
+    ):
+      # Per-call overrides of the configured atmospheric-state scalars.
+      # `sfc_alb` / `sfc_emis` may be traced per-column values (e.g. from a
+      # host model's surface scheme under vmap); the solvers broadcast them
+      # against the horizontal plane, so anything broadcastable against the
+      # `[nx, ny]` surface works.
       atm_state = dataclasses.replace(
           atm_state,
           **({"zenith": zenith} if zenith is not None else {}),
           **({"irrad": irrad} if irrad is not None else {}),
+          **({"sfc_alb": sfc_alb} if sfc_alb is not None else {}),
+          **({"sfc_emis": sfc_emis} if sfc_emis is not None else {}),
       )
 
     # Temperature may have NaNs in the halos (this is intentional).  These NaNs
