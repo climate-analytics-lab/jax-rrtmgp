@@ -422,19 +422,30 @@ def sw_cell_properties(
   # Only the upper (energy-conservation) bound is smoothed: that is the bound a
   # strongly scattering (cloudy) layer actually saturates, so smoothing it makes
   # the gradient continuous in exactly that regime, while a value well below the
-  # cap -- the common case -- is left unchanged to within O(sharpness**2). The
-  # lower positivity bound is kept as a hard `jnp.maximum`: a direct-beam
-  # reflectance/transmittance crossing zero is rare and its kink is mild, and a
-  # smooth lower clamp would instead offset every small positive value by
-  # ~sharpness, perturbing the forward everywhere.
+  # cap -- the common case -- is left unchanged to within O(sharpness**2). A
+  # smooth *lower* clamp would instead offset every small positive value by
+  # ~sharpness, so the lower positivity bound is kept as a hard `jnp.maximum`.
+  #
+  # The hard positivity floor is applied *after* (outside) the smooth cap. This
+  # matters when the cap itself collapses toward zero -- a transparent /
+  # non-scattering cell has `1 - t0 -> 0`, and `smooth_minimum(x, 0, s)`
+  # undershoots to `~ -s/2`; the outer `jnp.maximum(..., 0)` clamps that back to
+  # zero so the direct reflectance/transmittance can never go negative (which
+  # would otherwise inject a spurious negative diffuse source in
+  # `sw_cell_source`). Away from the degenerate cap the floor is inactive, so
+  # the upper-cap smoothing is preserved.
 
   # Direct transmittance.
   t0 = jnp.exp(-optical_depth / jnp.cos(zenith))
-  r_dir = smooth_ops.smooth_minimum(
-      jnp.maximum(r_dir_unconstrained, 0.0), 1 - t0, _SW_CLIP_SHARPNESS
+  r_dir = jnp.maximum(
+      smooth_ops.smooth_minimum(r_dir_unconstrained, 1 - t0, _SW_CLIP_SHARPNESS),
+      0.0,
   )
-  t_dir = smooth_ops.smooth_minimum(
-      jnp.maximum(t_dir_unconstrained, 0.0), 1 - t0 - r_dir, _SW_CLIP_SHARPNESS
+  t_dir = jnp.maximum(
+      smooth_ops.smooth_minimum(
+          t_dir_unconstrained, 1 - t0 - r_dir, _SW_CLIP_SHARPNESS
+      ),
+      0.0,
   )
 
   return {
