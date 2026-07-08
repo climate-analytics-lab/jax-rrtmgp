@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from rrtmgp import kernel_ops
+from rrtmgp import smooth_ops
 from rrtmgp.rte import rte_utils
 
 Array: TypeAlias = jax.Array
@@ -43,6 +44,14 @@ _EPSILON = 1e-6
 _MIN_TAU_FOR_LW_SRC = 1e-4
 # Minimum value of the k parameter used in the transmittance.
 _K_MIN = 1e-2
+
+# Absolute transition half-width for the differentiable replacement of the hard
+# upper (energy-conservation) clamp on the shortwave direct-beam reflectance /
+# transmittance (see `rrtmgp.smooth_ops.smooth_minimum`), on the [0, 1] scale of
+# those quantities. Small enough that a value well below the cap is offset only
+# negligibly, while the reverse-mode gradient stays continuous where a strongly
+# scattering (cloudy) layer drives the direct beam onto the cap.
+_SW_CLIP_SHARPNESS = 1e-5
 
 
 def _shift_up(f: Array) -> Array:
@@ -98,7 +107,18 @@ def lw_combine_sources(planck_srcs: StatesMap) -> StatesMap:
 
 
 def _k_fn(gamma1: Array, gamma2: Array) -> Array:
-  """Compute the k parameter used in the transmittance."""
+  """Compute the k parameter used in the transmittance.
+
+  The two lower bounds are deliberately left as hard ``jnp.maximum`` floors.
+  Smoothing them perturbs ``k`` by a tiny amount, but ``k`` feeds the
+  ``|1 - (k cos(zenith))**2| >= _EPSILON`` branch selection in
+  ``_rt_denominator_direct`` (which regularises the removable singularity at
+  ``k cos(zenith) = 1``); an epsilon-level shift in ``k`` can flip that branch
+  and move the direct reflectance discontinuously. The floors are inactive in
+  practice (``k`` reaches ``_K_MIN`` only as the single-scattering albedo
+  approaches 1), so leaving them hard costs essentially no gradient smoothness
+  while keeping the forward exactly at the reference.
+  """
   k = jnp.sqrt(jnp.maximum((gamma1 + gamma2) * (gamma1 - gamma2), _EPSILON))
   return jnp.maximum(k, _K_MIN)
 
@@ -309,7 +329,14 @@ def lw_cell_source_and_properties(
       given face sources [W / m^2].
     """
     src = math.pi * (downstream_out - refl * downstream_in - tran * upstream_in)
-    # Filter out sources where the optical depth is too small.
+    # Filter out sources where the optical depth is too small. This threshold is
+    # deliberately left as a hard `jnp.where`: it gates real (non-singular)
+    # source contributions, so any finite smoothing ramp would reweight the thin
+    # cells sitting near the threshold and move the forward flux away from the
+    # hard-threshold reference the scheme is validated against. The resulting
+    # gradient kink is small (the gated source is small for these thin layers)
+    # and, unlike the clamps smoothed elsewhere, cannot be removed without
+    # perturbing the forward.
     return jnp.where(tau > _MIN_TAU_FOR_LW_SRC, src, 0.0)
 
   src_up = cell_center_src_fn(
@@ -391,11 +418,24 @@ def sw_cell_properties(
   # physical limits by enforcing the constraint that the direct beam can
   # either be reflected, penetrate unscattetered to the bottom of the grid
   # cell, or penetrate through but be scattered on the way.
+  #
+  # Only the upper (energy-conservation) bound is smoothed: that is the bound a
+  # strongly scattering (cloudy) layer actually saturates, so smoothing it makes
+  # the gradient continuous in exactly that regime, while a value well below the
+  # cap -- the common case -- is left unchanged to within O(sharpness**2). The
+  # lower positivity bound is kept as a hard `jnp.maximum`: a direct-beam
+  # reflectance/transmittance crossing zero is rare and its kink is mild, and a
+  # smooth lower clamp would instead offset every small positive value by
+  # ~sharpness, perturbing the forward everywhere.
 
   # Direct transmittance.
   t0 = jnp.exp(-optical_depth / jnp.cos(zenith))
-  r_dir = jnp.clip(r_dir_unconstrained, 0, 1 - t0)
-  t_dir = jnp.clip(t_dir_unconstrained, 0, 1 - t0 - r_dir)
+  r_dir = smooth_ops.smooth_minimum(
+      jnp.maximum(r_dir_unconstrained, 0.0), 1 - t0, _SW_CLIP_SHARPNESS
+  )
+  t_dir = smooth_ops.smooth_minimum(
+      jnp.maximum(t_dir_unconstrained, 0.0), 1 - t0 - r_dir, _SW_CLIP_SHARPNESS
+  )
 
   return {
       't_diff': t_diff,

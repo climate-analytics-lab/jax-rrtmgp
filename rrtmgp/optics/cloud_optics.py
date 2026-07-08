@@ -19,6 +19,7 @@ from typing import Callable, TypeAlias
 
 import jax
 import jax.numpy as jnp
+from rrtmgp import smooth_ops
 from rrtmgp.optics import lookup_cloud_optics
 from rrtmgp.optics import optics_utils
 
@@ -117,16 +118,18 @@ def compute_optical_properties(
       cloud_path_ice * _KG_TO_G_FACTOR,
   )
 
-  cld_mask_liq = jnp.where(
-      cloud_path_liq * _KG_TO_G_FACTOR >= _EPSILON,
-      jnp.ones_like(cloud_path_liq),
-      jnp.zeros_like(cloud_path_liq),
+  # Presence mask that zeroes the contribution of a cell with a negligible
+  # cloud path. The hard step is replaced by a narrow smoothstep ramp so a cloud
+  # parameter driven toward zero during calibration turns the cloud off
+  # continuously instead of discontinuously. The ramp saturates to 1 far below
+  # any physical cloud path (at ``2 * _EPSILON`` g/m^2), so a real cloud is
+  # unaffected.
+  cld_mask_liq = smooth_ops.smooth_gate(
+      cloud_path_liq * _KG_TO_G_FACTOR, 0.0, 2.0 * _EPSILON
   )
 
-  cld_mask_ice = jnp.where(
-      cloud_path_ice * _KG_TO_G_FACTOR >= _EPSILON,
-      jnp.ones_like(cloud_path_ice),
-      jnp.zeros_like(cloud_path_ice),
+  cld_mask_ice = smooth_ops.smooth_gate(
+      cloud_path_ice * _KG_TO_G_FACTOR, 0.0, 2.0 * _EPSILON
   )
   cld_mask = (cld_mask_liq, cld_mask_ice)
 
