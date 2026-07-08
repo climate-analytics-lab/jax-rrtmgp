@@ -77,7 +77,19 @@ def lw_combine_sources(planck_srcs: StatesMap) -> StatesMap:
   """
   planck_src_top = planck_srcs['planck_src_top']
   planck_src_bottom = planck_srcs['planck_src_bottom']
-  combined_src_top = jnp.sqrt(planck_src_top * _shift_down(planck_src_bottom))
+  # Geometric mean of the two adjacent-layer sources. `jnp.sqrt` has an infinite
+  # derivative at zero, so a cell where the product vanishes (e.g. a halo/edge
+  # layer with a zero Planck source) yields a finite forward value but a NaN
+  # cotangent in reverse mode. Guard the argument with the standard double-`where`
+  # so the sqrt never sees a non-positive value on the differentiated path while
+  # the forward result (`sqrt(0) = 0`) is preserved.
+  planck_product = planck_src_top * _shift_down(planck_src_bottom)
+  product_is_positive = planck_product > 0.0
+  combined_src_top = jnp.where(
+      product_is_positive,
+      jnp.sqrt(jnp.where(product_is_positive, planck_product, 1.0)),
+      0.0,
+  )
   combined_src_bottom = _shift_up(combined_src_top)
   return {
       'planck_src_top': combined_src_top,
@@ -224,6 +236,18 @@ def lw_cell_source_and_properties(
       'src_up': A 3D variable containing the pointwise upwelling Planck source.
       'src_down': A 3D variable with the pointwise downwelling Planck source.
   """
+  # Optical depth is physically non-negative, but halo/edge cells can carry
+  # negative values (an artifact of forming molecular column amounts from
+  # finite-differenced halo pressures). A negative optical depth makes the
+  # `exp(-tau * k)` terms in the diffuse reflectance/transmittance overflow to
+  # `+inf`, so their shared denominator evaluates to `inf - inf = NaN`. These
+  # halo cells are stripped before the flux recurrence, leaving the forward
+  # result unchanged, but the NaN would otherwise poison the reverse-mode
+  # cotangents (a masked-away `0 * NaN`). Clamp to the physical range so both
+  # the forward and backward passes stay finite; interior cells (optical depth
+  # already positive) are untouched.
+  optical_depth = jnp.maximum(optical_depth, 0.0)
+
   # The coefficient of the parallel irradiance in the 2-stream RTE.
   gamma1 = _LW_DIFFUSIVE_FACTOR * (1 - 0.5 * ssa * (1 + asymmetry_factor))
   # The coefficient of the antiparallel irradiance in the 2-stream RTE.
@@ -234,8 +258,21 @@ def lw_cell_source_and_properties(
 
   # From Toon et al. (JGR 1989) Eqs 26-27, first-order coefficient of the
   # Taylor series expansion of the Planck function in terms of the optical
-  # depth.
-  b_1 = (level_src_bottom - level_src_top) / (optical_depth * (gamma1 + gamma2))
+  # depth. `b_1` feeds only the cell-center sources, which are masked to zero
+  # below wherever `optical_depth <= _MIN_TAU_FOR_LW_SRC`. The division by the
+  # optical depth would otherwise vanish in exactly those masked cells (thin or
+  # halo layers), producing a finite forward value but a 0/0 NaN cotangent in
+  # reverse mode. Guard the denominator with the same threshold used for the
+  # output mask so the differentiated path never divides by zero, while the
+  # forward result on the unmasked cells is unchanged.
+  src_is_active = optical_depth > _MIN_TAU_FOR_LW_SRC
+  b_1_denominator = optical_depth * (gamma1 + gamma2)
+  safe_b_1_denominator = jnp.where(src_is_active, b_1_denominator, 1.0)
+  b_1 = jnp.where(
+      src_is_active,
+      (level_src_bottom - level_src_top) / safe_b_1_denominator,
+      0.0,
+  )
 
   # Compute longwave source function for upward and downward emission at cell
   # interfaces using linear-in-tau assumption.
@@ -311,6 +348,13 @@ def sw_cell_properties(
     't_dir': A 3D variable containing the direct transmittance.
     'r_dir': A 3D variable containing the direct reflectance.
   """
+  # Clamp to the physical range: negative halo/edge optical depths would make
+  # the `exp(-tau * k)` and `exp(-tau / cos(zenith))` terms overflow to `+inf`
+  # and produce NaN denominators, which -- although masked out of the forward
+  # fluxes -- poison the reverse-mode cotangents. See the longwave counterpart
+  # in `lw_cell_source_and_properties` for details.
+  optical_depth = jnp.maximum(optical_depth, 0.0)
+
   # Exchange rate coefficients from Zdunkowski et al. (1980).
   g = asymmetry_factor
   gamma1 = 0.25 * (8 - ssa * (5 + 3 * g))
@@ -324,13 +368,24 @@ def sw_cell_properties(
   r_diff = _diffuse_reflectance(gamma1, gamma2, optical_depth)
   t_diff = _diffuse_transmittance(gamma1, gamma2, optical_depth)
 
-  # Direct reflectance and transmittance.
+  # Direct reflectance and transmittance. Both divide by the single-scattering
+  # albedo (through `_rt_denominator_direct`), so a non-scattering cell
+  # (`ssa == 0`, e.g. a pure-absorption g-point or a halo layer) makes the
+  # forward denominator infinite -- the ratio then evaluates to a finite 0 in
+  # the forward pass but leaves a NaN cotangent in reverse mode. Divide by a
+  # safe (nonzero) albedo and restore the physical `ssa == 0` limit (no diffuse
+  # reflection/transmission of the direct beam) by masking the results to zero,
+  # matching the forward `finite / inf -> 0` behaviour without the NaN adjoint.
+  ssa_is_positive = ssa > 0.0
+  safe_ssa = jnp.where(ssa_is_positive, ssa, 1.0)
   r_dir_unconstrained = _direct_reflectance(
-      gamma1, gamma2, gamma3, alpha2, optical_depth, ssa, zenith
+      gamma1, gamma2, gamma3, alpha2, optical_depth, safe_ssa, zenith
   )
   t_dir_unconstrained = _direct_transmittance(
-      gamma1, gamma2, gamma4, alpha1, optical_depth, ssa, zenith
+      gamma1, gamma2, gamma4, alpha1, optical_depth, safe_ssa, zenith
   )
+  r_dir_unconstrained = jnp.where(ssa_is_positive, r_dir_unconstrained, 0.0)
+  t_dir_unconstrained = jnp.where(ssa_is_positive, t_dir_unconstrained, 0.0)
 
   # Constrain reflectance and transmittance to be positive and to not go above
   # physical limits by enforcing the constraint that the direct beam can
@@ -379,6 +434,11 @@ def sw_cell_source(
         radiative flux at the bottom cell face.
       'sfc_src': A 2D field for the shortwave source emanating from the surface.
   """
+  # Clamp to the physical range so a negative halo/edge optical depth cannot
+  # overflow the direct-beam transmittance to `+inf` (which would poison the
+  # reverse-mode cotangents). Interior cells are untouched.
+  optical_depth = jnp.maximum(optical_depth, 0.0)
+
   # Transmittance of direct, unscattered beam.
   t_noscat = jnp.exp(-optical_depth / jnp.cos(zenith))
   mu = jnp.cos(zenith)

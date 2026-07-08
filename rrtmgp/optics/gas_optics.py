@@ -365,10 +365,31 @@ def _compute_minor_optical_depth(
     )
     return lambda: scaling
 
-  # Optical depth will be aggregated over all the minor absorbers contributing
-  # to the frequency band.
-  def step_fn(i_and_tau_minor):
-    i, tau_minor = i_and_tau_minor
+  # Optical depth is aggregated over all the minor absorbers contributing to
+  # the frequency band. The contributing intervals form the contiguous range
+  # ``[minor_start_idx, minor_bnd_end[ibnd]]`` within the static
+  # ``minor_absorber_intervals`` table dimension.
+  #
+  # A `lax.while_loop` (or `fori_loop`) with data-dependent start/stop bounds
+  # cannot be reverse-mode differentiated (JAX raises outright). Because the
+  # loop length is a static table dimension, the loop is instead expressed as a
+  # fixed-length `lax.scan` over every minor interval, with each iteration's
+  # contribution masked to zero unless the interval belongs to this band. The
+  # masked-out iterations add exactly ``0.0`` (via `jnp.where`), so the running
+  # sum is bit-identical to the original band-restricted loop while remaining
+  # differentiable in both forward and reverse mode.
+  minor_start_idx = minor_bnd_start[ibnd]
+  minor_end_idx = minor_bnd_end[ibnd]
+  # ``minor_start_idx < 0`` flags a band with no minor absorbers; the mask below
+  # is then never satisfied, so no interval contributes (matching the original
+  # loop, which set the start index past the end and never executed the body).
+  has_minor = minor_start_idx >= 0
+
+  def scan_fn(tau_minor: Array, i: Array) -> tuple[Array, None]:
+    # Whether interval ``i`` belongs to this band's contiguous minor range.
+    in_band = jnp.logical_and(
+        jnp.logical_and(i >= minor_start_idx, i <= minor_end_idx), has_minor
+    )
     # Map the minor contributor to the RRTMGP gas index.
     gas_idx = idx_gases_minor[i] * jnp.ones_like(tropo_idx)
     vmr_minor = get_vmr(lookup, vmr_lib, gas_idx, vmr_fields)
@@ -381,7 +402,7 @@ def _compute_minor_optical_depth(
     # Obtain the global contributor index needed to index into the `kminor`
     # table.
     k_loc = minor_gpt_shift[i] + loc_in_bnd
-    tau_minor += (
+    contribution = (
         optics_utils.interpolate(
             kminor[..., k_loc],
             collections.OrderedDict((
@@ -391,31 +412,15 @@ def _compute_minor_optical_depth(
         )
         * scaling
     )
-    return i + 1, tau_minor
+    tau_minor = tau_minor + jnp.where(in_band, contribution, 0.0)
+    return tau_minor, None
 
-  def cond_fn(i_and_tau_minor):
-    i, _ = i_and_tau_minor
-    return jnp.logical_and(
-        i <= minor_bnd_end[ibnd], i < minor_absorber_intervals
-    )
-
-  minor_start_idx = minor_bnd_start[ibnd]
-  # Both branches must return the same integer dtype: ``minor_start_idx`` keeps
-  # the loaded table's int32, whereas ``jnp.int_`` is int64 when x64 is enabled
-  # (e.g. when a float64 host such as the MAM4-JAX aerosol core turns on
-  # ``jax_enable_x64``), so ``lax.cond`` would reject the int32/int64 mismatch.
-  # Pin the false branch to ``minor_start_idx``'s dtype so the cond is
-  # x64-agnostic.
-  i0 = jax.lax.cond(
-      minor_start_idx >= 0,
-      true_fun=lambda: minor_start_idx,
-      false_fun=lambda: jnp.array(
-          minor_absorber_intervals, dtype=minor_start_idx.dtype
-      ),
-  )
   tau_minor_0 = jnp.zeros_like(temperature)
-
-  return jax.lax.while_loop(cond_fn, step_fn, (i0, tau_minor_0))[1]
+  # ``minor_absorber_intervals`` is a static Python int (a table dimension), so
+  # the scan length is static and reverse-mode differentiable.
+  intervals = jnp.arange(minor_absorber_intervals, dtype=minor_start_idx.dtype)
+  tau_minor, _ = jax.lax.scan(scan_fn, tau_minor_0, intervals)
+  return tau_minor
 
 
 def compute_minor_optical_depth(

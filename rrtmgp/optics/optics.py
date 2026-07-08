@@ -470,9 +470,20 @@ class RRTMOptics(optics_base.OpticsScheme):
 
     optical_depth_sw = optical_depth_sw + rayleigh_scattering
 
+    # Single-scattering albedo. The division by the total optical depth is
+    # guarded with the standard double-`where`: where the optical depth is
+    # non-positive (e.g. a halo/edge cell) the forward value is defined to be
+    # zero, but the raw ``rayleigh_scattering / optical_depth_sw`` in the
+    # unselected branch would still divide by zero and leave a NaN cotangent in
+    # reverse mode. Feed the division a safe (unit) denominator on that branch so
+    # both passes stay finite while the forward result is unchanged.
+    optical_depth_is_positive = optical_depth_sw > 0
+    safe_optical_depth_sw = jnp.where(
+        optical_depth_is_positive, optical_depth_sw, 1.0
+    )
     ssa = jnp.where(
-        optical_depth_sw > 0,
-        rayleigh_scattering / optical_depth_sw,
+        optical_depth_is_positive,
+        rayleigh_scattering / safe_optical_depth_sw,
         jnp.zeros_like(rayleigh_scattering),
     )
 

@@ -145,16 +145,29 @@ def compute_optical_properties(
     optical_props.append(props)
 
   combined_props = jax.tree.map(jnp.add, *optical_props)
+  # The single-scattering albedo and asymmetry factor un-weight the optical
+  # depth (and the ssa-weighted optical depth). A cloud-free cell -- or any cell
+  # whose cloud parameter is driven to zero during calibration -- makes those
+  # denominators vanish. The `jnp.where` already returns 0 there in the forward
+  # pass, but the unselected ``a / 0`` branch would still leave a NaN cotangent
+  # in reverse mode, so the division is fed a safe (unit) denominator on the
+  # masked branch. Forward values are unchanged.
+  tau = combined_props['tau']
+  tau_ssa = combined_props['tau_ssa']
+  tau_is_nonzero = tau != 0
+  tau_ssa_is_nonzero = tau_ssa != 0
+  safe_tau = jnp.where(tau_is_nonzero, tau, 1.0)
+  safe_tau_ssa = jnp.where(tau_ssa_is_nonzero, tau_ssa, 1.0)
   return {
-      'optical_depth': combined_props['tau'],
+      'optical_depth': tau,
       'ssa': jnp.where(
-          combined_props['tau'] != 0,
-          combined_props['tau_ssa'] / combined_props['tau'],
+          tau_is_nonzero,
+          tau_ssa / safe_tau,
           0.0,
       ),
       'asymmetry_factor': jnp.where(
-          combined_props['tau_ssa'] != 0,
-          combined_props['tau_ssa_g'] / combined_props['tau_ssa'],
+          tau_ssa_is_nonzero,
+          combined_props['tau_ssa_g'] / safe_tau_ssa,
           0.0,
       ),
   }
