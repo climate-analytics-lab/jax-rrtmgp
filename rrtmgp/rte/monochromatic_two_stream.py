@@ -403,7 +403,13 @@ def sw_cell_properties(
   # safe (nonzero) albedo and restore the physical `ssa == 0` limit (no diffuse
   # reflection/transmission of the direct beam) by masking the results to zero,
   # matching the forward `finite / inf -> 0` behaviour without the NaN adjoint.
-  ssa_is_positive = ssa > 0.0
+  #
+  # The threshold is 1e-30, not ``> 0``: on the SELECTED branch the division
+  # VJP forms ``x / (ssa * ssa)``-shaped terms, and an albedo in the squared-
+  # underflow window (0 < ssa < ~1e-154, reachable when spectral-ringing
+  # condensate tails leave a vanishing scattering fraction) makes that
+  # 0/0 = NaN. A scattering fraction below 1e-30 is physically zero.
+  ssa_is_positive = ssa > 1e-30
   safe_ssa = jnp.where(ssa_is_positive, ssa, 1.0)
   r_dir_unconstrained = _direct_reflectance(
       gamma1, gamma2, gamma3, alpha2, optical_depth, safe_ssa, zenith

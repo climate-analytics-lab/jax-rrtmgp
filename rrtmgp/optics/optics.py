@@ -477,7 +477,13 @@ class RRTMOptics(optics_base.OpticsScheme):
     # unselected branch would still divide by zero and leave a NaN cotangent in
     # reverse mode. Feed the division a safe (unit) denominator on that branch so
     # both passes stay finite while the forward result is unchanged.
-    optical_depth_is_positive = optical_depth_sw > 0
+    #
+    # The threshold is 1e-30, not ``> 0``: on the SELECTED branch the division
+    # VJP computes ``-g * x / (y * y)``, and an optical depth in the squared-
+    # underflow window (0 < y < ~1e-154, reachable through spectral-ringing
+    # tails in a host model) makes that 0/0 = NaN. An optical depth below
+    # 1e-30 is radiatively nothing.
+    optical_depth_is_positive = optical_depth_sw > 1e-30
     safe_optical_depth_sw = jnp.where(
         optical_depth_is_positive, optical_depth_sw, 1.0
     )
