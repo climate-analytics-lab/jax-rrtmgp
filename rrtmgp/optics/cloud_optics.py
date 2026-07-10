@@ -157,8 +157,15 @@ def compute_optical_properties(
   # masked branch. Forward values are unchanged.
   tau = combined_props['tau']
   tau_ssa = combined_props['tau_ssa']
-  tau_is_nonzero = tau != 0
-  tau_ssa_is_nonzero = tau_ssa != 0
+  # The guard threshold is 1e-30, NOT ``!= 0``: the division VJP on the
+  # SELECTED branch computes ``-g * x / (y * y)``, and a host model's
+  # spectral-ringing condensate tails produce cloud paths (hence taus) down to
+  # ~1e-290, where the squared denominator underflows to 0 and the backward
+  # pass evaluates 0/0 = NaN while the forward stays finite. An optical depth
+  # below 1e-30 is radiatively nothing, so routing it to the masked (zero)
+  # branch changes no physical result.
+  tau_is_nonzero = jnp.abs(tau) > 1e-30
+  tau_ssa_is_nonzero = jnp.abs(tau_ssa) > 1e-30
   safe_tau = jnp.where(tau_is_nonzero, tau, 1.0)
   safe_tau_ssa = jnp.where(tau_ssa_is_nonzero, tau_ssa, 1.0)
   return {
