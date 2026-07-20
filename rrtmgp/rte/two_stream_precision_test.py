@@ -264,10 +264,14 @@ class TwoStreamFloat32PrecisionTest(unittest.TestCase):
       )
       return sum(jnp.sum(v) for v in out.values())
 
-    # tau = 0, thin tau, thick tau; ssa = 0, near-conservative; the SW
-    # profile sits at the k*mu0 = 1 resonance of the KGO test point.
-    tau = jnp.asarray([0.0, 1e-8, 1e-4, 0.03, 5.0, 100.0])
-    ssa = jnp.asarray([0.0, 0.999, 0.2722723, 0.2722723, 0.5, 0.0])
+    # tau = 0, thin tau, thick tau; ssa = 0, near-conservative, and
+    # EXACTLY conservative (ssa = 1 -> k^2 = 0: an f32 Rayleigh-only
+    # g-point rounds there, and a sqrt(k2) on the reverse path NaN'd every
+    # clear-sky SW temperature gradient before the x2-parameterized
+    # helpers); the SW profile also sits at the k*mu0 = 1 resonance of the
+    # KGO test point.
+    tau = jnp.asarray([0.0, 1e-8, 1e-4, 0.03, 5.0, 100.0, 0.1, 10.0])
+    ssa = jnp.asarray([0.0, 0.999, 0.2722723, 0.2722723, 0.5, 0.0, 1.0, 1.0])
     for fn in (lw_sum, sw_sum):
       grads = jax.grad(fn, argnums=(0, 1))(tau, ssa)
       for grad in grads:

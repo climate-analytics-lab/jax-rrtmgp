@@ -118,36 +118,62 @@ def _eps_of(x: Array) -> float:
   return float(jnp.finfo(jnp.result_type(x)).eps)
 
 
-def _sinhc(x: Array) -> Array:
-  """``sinh(x)/x`` with the exact limit 1 at ``x = 0``.
+# The three hyperbolic helpers below are parameterized by ``x2 = x**2``, NOT
+# by ``x`` — because their only caller has ``x = k*tau`` with ``k = sqrt(k2)``
+# and ``k2`` hitting *exactly* zero for conservative scattering (an f32
+# Rayleigh-only g-point rounds ssa to 1). The functions are analytically
+# smooth in ``x2``, but composing them as ``f(sqrt(x2))`` puts
+# ``d sqrt/d x2 = inf`` on the reverse path at ``x2 = 0`` and the chain rule
+# manufactures ``0 * inf = NaN`` cotangents (this NaN'd every clear-sky SW
+# column's temperature gradient). Taking ``x2`` directly keeps the series
+# branch polynomial (clean adjoint) and confines ``sqrt`` to the branch where
+# ``x2`` is bounded away from zero by the eps-scaled series threshold.
 
-  For ``x`` below an eps-scaled threshold the direct quotient loses relative
-  accuracy (and is 0/0 at exactly 0), so the truncated series
-  ``1 + x^2/6 + x^4/120`` is used; its truncation error ``~x^6/5040`` is below
-  machine eps at the switch point ``(5040*eps)**(1/6)``. Safe operands sit
-  inside both ``where`` branches so reverse-mode gradients never see 0/0.
+
+def _sinhc2(x2: Array) -> Array:
+  """``sinh(x)/x`` as a function of ``x2 = x**2``; exact limit 1 at 0.
+
+  Below an eps-scaled threshold the truncated series
+  ``1 + x2/6*(1 + x2/20)`` is used (truncation ``~x2**3/5040``, below machine
+  eps at the switch ``(5040*eps)**(1/3)``); above it the direct quotient with
+  a safe ``sqrt`` operand. Safe operands sit inside both ``where`` branches
+  so reverse-mode gradients never see 0/0 or ``sqrt'(0)``.
   """
-  x0 = (5040.0 * _eps_of(x)) ** (1.0 / 6.0)
-  small = jnp.abs(x) < x0
-  x_safe = jnp.where(small, 1.0, x)
-  x2 = jnp.square(jnp.where(small, x, 0.0))
-  return jnp.where(small, 1.0 + x2 / 6.0 * (1.0 + x2 / 20.0),
+  t0 = (5040.0 * _eps_of(x2)) ** (1.0 / 3.0)
+  small = x2 < t0
+  x_safe = jnp.sqrt(jnp.where(small, 1.0, x2))
+  x2s = jnp.where(small, x2, 0.0)
+  return jnp.where(small, 1.0 + x2s / 6.0 * (1.0 + x2s / 20.0),
                    jnp.sinh(x_safe) / x_safe)
 
 
-def _sinhc_m1(x: Array) -> Array:
-  """``sinh(x)/x - 1`` without cancellation near ``x = 0``.
+def _sinhc2_m1(x2: Array) -> Array:
+  """``sinh(x)/x - 1`` as a function of ``x2 = x**2``, cancellation-free.
 
-  The direct form subtracts two numbers that agree to ``O(x^2)``; the series
-  ``x^2/6*(1 + x^2/20)`` is exact to machine eps for
-  ``x < (840*eps)**(1/4)`` (next term ``x^6/5040`` relative ``~x^4/840``).
+  The direct form subtracts two numbers agreeing to ``O(x2)``; the series
+  ``x2/6*(1 + x2/20)`` is exact to machine eps for ``x2 < sqrt(840*eps)``
+  (next term ``x2**3/5040``, relative ``~x2**2/840``).
   """
-  x0 = (840.0 * _eps_of(x)) ** 0.25
-  small = jnp.abs(x) < x0
-  x_safe = jnp.where(small, 1.0, x)
-  x2 = jnp.square(jnp.where(small, x, 0.0))
-  return jnp.where(small, x2 / 6.0 * (1.0 + x2 / 20.0),
+  t0 = (840.0 * _eps_of(x2)) ** 0.5
+  small = x2 < t0
+  x_safe = jnp.sqrt(jnp.where(small, 1.0, x2))
+  x2s = jnp.where(small, x2, 0.0)
+  return jnp.where(small, x2s / 6.0 * (1.0 + x2s / 20.0),
                    jnp.sinh(x_safe) / x_safe - 1.0)
+
+
+def _cosh2(x2: Array) -> Array:
+  """``cosh(x)`` as a function of ``x2 = x**2``.
+
+  Series ``1 + x2/2*(1 + x2/12)`` below ``(720*eps)**(1/3)`` (truncation
+  ``~x2**3/720``); direct ``cosh(sqrt(x2))`` with a safe operand above.
+  """
+  t0 = (720.0 * _eps_of(x2)) ** (1.0 / 3.0)
+  small = x2 < t0
+  x_safe = jnp.sqrt(jnp.where(small, 1.0, x2))
+  x2s = jnp.where(small, x2, 0.0)
+  return jnp.where(small, 1.0 + x2s / 2.0 * (1.0 + x2s / 12.0),
+                   jnp.cosh(x_safe))
 
 
 def _k_squared(gamma1: Array, gamma2: Array) -> Array:
@@ -326,25 +352,30 @@ def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
   eps = _eps_of(gamma1)
   k2 = _k_squared(gamma1, gamma2)
   k = _k_fn(gamma1, gamma2)
-  ktau = jnp.sqrt(k2) * tau
-  small = ktau < _KTAU_SWITCH
+  # The branch selector and the whole small branch are written in
+  # x2 = (k*tau)^2 = k2*tau^2 — never through sqrt(k2), whose reverse-mode
+  # derivative is infinite at the conservative-scattering point k2 = 0 (see
+  # the note above the hyperbolic helpers). ``k`` itself (eps-floored, safe
+  # adjoint) is used only by the large branch.
+  x2 = k2 * jnp.square(tau)
+  small = x2 < _KTAU_SWITCH**2
   gsum = jnp.maximum(gamma1 + gamma2, eps)
 
   # --- small-k*tau branch (safe operands: argument clipped to the switch
   # point inside the branch so sinh/cosh never overflow when unselected).
-  x = jnp.where(small, ktau, _KTAU_SWITCH)
-  shc = _sinhc(x)
-  ch = jnp.cosh(x)
+  x2c = jnp.where(small, x2, _KTAU_SWITCH**2)
+  shc = _sinhc2(x2c)
+  ch = _cosh2(x2c)
   c_small = ch + gamma1 * tau * shc
   r_small = gamma2 * tau * shc / c_small
   t_small = 1.0 / c_small
   # 1 - R - T = tau*(k^2 tau/2 * sinhc^2(x/2) + (g1-g2) sinhc(x)) / C
-  shc_half = _sinhc(0.5 * x)
+  shc_half = _sinhc2(0.25 * x2c)
   omrt_small = tau * (0.5 * k2 * tau * jnp.square(shc_half)
                       + (gamma1 - gamma2) * shc) / c_small
   # G - T = (k^2 tau/(2 gsum) * sinhc^2(x/2) + sinhc_m1(x)) / C
   gmt_small = (0.5 * k2 * tau * jnp.square(shc_half) / gsum
-               + _sinhc_m1(x)) / c_small
+               + _sinhc2_m1(x2c)) / c_small
 
   # --- large-k*tau branch (exp-scaled; safe at any tau).
   ktau_big = jnp.where(small, _KTAU_SWITCH, k * tau)
