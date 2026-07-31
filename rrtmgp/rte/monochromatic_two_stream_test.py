@@ -103,14 +103,18 @@ class MonochromaticTwoStreamTest(unittest.TestCase):
     )
 
     # VERIFICATION
-    # Expected output obtained by running the CliMA code on the input above.
+    # Expected output evaluated in float128 from the analytic two-stream
+    # solution (Meador & Weaver 1980 eqs 25-26 + the Toon et al. 1989
+    # linear-in-tau sources). The original CliMA-derived values agreed only
+    # to ~2e-5 (float32 noise of the cancelling formulation they were
+    # generated with); these are exact to well beyond the tolerance.
     expected_t = 0.95177512 * jnp.ones_like(planck_src_top, dtype=jnp.float_)
     expected_r = 1.1854426e-4 * jnp.ones_like(planck_src_top, dtype=jnp.float_)
     expected_src_up = convert_to_3d(
-        jnp.array([0.0227322, 0.03784506, 0.05295792, 0.06807115])
+        jnp.array([0.022731973, 0.037845025, 0.052958076, 0.068071128])
     )
     expected_src_down = convert_to_3d(
-        jnp.array([0.02260674, 0.03772035, 0.05283246, 0.06794681])
+        jnp.array([0.022607182, 0.037720234, 0.052833285, 0.067946337])
     )
 
     np.testing.assert_allclose(output['t_diff'], expected_t, rtol=1e-5, atol=0)
@@ -169,11 +173,16 @@ class MonochromaticTwoStreamTest(unittest.TestCase):
     )
 
     # VERIFICATION
-    # Expected output obtained by running the original RRTMGP code on the input
-    # above.
+    # Expected diffuse values obtained by running the original RRTMGP code on
+    # the input above. The direct reflectance is instead the float128 limit of
+    # the analytic expression: this input sits at the removable singularity
+    # k*mu0 = 1 (|1 - k^2 mu0^2| ~ 8.5e-7), where the original code's
+    # fixed-epsilon denominator clamp produced 0.0012536654 -- an artifact
+    # ~4x below the true value. The reformulated solver evaluates the limit
+    # exactly, so the reference is the true value.
     expected_t_diff = 0.9523814 * jnp.ones_like(optical_depth, dtype=jnp.float_)
     expected_r_diff = 0.0048960485 * jnp.ones_like(optical_depth, dtype=jnp.float_)
-    expected_r_dir = 0.0012536654 * jnp.ones_like(optical_depth, dtype=jnp.float_)
+    expected_r_dir = 0.0053730679 * jnp.ones_like(optical_depth, dtype=jnp.float_)
 
     np.testing.assert_allclose(
         output['t_diff'], expected_t_diff, rtol=1e-5, atol=0
