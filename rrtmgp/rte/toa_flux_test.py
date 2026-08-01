@@ -31,6 +31,7 @@ A US Standard Atmosphere column is also run end to end as a coarse sanity band
 on clear-sky OLR.
 """
 
+import dataclasses
 import functools
 from pathlib import Path
 from typing import TypeAlias
@@ -219,6 +220,33 @@ class ToaFluxTest(unittest.TestCase):
         )
         flux_down_toa = np.asarray(fluxes['flux_down'])[:, :, -1]
         np.testing.assert_allclose(flux_down_toa, 0.0, atol=1e-5)
+
+    def test_toa_downwelling_longwave_matches_prescribed_flux(self):
+        """A nonzero prescribed incoming longwave must arrive undistorted.
+
+        Each g-point is solved separately and the results are summed over the
+        spectrum, so a broadband boundary flux handed unchanged to every
+        g-point would come back multiplied by `n_gpt_lw` (256x for the g256
+        table) and would inflate the whole downwelling profile, not just the
+        top face.
+        """
+        optics_lib, atmos_state = _radiation_setup(_SFC_EMIS)
+        p, t, molecules, h2o, o3, sfc_temperature = _build_ussa_column()
+        vmr_fields = {'h2o': h2o, 'o3': o3}
+
+        for toa_flux_lw in (1.0, 10.0):
+            state = dataclasses.replace(
+                atmos_state, toa_flux_lw=toa_flux_lw
+            )
+            fluxes = two_stream.solve_lw(
+                p, t, molecules, optics_lib, state, vmr_fields,
+                sfc_temperature, use_scan=True,
+            )
+            flux_down_toa = np.asarray(fluxes['flux_down'])[:, :, -1]
+            np.testing.assert_allclose(
+                flux_down_toa, toa_flux_lw, rtol=1e-5,
+                err_msg=f'for toa_flux_lw={toa_flux_lw}',
+            )
 
     def test_us_standard_atmosphere_clear_sky_olr(self):
         """Clear-sky OLR for a USSA column sits in a physically sane band.

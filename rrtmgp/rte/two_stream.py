@@ -223,9 +223,19 @@ def solve_lw(
         aerosol_optics_slice=aer_slice,
     )
 
-    # Boundary conditions.
+    # Boundary conditions. `toa_flux_lw` prescribes the *broadband* downwelling
+    # flux at the top of the atmosphere, but each g-point is solved as a
+    # separate radiative transfer problem and the results are summed over the
+    # spectrum below. Feeding the full broadband value to every g-point would
+    # therefore return `n_gpt_lw` times the prescribed flux. Split it across the
+    # g-points so the spectral sum reproduces it exactly. The shortwave path
+    # does the same thing with the physically-derived
+    # `solar_fraction_by_gpt` weights; a prescribed broadband longwave flux
+    # carries no such spectral information, so it is divided uniformly.
     sfc_src = optical_props_2stream['sfc_src']
-    toa_flux_down_lw = atmos_state.toa_flux_lw * jnp.ones_like(sfc_src)
+    toa_flux_down_lw = (
+        atmos_state.toa_flux_lw / optics_lib.n_gpt_lw
+    ) * jnp.ones_like(sfc_src)
     sfc_emissivity_lw = atmos_state.sfc_emis * jnp.ones_like(sfc_src)
 
     fluxes = monochromatic_two_stream.lw_transport(
