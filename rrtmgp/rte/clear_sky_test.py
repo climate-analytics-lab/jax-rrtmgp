@@ -63,6 +63,18 @@ def _remove_halos(f: Array) -> Array:
     return f[:, :, 1:-1]
 
 
+def _interior_and_toa(f: Array) -> Array:
+    """Drop the bottom halo but keep the top face, which is the TOA level.
+
+    The reference fluxes are padded at the bottom only, so index -1 holds the
+    top-of-atmosphere level rather than an unused halo. Comparing only
+    `_remove_halos` therefore leaves the TOA -- the level OLR is read from --
+    completely unchecked, which is how a spurious extrapolation there went
+    unnoticed (issue #19).
+    """
+    return f[:, :, 1:]
+
+
 def _setup_radiation_params(
     site: int,
     use_compact_lookup: bool,
@@ -212,13 +224,14 @@ class ClearSkyTest(unittest.TestCase):
         exp_up_sw = conv3d(sw_up[rfmip_expt_id, rfmip_site, :])
         exp_dn_sw = conv3d(sw_dn[rfmip_expt_id, rfmip_site, :])
 
+        # The comparison spans the interior *and* the top-of-atmosphere face.
         atol=0.2
-        np.testing.assert_allclose(_remove_halos(lw['flux_down']), _remove_halos(exp_dn_lw), rtol=1e-2, atol=atol)
-        np.testing.assert_allclose(_remove_halos(lw['flux_up']),   _remove_halos(exp_up_lw), rtol=7e-3, atol=atol)
+        np.testing.assert_allclose(_interior_and_toa(lw['flux_down']), _interior_and_toa(exp_dn_lw), rtol=1e-2, atol=atol)
+        np.testing.assert_allclose(_interior_and_toa(lw['flux_up']),   _interior_and_toa(exp_up_lw), rtol=7e-3, atol=atol)
 
         rtol = 7e-3 if use_compact_lookup else 1e-3
-        np.testing.assert_allclose(_remove_halos(sw['flux_down']), _remove_halos(exp_dn_sw), rtol=rtol, atol=atol)
-        np.testing.assert_allclose(_remove_halos(sw['flux_up']),   _remove_halos(exp_up_sw), rtol=rtol, atol=atol)
+        np.testing.assert_allclose(_interior_and_toa(sw['flux_down']), _interior_and_toa(exp_dn_sw), rtol=rtol, atol=atol)
+        np.testing.assert_allclose(_interior_and_toa(sw['flux_up']),   _interior_and_toa(exp_up_sw), rtol=rtol, atol=atol)
 
 
 if __name__ == '__main__':

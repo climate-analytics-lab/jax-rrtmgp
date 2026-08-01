@@ -112,23 +112,6 @@ def _reindex_vmr_fields(
   return {gas_optics_lib.idx_gases[k]: v for k, v in vmr_fields.items()}
 
 
-def _replace_top_flux(f: Array) -> Array:
-  """Modify problematic value for the fluxes at the top boundary (top halo).
-
-  Use quadratic polynomials to evaluate the flux at the top boundary making use
-  of the points just below the top boundary.
-
-  Args:
-    f: The array to fix the top boundary of.
-
-  Returns:
-    The array with the top boundary value fixed.
-  """
-  top_bdy_f = 3 * f[:, :, -2] - 3 * f[:, :, -3] + f[:, :, -4]
-  f = f.at[:, :, -1].set(top_bdy_f)
-  return f
-
-
 def solve_lw(
     pressure: Array,
     temperature: Array,
@@ -240,9 +223,19 @@ def solve_lw(
         aerosol_optics_slice=aer_slice,
     )
 
-    # Boundary conditions.
+    # Boundary conditions. `toa_flux_lw` prescribes the *broadband* downwelling
+    # flux at the top of the atmosphere, but each g-point is solved as a
+    # separate radiative transfer problem and the results are summed over the
+    # spectrum below. Feeding the full broadband value to every g-point would
+    # therefore return `n_gpt_lw` times the prescribed flux. Split it across the
+    # g-points so the spectral sum reproduces it exactly. The shortwave path
+    # does the same thing with the physically-derived
+    # `solar_fraction_by_gpt` weights; a prescribed broadband longwave flux
+    # carries no such spectral information, so it is divided uniformly.
     sfc_src = optical_props_2stream['sfc_src']
-    toa_flux_down_lw = atmos_state.toa_flux_lw * jnp.ones_like(sfc_src)
+    toa_flux_down_lw = (
+        atmos_state.toa_flux_lw / optics_lib.n_gpt_lw
+    ) * jnp.ones_like(sfc_src)
     sfc_emissivity_lw = atmos_state.sfc_emis * jnp.ones_like(sfc_src)
 
     fluxes = monochromatic_two_stream.lw_transport(
@@ -261,14 +254,16 @@ def solve_lw(
   flux_keys = ['flux_up', 'flux_down', 'flux_net']
   init_val = {key: jnp.zeros_like(temperature) for key in flux_keys}
 
-  fluxes = jax.lax.fori_loop(0, optics_lib.n_gpt_lw, step_fn, init_val)
-  # There are problematic values for the fluxes at the top boundary (the top
-  # halo), so fix using a quadratic polynomial to evaluate the flux at the top
-  # boundary.
-  for key in flux_keys:
-    fluxes[key] = _replace_top_flux(fluxes[key])
-
-  return fluxes
+  # The top halo face is the top of the atmosphere, and the solver already
+  # produces the correct value there: the downward recurrence seeds
+  # `flux_down[..., -1]` with the prescribed incoming flux, and `flux_up` at
+  # that face follows from the shifted albedo and aggregate emission of the
+  # whole column below. It therefore must not be overwritten -- an earlier
+  # quadratic extrapolation from the interior did, which replaced the exact
+  # downwelling boundary value with a spurious nonzero flux and degraded the
+  # net flux (and hence the top layer's heating rate) at the top of the
+  # atmosphere. See `toa_flux_test.py` and issue #19.
+  return jax.lax.fori_loop(0, optics_lib.n_gpt_lw, step_fn, init_val)
 
 
 def solve_sw(
@@ -437,12 +432,9 @@ def solve_sw(
   flux_keys = ['flux_up', 'flux_down', 'flux_net']
   fluxes_0 = {key: jnp.zeros_like(temperature) for key in flux_keys}
 
+  # As in `solve_lw`, the top halo face is the top of the atmosphere and the
+  # solver already produces the correct value there, so it is left untouched.
   fluxes = jax.lax.fori_loop(0, optics_lib.n_gpt_sw, step_fn, fluxes_0)
-  # There are problematic values for the fluxes at the top boundary (the top
-  # halo), so fix using a quadratic polynomial to evaluate the flux at the top
-  # boundary.
-  for key in flux_keys:
-    fluxes[key] = _replace_top_flux(fluxes[key])
   # Zero out columns where the sun is at or below the horizon. `night` is a
   # scalar (single column) or, under a column `vmap`, a per-column scalar; it
   # broadcasts over the trailing spatial/vertical axes of each flux field.
