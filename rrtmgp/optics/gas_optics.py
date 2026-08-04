@@ -19,6 +19,7 @@ from typing import TypeAlias
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from rrtmgp.optics import lookup_gas_optics_base
 from rrtmgp.optics import lookup_gas_optics_longwave
 from rrtmgp.optics import lookup_gas_optics_shortwave
@@ -272,6 +273,45 @@ def compute_major_optical_depth(
   )
 
 
+def minor_scan_length(
+    minor_bnd_start: Array,
+    minor_bnd_end: Array,
+    minor_absorber_intervals: int,
+) -> int:
+  """Static length of the minor-absorber scan: the widest band's range.
+
+  Each band draws on a contiguous range of minor-absorber intervals. The scan
+  that accumulates their optical depth must have a compile-time length (a
+  data-dependent `while_loop` is not reverse-mode differentiable), but that
+  length only has to cover the *widest* band, not the whole table: the scan
+  walks the offset within a band, not the absolute interval index.
+
+  This distinction is worth a lot. For the shipped tables the widest band spans
+  5-11 intervals against table dimensions of 24-60, so scanning the full table
+  would evaluate roughly 12-16x more interpolations than any band actually
+  uses, all of them masked away afterwards. That was the dominant cost in the
+  runtime regression of issue #22.
+
+  Args:
+    minor_bnd_start: Per-band index of the first contributing minor interval,
+      negative for a band with no minor absorbers.
+    minor_bnd_end: Per-band index of the last contributing minor interval.
+    minor_absorber_intervals: Size of the table's minor-interval dimension.
+
+  Returns:
+    The scan length, as a Python int so it stays a compile-time constant.
+  """
+  # These are loaded lookup constants, never traced values, so converting to
+  # numpy here is safe under `jit` and keeps the result static.
+  starts = np.asarray(minor_bnd_start)
+  ends = np.asarray(minor_bnd_end)
+  if starts.size == 0:
+    return 0
+  widths = np.where(starts >= 0, ends - starts + 1, 0)
+  # Clamp into range: guards a degenerate/empty table and any stray limits.
+  return int(np.clip(widths.max(), 0, minor_absorber_intervals))
+
+
 def _compute_minor_optical_depth(
     lookup: AbstractLookupGasOptics,
     vmr_lib: LookupVolumeMixingRatio,
@@ -371,13 +411,19 @@ def _compute_minor_optical_depth(
   # ``minor_absorber_intervals`` table dimension.
   #
   # A `lax.while_loop` (or `fori_loop`) with data-dependent start/stop bounds
-  # cannot be reverse-mode differentiated (JAX raises outright). Because the
-  # loop length is a static table dimension, the loop is instead expressed as a
-  # fixed-length `lax.scan` over every minor interval, with each iteration's
-  # contribution masked to zero unless the interval belongs to this band. The
-  # masked-out iterations add exactly ``0.0`` (via `jnp.where`), so the running
-  # sum is bit-identical to the original band-restricted loop while remaining
-  # differentiable in both forward and reverse mode.
+  # cannot be reverse-mode differentiated (JAX raises outright), so the loop is
+  # expressed as a fixed-length `lax.scan` with each iteration masked to the
+  # band. The length has to be a compile-time constant, but it does NOT have to
+  # be the whole table: only the *widest* band's range needs to fit. Scanning
+  # all `minor_absorber_intervals` instead would evaluate an interpolation per
+  # interval per g-point for intervals that are then masked away -- roughly
+  # 12-16x more work than the original band-restricted loop, which dominated
+  # the runtime regression in issue #22.
+  #
+  # So the scan runs over the offset `j` within the band, `i = start + j`, for a
+  # static length equal to the widest band range in the table. Iterations past
+  # this band's end are masked out and add exactly 0.0, so the sum is identical
+  # to the band-restricted loop while staying differentiable in both modes.
   minor_start_idx = minor_bnd_start[ibnd]
   minor_end_idx = minor_bnd_end[ibnd]
   # ``minor_start_idx < 0`` flags a band with no minor absorbers; the mask below
@@ -385,11 +431,25 @@ def _compute_minor_optical_depth(
   # loop, which set the start index past the end and never executed the body).
   has_minor = minor_start_idx >= 0
 
-  def scan_fn(tau_minor: Array, i: Array) -> tuple[Array, None]:
+  max_band_width = minor_scan_length(
+      minor_bnd_start, minor_bnd_end, minor_absorber_intervals
+  )
+
+  if max_band_width == 0:
+    # No band in this table has any minor absorber.
+    return jnp.zeros_like(temperature)
+
+  def scan_fn(tau_minor: Array, j: Array) -> tuple[Array, None]:
+    # Absolute interval index for offset ``j`` within this band's range.
+    i_unclamped = minor_start_idx + j
     # Whether interval ``i`` belongs to this band's contiguous minor range.
     in_band = jnp.logical_and(
-        jnp.logical_and(i >= minor_start_idx, i <= minor_end_idx), has_minor
+        jnp.logical_and(i_unclamped <= minor_end_idx, has_minor),
+        i_unclamped < minor_absorber_intervals,
     )
+    # The index is only read when `in_band`; clamp it so the out-of-range
+    # iterations of a narrower-than-maximum band stay inside the table.
+    i = jnp.clip(i_unclamped, 0, minor_absorber_intervals - 1)
     # Map the minor contributor to the RRTMGP gas index.
     gas_idx = idx_gases_minor[i] * jnp.ones_like(tropo_idx)
     vmr_minor = get_vmr(lookup, vmr_lib, gas_idx, vmr_fields)
@@ -416,10 +476,10 @@ def _compute_minor_optical_depth(
     return tau_minor, None
 
   tau_minor_0 = jnp.zeros_like(temperature)
-  # ``minor_absorber_intervals`` is a static Python int (a table dimension), so
-  # the scan length is static and reverse-mode differentiable.
-  intervals = jnp.arange(minor_absorber_intervals, dtype=minor_start_idx.dtype)
-  tau_minor, _ = jax.lax.scan(scan_fn, tau_minor_0, intervals)
+  # ``max_band_width`` is a Python int, so the scan length is static and
+  # reverse-mode differentiable.
+  offsets = jnp.arange(max_band_width, dtype=minor_start_idx.dtype)
+  tau_minor, _ = jax.lax.scan(scan_fn, tau_minor_0, offsets)
   return tau_minor
 
 
