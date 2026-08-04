@@ -162,6 +162,38 @@ def _radiation_setup():
             {'h2o': vmr_h2o, 'o3': vmr_o3}, sfc_temperature)
 
 
+def _scan_lengths(jaxpr) -> list[int]:
+    """Every `scan` trip count in `jaxpr`, including nested sub-jaxprs.
+
+    Reads the trip count straight off the traced program, so it reflects what
+    the solver actually does rather than what a helper reports.
+    """
+    lengths = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == 'scan':
+            lengths.append(int(eqn.params['length']))
+        for value in eqn.params.values():
+            for sub in (value if isinstance(value, (tuple, list)) else (value,)):
+                inner = getattr(sub, 'jaxpr', sub)
+                if hasattr(inner, 'eqns'):
+                    lengths.extend(_scan_lengths(inner))
+    return lengths
+
+
+def _minor_optical_depth_scan_lengths(lookup, atmos_state, molecules, p, t,
+                                      vmr_fields) -> list[int]:
+    """Trace the real minor-gas optical depth and collect its scan lengths."""
+    vmr_by_index = {
+        lookup.idx_gases[name]: field for name, field in vmr_fields.items()
+    }
+    jaxpr = jax.make_jaxpr(
+        lambda temp: gas_optics.compute_minor_optical_depth(
+            lookup, atmos_state.vmr, molecules, temp, p, 0, vmr_by_index
+        )
+    )(t)
+    return _scan_lengths(jaxpr.jaxpr)
+
+
 def _compiled_cost(band: str) -> dict[str, float]:
     """Compile the solve for `band` and return XLA's cost analysis."""
     (optics_lib, atmos_state, p, t, molecules, vmr_fields,
@@ -223,6 +255,51 @@ class PerformanceTest(unittest.TestCase):
                          f'band uses.'),
                 )
 
+    def test_minor_gas_scan_trip_count_in_traced_solver(self):
+        """The trip count the solver actually uses, not what a helper returns.
+
+        The check above pins `minor_scan_length`, which is only useful while
+        `_compute_minor_optical_depth` keeps calling it. Reverting that call
+        site to scan the whole table would restore the regression with the
+        helper left untouched, and the check above would still pass. This one
+        reads the trip count off the traced program, so it follows the code
+        that actually runs.
+        """
+        (optics_lib, atmos_state, p, t, molecules, vmr_fields,
+         _) = _radiation_setup()
+        lookup = optics_lib.gas_optics_lw
+
+        lengths = _minor_optical_depth_scan_lengths(
+            lookup, atmos_state, molecules, p, t, vmr_fields
+        )
+        self.assertTrue(
+            lengths, 'no scan found in the minor-gas optical depth; the '
+                     'traced structure changed and this guard needs updating'
+        )
+
+        # The lower and upper atmosphere are accumulated separately, so the
+        # widest band of either bounds every scan here.
+        widest = 0
+        for start, end in ((lookup.minor_lower_bnd_start,
+                            lookup.minor_lower_bnd_end),
+                           (lookup.minor_upper_bnd_start,
+                            lookup.minor_upper_bnd_end)):
+            widths = np.where(
+                np.asarray(start) >= 0,
+                np.asarray(end) - np.asarray(start) + 1,
+                0,
+            )
+            widest = max(widest, int(widths.max()))
+
+        table_dim = max(lookup.n_minor_absrb_lower, lookup.n_minor_absrb_upper)
+        self.assertLessEqual(
+            max(lengths), widest,
+            msg=(f'minor-gas scan runs {max(lengths)} iterations, more than '
+                 f'the widest band ({widest}) needs. Scanning the full table '
+                 f'({table_dim}) evaluates interpolations that are then masked '
+                 f'away -- the issue #22 regression.'),
+        )
+
     def test_longwave_solve_arithmetic_within_budget(self):
         self._assert_within_budget('lw')
 
@@ -237,10 +314,26 @@ class PerformanceTest(unittest.TestCase):
         why the scan length is pinned separately above.
         """
         cost = _compiled_cost(band)
-        flops = cost.get('flops', 0.0)
-        transcendentals = cost.get('transcendentals', 0.0)
+
+        # Both metrics must actually be reported. Defaulting a missing key to
+        # zero would leave the corresponding budget vacuously satisfied, so a
+        # backend or JAX version that stops reporting one would silently
+        # disable the guard rather than fail visibly.
+        for metric in ('flops', 'transcendentals'):
+            self.assertIn(
+                metric, cost,
+                msg=(f'cost analysis did not report {metric!r}, so its budget '
+                     f'cannot be enforced. Keys present: {sorted(cost)}'),
+            )
+        flops = cost['flops']
+        transcendentals = cost['transcendentals']
 
         self.assertGreater(flops, 0.0, 'cost analysis reported no flops')
+        self.assertGreater(
+            transcendentals, 0.0,
+            'cost analysis reported no transcendentals; the solve uses exp and '
+            'sqrt, so a zero here means the metric is not being measured',
+        )
         self.assertLessEqual(
             flops, _MAX_FLOPS[band],
             msg=(f'{band.upper()} solve costs {flops:,.0f} flops per g-point '
