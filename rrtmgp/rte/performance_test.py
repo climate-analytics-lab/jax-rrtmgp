@@ -70,19 +70,38 @@ _ATMOS_STATE = 'rrtmgp/optics/test_data/clearsky_as.nc'
 _VMR_GLOBAL_MEANS = 'rrtmgp/optics/test_data/vmr_global_means.json'
 
 _HALO = 1
-_N_HORIZ = 2
+# Column count matters for what these budgets actually measure. The production
+# use case (a GCM radiation call) solves a large batch of independent columns,
+# where cost is dominated by per-element work in the g-point loop body. At a
+# handful of columns, fixed per-call overhead dilutes exactly the per-element
+# costs that hurt in production, so a budget calibrated there would be
+# insensitive to the regressions worth catching. 136x136 = 18,496 columns is
+# the T63L47 grid (18,432) to within rounding.
+#
+# This costs nothing to run: the guards below only *compile* the solve and read
+# XLA's cost model. Nothing is executed, so the large shape adds no runtime.
+_N_HORIZ = 136
 
-# Per-g-point-body budgets. Reference values on the implementation these were
-# written against (g256 longwave / g224 shortwave, 2x2 columns):
+# Per-g-point-body budgets at the column count above (g256 longwave / g224
+# shortwave). Reference values on the implementation these were written
+# against:
 #
-#            flops        transcendentals
-#   LW    2,358,866            19,840
-#   SW    2,221,804            18,848
+#            flops          transcendentals
+#   LW    2,463,834,112         9,174,016
+#   SW    2,354,763,008        16,054,528
 #
-# The ceilings carry ~35% headroom. For scale, the arithmetic here is already
-# ~6x the transcendental count of the 0.2.1 release, so these are not tight.
-_MAX_FLOPS = {'lw': 3_200_000, 'sw': 3_000_000}
-_MAX_TRANSCENDENTALS = {'lw': 27_000, 'sw': 26_000}
+# The ceilings carry ~30% headroom. They are set from the *current* numbers
+# rather than left slack at a historical high-water mark: the transcendental
+# counts were ~2.5x (longwave) higher before the hyperbolic quantities were
+# computed together, and a budget loose enough to admit that guards nothing.
+#
+# These scale with the column count, so changing `_N_HORIZ` means recomputing
+# them. Per element the figures above are ~8 transcendentals; at 2x2 columns
+# the same code measures ~32, because fixed per-call work is then spread over
+# far fewer elements -- which is the reason the guard is calibrated at the
+# production shape rather than a token one.
+_MAX_FLOPS = {'lw': 3_200_000_000, 'sw': 3_100_000_000}
+_MAX_TRANSCENDENTALS = {'lw': 12_000_000, 'sw': 21_000_000}
 
 
 def _radiation_setup():
