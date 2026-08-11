@@ -74,8 +74,15 @@ Array: TypeAlias = jax.Array
 # Primitives that map to a hardware transcendental / special-function unit.
 # Counted separately because they dominate the radiative transfer inner loop
 # and are what regressed in issue #22.
+#
+# `integer_pow` is deliberately NOT here. `x ** 2` traces to `integer_pow`, but
+# a static non-negative exponent lowers to repeated multiplication, not to a
+# special-function unit. Counting it as transcendental would let a
+# cost-neutral `x * x` -> `x ** 2` refactor blow the transcendental budget and
+# fail a guard for nothing. General `pow` (a runtime/float exponent) is a real
+# transcendental and stays.
 TRANSCENDENTAL_PRIMITIVES = frozenset({
-    'exp', 'exp2', 'expm1', 'log', 'log1p', 'pow', 'integer_pow',
+    'exp', 'exp2', 'expm1', 'log', 'log1p', 'pow',
     'sqrt', 'rsqrt', 'cbrt', 'logistic',
     'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2',
     'sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh',
@@ -133,6 +140,45 @@ class OpCounts:
     return '\n'.join(lines)
 
 
+def _aval_size(var) -> int:
+  """Element count of a jaxpr variable, or 0 if it has no shape."""
+  aval = getattr(var, 'aval', None)
+  return int(getattr(aval, 'size', 0)) if aval is not None else 0
+
+
+def _eqn_work(eqn) -> int:
+  """How many element-operations an equation performs.
+
+  Output size is the right measure for elementwise primitives, and badly wrong
+  for anything that reduces or contracts: `jnp.sum` over a million elements
+  produces a scalar, so an output-only rule would score it as a single
+  operation and be blind to the input growing. For those the work follows what
+  is consumed, not what is produced.
+  """
+  name = eqn.primitive.name
+  out_size = sum(_aval_size(v) for v in eqn.outvars)
+  in_size = sum(_aval_size(v) for v in eqn.invars)
+
+  if name == 'dot_general':
+    # One multiply-add per output element per contracted position.
+    try:
+      (lhs_contract, _), _ = eqn.params['dimension_numbers']
+      lhs_shape = eqn.invars[0].aval.shape
+      contracted = 1
+      for dim in lhs_contract:
+        contracted *= int(lhs_shape[dim])
+      return max(out_size * contracted, in_size, 1)
+    except Exception:  # noqa: BLE001 - fall back rather than fail a guard.
+      return max(in_size, out_size, 1)
+
+  if name.startswith('reduce') or name.startswith('cum') or name in (
+      'argmax', 'argmin', 'sort', 'top_k'
+  ):
+    return max(in_size, out_size, 1)
+
+  return max(out_size, 1)
+
+
 def _sub_jaxprs(params: dict[str, Any]) -> Iterable[Any]:
   """Every nested jaxpr reachable from an equation's params."""
   for value in params.values():
@@ -173,11 +219,7 @@ def _accumulate(jaxpr, multiplier: float, counts: dict[str, float],
         _accumulate(sub, multiplier, counts, lengths, unknown)
       continue
 
-    size = sum(
-        int(getattr(v.aval, 'size', 1)) for v in eqn.outvars
-        if hasattr(v, 'aval')
-    )
-    counts[name] = counts.get(name, 0.0) + multiplier * max(size, 1)
+    counts[name] = counts.get(name, 0.0) + multiplier * _eqn_work(eqn)
 
 
 def op_counts(fn: Callable[..., Any], *args, **kwargs) -> OpCounts:
