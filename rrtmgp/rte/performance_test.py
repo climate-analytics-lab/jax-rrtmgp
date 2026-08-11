@@ -49,6 +49,7 @@ import netCDF4 as nc
 import numpy as np
 
 from rrtmgp import constants
+from rrtmgp import jaxpr_cost
 from rrtmgp import kernel_ops
 from rrtmgp import test_util
 from rrtmgp.config import radiative_transfer
@@ -162,36 +163,23 @@ def _radiation_setup():
             {'h2o': vmr_h2o, 'o3': vmr_o3}, sfc_temperature)
 
 
-def _scan_lengths(jaxpr) -> list[int]:
-    """Every `scan` trip count in `jaxpr`, including nested sub-jaxprs.
-
-    Reads the trip count straight off the traced program, so it reflects what
-    the solver actually does rather than what a helper reports.
-    """
-    lengths = []
-    for eqn in jaxpr.eqns:
-        if eqn.primitive.name == 'scan':
-            lengths.append(int(eqn.params['length']))
-        for value in eqn.params.values():
-            for sub in (value if isinstance(value, (tuple, list)) else (value,)):
-                inner = getattr(sub, 'jaxpr', sub)
-                if hasattr(inner, 'eqns'):
-                    lengths.extend(_scan_lengths(inner))
-    return lengths
-
-
 def _minor_optical_depth_scan_lengths(lookup, atmos_state, molecules, p, t,
                                       vmr_fields) -> list[int]:
-    """Trace the real minor-gas optical depth and collect its scan lengths."""
+    """Trace the real minor-gas optical depth and collect its scan lengths.
+
+    Reads the trip counts off the traced program via `rrtmgp.jaxpr_cost`, so
+    this reflects what the solver actually does rather than what a helper
+    reports.
+    """
     vmr_by_index = {
         lookup.idx_gases[name]: field for name, field in vmr_fields.items()
     }
-    jaxpr = jax.make_jaxpr(
+    return jaxpr_cost.scan_lengths(
         lambda temp: gas_optics.compute_minor_optical_depth(
             lookup, atmos_state.vmr, molecules, temp, p, 0, vmr_by_index
-        )
-    )(t)
-    return _scan_lengths(jaxpr.jaxpr)
+        ),
+        t,
+    )
 
 
 def _compiled_cost(band: str) -> dict[str, float]:
