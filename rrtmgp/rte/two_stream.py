@@ -448,6 +448,7 @@ def solve_sw(
 def compute_heating_rate(
     flux_net: Array,
     pressure: Array,
+    q_v: Array | None = None,
 ) -> Array:
   """Computes cell-center heating rate from pressure and net radiative flux.
 
@@ -459,6 +460,9 @@ def compute_heating_rate(
   Args:
     flux_net: The net flux at the bottom face [W/m²].
     pressure: The pressure field [Pa].
+    q_v: Water vapor specific humidity [kg/kg], used for the moist heat
+      capacity. When omitted the dry-air value is used, which overestimates
+      the heating rate by 0.84·q_v — 1.7% at 20 g/kg.
 
   Returns:
     The heating rate of the grid cell [K/s].
@@ -473,5 +477,13 @@ def compute_heating_rate(
   # derivative of face_to_node).
   dflux = kernel_ops.forward_difference(flux_net, dim=2)
 
+  # Moist heat capacity: cp = cp_d·(1 - q_v) + cp_v·q_v. Using the dry value
+  # makes the heating rate too large by (cp_v/cp_d - 1)·q_v = 0.84·q_v, which
+  # is ~1.7% in a tropical boundary layer and biases the low-level longwave
+  # cooling everywhere it is moist.
+  cp = constants.CP_D
+  if q_v is not None:
+    cp = cp + (constants.CP_V - constants.CP_D) * q_v
+
   # Compute the heating rate at the grid cell center in K/s.
-  return constants.G * dflux / dp / constants.CP_D
+  return constants.G * dflux / dp / cp

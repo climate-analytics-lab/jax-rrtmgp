@@ -288,11 +288,12 @@ class RRTMGP:
     )
 
     # Compute the heating rate in K/s.
+    q_v = q_t - q_c
     lw_heating_rate = two_stream.compute_heating_rate(
-        lw_fluxes['flux_net'], p_ref_xxc
+        lw_fluxes['flux_net'], p_ref_xxc, q_v
     )
     sw_heating_rate = two_stream.compute_heating_rate(
-        sw_fluxes['flux_net'], p_ref_xxc
+        sw_fluxes['flux_net'], p_ref_xxc, q_v
     )
     # Compute the total heating rate (temperature tendency due to radiation).
     heating_rate = lw_heating_rate + sw_heating_rate
@@ -375,10 +376,10 @@ class RRTMGP:
       )
       # Compute the heating rate in K/s.
       lw_heating_rate_clearsky = two_stream.compute_heating_rate(
-          lw_fluxes_clearsky['flux_net'], p_ref_xxc
+          lw_fluxes_clearsky['flux_net'], p_ref_xxc, q_v
       )
       sw_heating_rate_clearsky = two_stream.compute_heating_rate(
-          sw_fluxes_clearsky['flux_net'], p_ref_xxc
+          sw_fluxes_clearsky['flux_net'], p_ref_xxc, q_v
       )
 
       if self._save_lw_sw_heating_rates:
