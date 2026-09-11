@@ -45,7 +45,9 @@ def _humidity_to_volume_mixing_ratio(
 
 def _air_molecules_per_area(p_xxc: Array, vmr_h2o_xxc: Array) -> Array:
   """Compute the number of molecules in a grid cell per area."""
-  dp_xxc = kernel_ops.centered_difference(p_xxc, dim=2)
+  # centered_difference returns p[k+1] - p[k-1], which spans two layers; the
+  # thickness of the layer centered on k is half of it.
+  dp_xxc = 0.5 * kernel_ops.centered_difference(p_xxc, dim=2)
   mol_m_air_xxc = (
       constants.DRY_AIR_MOL_MASS + constants.WATER_MOL_MASS * vmr_h2o_xxc
   )

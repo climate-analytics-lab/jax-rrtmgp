@@ -132,6 +132,44 @@ def _build_inputs(
   }
 
 
+class AirMoleculesPerAreaTest(unittest.TestCase):
+  """Pins the production molecular-burden routine to the hydrostatic column.
+
+  Regression test for climate-analytics-lab/jax-rrtmgp#26: the routine used
+  `centered_difference`, which spans two layers, so every layer's molecular
+  burden -- and hence every gas optical depth, in both streams -- came out
+  twice too large. The clear-sky and all-sky tests never caught it because
+  they compute molecules with their own interface-based helper rather than
+  calling `_air_molecules_per_area`.
+  """
+
+  def test_column_burden_matches_hydrostatic_value(self):
+    # Dry isothermal column on log-spaced cell-center pressures; the summed
+    # burden must equal the hydrostatic p_sfc / (g * m_air).
+    p_centers = np.geomspace(1.0e5, 1.0e2, 64)
+    p_xxc = p_centers[np.newaxis, np.newaxis, :]
+    vmr_h2o_xxc = np.zeros_like(p_xxc)
+
+    molecules = np.asarray(
+        rrtmgp._air_molecules_per_area(  # pylint: disable=protected-access
+            jnp.asarray(p_xxc), jnp.asarray(vmr_h2o_xxc)
+        )
+    )
+
+    # The centered difference is undefined on the end cells; over the interior
+    # the half-thicknesses telescope to half the pressure drop across the two
+    # cells at each end. A missing factor of 0.5 shows up here as a ratio of 2.
+    interior = molecules[0, 0, 1:-1]
+    expected = (
+        0.5
+        * (p_centers[0] + p_centers[1] - p_centers[-2] - p_centers[-1])
+        / constants.G
+        * constants.AVOGADRO
+        / constants.DRY_AIR_MOL_MASS
+    )
+    self.assertAlmostEqual(interior.sum() / expected, 1.0, places=6)
+
+
 class RRTMGPVMROverrideTest(unittest.TestCase):
   """Regression test for the `vmr_fields` override kwarg.
 
