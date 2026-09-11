@@ -19,8 +19,8 @@ without changing any answer, so nothing else in the suite notices. That is what
 happened in #22: the solve got several times more expensive and it was only
 caught much later, end to end, in a downstream GCM.
 
-The two ways that happens have different signatures, so they are guarded
-separately, and both guards are deterministic -- they assert on the *compiled
+The ways that happens have different signatures, so they are guarded
+separately, and every guard is deterministic -- they assert on the *compiled
 program*, not on wall-clock time, so they behave identically on a laptop and on
 a loaded CI runner:
 
@@ -32,10 +32,33 @@ a loaded CI runner:
      *body* cost, so a scan of length 10 and one of length 100 look identical.
      Caught structurally, by pinning the scan length itself.
 
+  3. **Arithmetic in a cell kernel, diluted below the noise floor of a
+     whole-solve budget.** See below.
+
 The budgets are ceilings with headroom, not exact values; they are meant to
 catch a multiplicative regression, not to freeze the implementation. If a change
 genuinely needs more arithmetic, raise the number here deliberately and say why
 in the commit -- that is the point of the guard.
+
+Two blind spots in the original version of this file let the issue #27
+regression through, both worth stating because they are easy to reintroduce:
+
+  * **Only the whole solve was measured.** A solve is dominated by gas optics,
+    so a cell kernel can several-fold and still move the total by a few
+    percent. The 0.3.0 two-stream rewrite made `lw_cell_source_and_properties`
+    4.8x the flops and 2.7x the transcendentals of 0.2.1 and never came close
+    to tripping a whole-solve ceiling. The kernels are therefore now measured
+    *in isolation* as well, where nothing dilutes them.
+
+  * **Only `use_scan=True` was measured.** That is not the default and not
+    what downstream callers get: `solve_lw` / `solve_sw` default to
+    `use_scan=False`, which unrolls the vertical recurrence instead of
+    emitting a `scan`. The two configurations do not merely differ by a
+    constant -- at 0.3.0 the same change that cost 1.35x (LW) / 2.0x (SW) of
+    the solve under `use_scan=True` cost 3.1x / 7.7x under `use_scan=False`,
+    because the unrolled form multiplies per-cell arithmetic in a way the
+    scan form does not. A budget is only meaningful for the configuration it
+    was measured in, so both are now pinned.
 """
 
 import functools
@@ -58,6 +81,7 @@ from rrtmgp.optics import gas_optics
 from rrtmgp.optics import lookup_gas_optics_longwave
 from rrtmgp.optics import lookup_gas_optics_shortwave
 from rrtmgp.optics import optics
+from rrtmgp.rte import monochromatic_two_stream
 from rrtmgp.rte import two_stream
 
 Array: TypeAlias = jax.Array
@@ -87,22 +111,63 @@ _N_HORIZ = 136
 # shortwave). Reference values on the implementation these were written
 # against:
 #
-#            flops          transcendentals
-#   LW    2,463,834,112         9,174,016
-#   SW    2,354,763,008        16,054,528
+#                        flops          transcendentals
+#   LW  use_scan=True  2,415,670,272        3,440,256
+#   SW  use_scan=True  2,245,821,696       11,467,520
+#   LW  use_scan=False 6,818,315,776        3,440,256
+#   SW  use_scan=False 10,076,223,488      11,467,520
 #
 # The ceilings carry ~30% headroom. They are set from the *current* numbers
 # rather than left slack at a historical high-water mark: the transcendental
 # counts were ~2.5x (longwave) higher before the hyperbolic quantities were
 # computed together, and a budget loose enough to admit that guards nothing.
 #
+# The transcendental budgets in particular are now tight: the longwave solve
+# sits at 0.2.1's count exactly, so there is no room left in which a repeat of
+# the issue #27 regression could hide.
+#
 # These scale with the column count, so changing `_N_HORIZ` means recomputing
-# them. Per element the figures above are ~8 transcendentals; at 2x2 columns
-# the same code measures ~32, because fixed per-call work is then spread over
-# far fewer elements -- which is the reason the guard is calibrated at the
-# production shape rather than a token one.
-_MAX_FLOPS = {'lw': 3_200_000_000, 'sw': 3_100_000_000}
-_MAX_TRANSCENDENTALS = {'lw': 12_000_000, 'sw': 21_000_000}
+# them. Per element the figures above are ~4 (longwave) and ~13 (shortwave)
+# transcendentals; at 2x2 columns the same code measures several times that,
+# because fixed per-call work is then spread over far fewer elements -- which
+# is the reason the guard is calibrated at the production shape rather than a
+# token one.
+#
+# Keyed by (band, use_scan). The `use_scan=False` figures are much larger
+# because that setting unrolls the vertical recurrence into the g-point body;
+# they are budgets for a different program, not a looser bound on the same one.
+_MAX_FLOPS = {
+    ('lw', True): 3_200_000_000,
+    ('sw', True): 3_100_000_000,
+    ('lw', False): 8_200_000_000,
+    ('sw', False): 12_100_000_000,
+}
+_MAX_TRANSCENDENTALS = {
+    ('lw', True): 4_500_000,
+    ('sw', True): 15_000_000,
+    ('lw', False): 4_500_000,
+    ('sw', False): 15_000_000,
+}
+
+# Per-cell two-stream kernel budgets, measured with nothing else in the
+# program. This is the granularity the issue #27 regression actually lived at,
+# and the ceilings are correspondingly tight -- ~20% headroom rather than the
+# ~30% carried above, because there is no gas optics here to move underneath
+# them. Reference values on the implementation these were written against, at
+# the `_N_HORIZ` shape above (136 x 136 x 49 = 906,304 elements):
+#
+#                                       flops     transcendentals   per element
+#   sw_cell_properties                315,393,792      9,063,040       348 / 10
+#   lw_cell_source_and_properties     308,143,360      2,718,912       340 /  3
+#
+# For scale, the same two kernels at 0.2.1 measured 160 and 73 flops per
+# element and 6 and 3 transcendentals. The longwave kernel is back to 0.2.1's
+# transcendental count exactly; the shortwave one keeps 4 more per element than
+# 0.2.1 -- two `sqrt` for the smooth energy-conservation clamps, and the extra
+# `exp`/`expm1` pair that the float32-stable direct-beam form needs. Those are
+# the numerics 0.3.0 was for, so they are budgeted for rather than removed.
+_MAX_KERNEL_FLOPS = {'sw': 380_000_000, 'lw': 370_000_000}
+_MAX_KERNEL_TRANSCENDENTALS = {'sw': 10_900_000, 'lw': 3_300_000}
 
 
 def _radiation_setup():
@@ -182,21 +247,54 @@ def _minor_optical_depth_scan_lengths(lookup, atmos_state, molecules, p, t,
     )
 
 
-def _compiled_cost(band: str) -> dict[str, float]:
+def _cost_of(fn, *args) -> dict[str, float]:
+    """Compile `fn` at `args` and return XLA's cost analysis."""
+    cost = jax.jit(fn).lower(*args).compile().cost_analysis()
+    # Some backends report a list of per-computation dicts.
+    return cost[0] if isinstance(cost, list) else cost
+
+
+def _compiled_cost(band: str, use_scan: bool) -> dict[str, float]:
     """Compile the solve for `band` and return XLA's cost analysis."""
     (optics_lib, atmos_state, p, t, molecules, vmr_fields,
      sfc_temperature) = _radiation_setup()
     if band == 'lw':
         fn = lambda temp: two_stream.solve_lw(
             p, temp, molecules, optics_lib, atmos_state, vmr_fields,
-            sfc_temperature, use_scan=True,
+            sfc_temperature, use_scan=use_scan,
         )['flux_net']
     else:
         fn = lambda temp: two_stream.solve_sw(
             p, temp, molecules, optics_lib, atmos_state, vmr_fields,
-            use_scan=True,
+            use_scan=use_scan,
         )['flux_net']
-    return jax.jit(fn).lower(t).compile().cost_analysis()
+    return _cost_of(fn, t)
+
+
+def _kernel_cost(band: str) -> dict[str, float]:
+    """Cost of one two-stream cell kernel, compiled on its own.
+
+    Deliberately not routed through the solve: the point of this measurement is
+    that nothing else is in the program to dilute it. Inputs span the physical
+    ranges (optical depth over several decades, single-scattering albedo up to
+    and including 1) so no branch is optimised away as unreachable.
+    """
+    shape = (_N_HORIZ, _N_HORIZ, 49)
+    rng = np.random.default_rng(0)
+    f32 = jnp.float32
+    tau = jnp.asarray(10.0 ** rng.uniform(-6, 0.5, shape), f32)
+    ssa = jnp.asarray(rng.uniform(0.0, 1.0, shape), f32)
+    asymmetry = jnp.asarray(rng.uniform(0.0, 0.9, shape), f32)
+    if band == 'sw':
+        fn = lambda tau, ssa, g: monochromatic_two_stream.sw_cell_properties(
+            0.5, tau, ssa, g
+        )
+        return _cost_of(fn, tau, ssa, asymmetry)
+    src = jnp.asarray(rng.uniform(0.0, 10.0, shape), f32)
+    fn = lambda tau, ssa, s, g: (
+        monochromatic_two_stream.lw_cell_source_and_properties(tau, ssa, s, s, g)
+    )
+    return _cost_of(fn, tau, ssa, src, asymmetry)
 
 
 class PerformanceTest(unittest.TestCase):
@@ -289,52 +387,106 @@ class PerformanceTest(unittest.TestCase):
         )
 
     def test_longwave_solve_arithmetic_within_budget(self):
-        self._assert_within_budget('lw')
+        """Both `use_scan` settings, because they are different programs.
+
+        `use_scan=False` is the default that downstream callers get, and it
+        unrolls the vertical recurrence, so a change to the per-cell kernels
+        lands on it far harder than on the `use_scan=True` form. Measuring only
+        the latter is how the issue #27 regression cleared this file.
+        """
+        for use_scan in (True, False):
+            with self.subTest(use_scan=use_scan):
+                self._assert_within_budget('lw', use_scan)
 
     def test_shortwave_solve_arithmetic_within_budget(self):
-        self._assert_within_budget('sw')
+        for use_scan in (True, False):
+            with self.subTest(use_scan=use_scan):
+                self._assert_within_budget('sw', use_scan)
 
-    def _assert_within_budget(self, band: str):
+    def test_longwave_cell_kernel_within_budget(self):
+        self._assert_kernel_within_budget('lw')
+
+    def test_shortwave_cell_kernel_within_budget(self):
+        self._assert_kernel_within_budget('sw')
+
+    def _assert_metrics_present(self, cost, what: str):
+        """Both metrics must actually be reported.
+
+        Defaulting a missing key to zero would leave the corresponding budget
+        vacuously satisfied, so a backend or JAX version that stops reporting
+        one would silently disable the guard rather than fail visibly.
+        """
+        for metric in ('flops', 'transcendentals'):
+            self.assertIn(
+                metric, cost,
+                msg=(f'cost analysis did not report {metric!r} for {what}, so '
+                     f'its budget cannot be enforced. Keys: {sorted(cost)}'),
+            )
+        self.assertGreater(cost['flops'], 0.0, f'{what}: no flops reported')
+        self.assertGreater(
+            cost['transcendentals'], 0.0,
+            f'{what}: cost analysis reported no transcendentals, but this code '
+            'uses exp and sqrt -- a zero here means the metric is not being '
+            'measured rather than that the work is not being done',
+        )
+
+    def _assert_within_budget(self, band: str, use_scan: bool):
         """Per-g-point-body flops and transcendentals stay under budget.
 
         Note this counts the *body* of the g-point loop, so it catches extra
         arithmetic per element but says nothing about trip counts -- which is
         why the scan length is pinned separately above.
         """
-        cost = _compiled_cost(band)
-
-        # Both metrics must actually be reported. Defaulting a missing key to
-        # zero would leave the corresponding budget vacuously satisfied, so a
-        # backend or JAX version that stops reporting one would silently
-        # disable the guard rather than fail visibly.
-        for metric in ('flops', 'transcendentals'):
-            self.assertIn(
-                metric, cost,
-                msg=(f'cost analysis did not report {metric!r}, so its budget '
-                     f'cannot be enforced. Keys present: {sorted(cost)}'),
-            )
+        label = f'{band.upper()} solve (use_scan={use_scan})'
+        cost = _compiled_cost(band, use_scan)
+        self._assert_metrics_present(cost, label)
         flops = cost['flops']
         transcendentals = cost['transcendentals']
 
-        self.assertGreater(flops, 0.0, 'cost analysis reported no flops')
-        self.assertGreater(
-            transcendentals, 0.0,
-            'cost analysis reported no transcendentals; the solve uses exp and '
-            'sqrt, so a zero here means the metric is not being measured',
-        )
         self.assertLessEqual(
-            flops, _MAX_FLOPS[band],
-            msg=(f'{band.upper()} solve costs {flops:,.0f} flops per g-point '
-                 f'body, over the {_MAX_FLOPS[band]:,} budget. If this is a '
+            flops, _MAX_FLOPS[band, use_scan],
+            msg=(f'{label} costs {flops:,.0f} flops per g-point body, over the '
+                 f'{_MAX_FLOPS[band, use_scan]:,} budget. If this is a '
                  f'deliberate trade, raise the budget and justify it.'),
         )
         self.assertLessEqual(
-            transcendentals, _MAX_TRANSCENDENTALS[band],
-            msg=(f'{band.upper()} solve costs {transcendentals:,.0f} '
-                 f'transcendentals per g-point body, over the '
-                 f'{_MAX_TRANSCENDENTALS[band]:,} budget. Note that a '
-                 f'`jnp.where` evaluates both branches, so a "safe" branch '
+            transcendentals, _MAX_TRANSCENDENTALS[band, use_scan],
+            msg=(f'{label} costs {transcendentals:,.0f} transcendentals per '
+                 f'g-point body, over the '
+                 f'{_MAX_TRANSCENDENTALS[band, use_scan]:,} budget. Note that '
+                 f'a `jnp.where` evaluates both branches, so a "safe" branch '
                  f'guarding a sqrt/exp costs the same as taking it.'),
+        )
+
+    def _assert_kernel_within_budget(self, band: str):
+        """The two-stream cell kernel on its own, with nothing to dilute it.
+
+        The whole-solve budgets above are dominated by gas optics, which is
+        most of their cost and none of their risk: at 0.3.0 the longwave cell
+        kernel took 4.8x the flops and 2.7x the transcendentals of 0.2.1 while
+        moving the longwave solve total by ~35%. This guard sees the kernel at
+        full amplitude, which is the only way a change of that shape shows up
+        as a number somebody has to justify.
+        """
+        label = f'{band.upper()} cell kernel'
+        cost = _kernel_cost(band)
+        self._assert_metrics_present(cost, label)
+        flops = cost['flops']
+        transcendentals = cost['transcendentals']
+
+        self.assertLessEqual(
+            flops, _MAX_KERNEL_FLOPS[band],
+            msg=(f'{label} costs {flops:,.0f} flops '
+                 f'({flops / (_N_HORIZ * _N_HORIZ * 49):.0f} per element), over '
+                 f'the {_MAX_KERNEL_FLOPS[band]:,} budget.'),
+        )
+        self.assertLessEqual(
+            transcendentals, _MAX_KERNEL_TRANSCENDENTALS[band],
+            msg=(f'{label} costs {transcendentals:,.0f} transcendentals '
+                 f'({transcendentals / (_N_HORIZ * _N_HORIZ * 49):.0f} per '
+                 f'element), over the {_MAX_KERNEL_TRANSCENDENTALS[band]:,} '
+                 f'budget. Both branches of a `jnp.where` are evaluated, so '
+                 f'guarding a transcendental costs as much as taking it.'),
         )
 
 
