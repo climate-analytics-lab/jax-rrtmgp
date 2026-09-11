@@ -118,75 +118,87 @@ def _eps_of(x: Array) -> float:
   return float(jnp.finfo(jnp.result_type(x)).eps)
 
 
-# The three hyperbolic helpers below are parameterized by ``x2 = x**2``, NOT
-# by ``x`` — because their only caller has ``x = k*tau`` with ``k = sqrt(k2)``
-# and ``k2`` hitting *exactly* zero for conservative scattering (an f32
-# Rayleigh-only g-point rounds ssa to 1). The functions are analytically
-# smooth in ``x2``, but composing them as ``f(sqrt(x2))`` puts
-# ``d sqrt/d x2 = inf`` on the reverse path at ``x2 = 0`` and the chain rule
-# manufactures ``0 * inf = NaN`` cotangents (this NaN'd every clear-sky SW
-# column's temperature gradient). Taking ``x2`` directly keeps the series
-# branch polynomial (clean adjoint) and confines ``sqrt`` to the branch where
-# ``x2`` is bounded away from zero by the eps-scaled series threshold.
+# The hyperbolic helper below is parameterized by ``x2 = x**2``, NOT by ``x``
+# — because its only caller has ``x = k*tau`` with ``k = sqrt(k2)`` and ``k2``
+# hitting *exactly* zero for conservative scattering (an f32 Rayleigh-only
+# g-point rounds ssa to 1). The functions are analytically smooth in ``x2``,
+# but composing them as ``f(sqrt(x2))`` puts ``d sqrt/d x2 = inf`` on the
+# reverse path at ``x2 = 0`` and the chain rule manufactures ``0 * inf = NaN``
+# cotangents (this NaN'd every clear-sky SW column's temperature gradient).
+# Taking ``x2`` directly keeps the whole evaluation polynomial in ``x2``, so
+# there is no ``sqrt`` on the differentiated path at all.
+
+
+def _series_order(eps: float) -> int:
+  """Highest power of ``x2`` needed to reach ``eps`` accuracy on ``[0, 1]``.
+
+  The slowest-converging of the four quantities below is ``cosh``, whose
+  truncation error after the ``x2**n`` term is the first omitted term,
+  ``x2**(n+1)/(2n+2)!``, i.e. ``1/(2n+2)!`` at the top of the range. Solving
+  that against the working precision gives ``n = 5`` at float32 (error
+  ``1/12! = 2e-9``, well under ``eps = 1.2e-7``) and ``n = 8`` at float64
+  (``1/18! = 1.6e-16`` against ``eps = 2.2e-16``).
+  """
+  n = 1
+  while 1.0 / math.factorial(2 * n + 2) > eps:
+    n += 1
+  return n
+
+
+def _horner(x: Array, coeffs: list[float]) -> Array:
+  """Evaluate ``sum(coeffs[i] * x**i)`` by Horner's rule."""
+  acc = coeffs[-1]
+  for c in reversed(coeffs[:-1]):
+    acc = c + x * acc
+  return acc
 
 
 def _hyperbolics(x2: Array) -> tuple[Array, Array, Array, Array]:
   """``sinh(x)/x``, ``sinh(x/2)/(x/2)``, ``sinh(x)/x - 1`` and ``cosh(x)``.
 
   All four as functions of ``x2 = x**2``, computed together because the caller
-  always needs all four at the same argument. Sharing matters: a ``jnp.where``
-  evaluates *both* branches, so every guarded call pays for its transcendental
-  whether or not the cheap branch is the one selected. Computing these
-  separately cost four ``sqrt`` and four ``sinh``/``cosh`` per call; sharing
-  brings that to **one** ``sqrt`` and **one** ``exp``:
+  always needs all four at the same argument, and evaluated as **truncated
+  Maclaurin series in x2 with no branch at all**.
 
-  * ``sqrt`` — the half-argument quantity needs ``sqrt(x2/4) = x/2``, the same
-    root scaled, so one root serves both.
-  * ``exp`` — with ``h = exp(x/2)``, everything follows by arithmetic:
-    ``sinh(x/2) = (h - 1/h)/2`` and, from ``exp(x) = h**2``,
-    ``sinh(x) = (h**2 - h**-2)/2`` and ``cosh(x) = (h**2 + h**-2)/2``.
+  A branch-free polynomial is admissible here only because the caller clips its
+  argument: ``_diffuse_quantities`` selects this (small-``k*tau``) form solely
+  for ``x2 < _KTAU_SWITCH**2 = 1`` and passes a clipped ``x2`` otherwise, so
+  the domain is exactly ``[0, 1]``. Over that domain the series converge fast
+  enough to be correctly rounded at ``_series_order(eps)`` terms — five at
+  float32 — which is where the cost goes:
 
-  Below a common eps-scaled threshold the truncated series are used instead.
-  As in the per-function versions this replaced, the ``sqrt`` operand is made
-  safe inside both branches, so reverse-mode never sees ``sqrt'(0)`` at the
-  conservative-scattering point ``x2 = 0`` and the series branch stays
-  polynomial in ``x2`` (clean adjoint) — see the note above.
+  * **no transcendentals.** The previous formulation switched between these
+    series and an ``exp``-based direct form at an eps-scaled threshold, and a
+    ``jnp.where`` evaluates *both* branches, so every call paid for one
+    ``sqrt`` and one ``exp`` (plus four selects and their compares) to end up
+    on the polynomial anyway over most of the range. On ``[0, 1]`` the direct
+    form buys nothing: a handful of fused multiply-adds is both cheaper and
+    *more* accurate than ``(e**x - e**-x)/2x``, which cancels mildly at the
+    small end of the interval.
+  * **no ``sqrt`` on the differentiated path.** ``x`` itself never appears —
+    see the note above on why ``sqrt(x2)`` is poison for the adjoint at the
+    conservative-scattering point ``x2 = 0``. The previous version needed a
+    masked-safe operand to keep that ``sqrt`` away from zero; with the direct
+    form gone there is nothing left to guard.
 
-  The shared threshold is the tightest of the three the separate functions
-  used, ``(720*eps)**(1/3)`` (from ``cosh``, whose series truncates at
-  ``~x2**3/720``). It sits above the ``sqrt(840*eps)`` that ``sinh(x)/x - 1``
-  needed for its *direct* form to avoid cancellation, so that quantity still
-  takes its series wherever the subtraction would cancel; its series carries
-  one extra term here to stay accurate to eps over the wider range.
+  ``sinh(x)/x - 1`` is returned separately (rather than left to the caller to
+  subtract) because it is ``O(x2)`` and forming it as ``sinhc - 1`` would
+  cancel away its leading digits; its series simply omits the constant term.
   """
-  eps = _eps_of(x2)
-  t0 = (720.0 * eps) ** (1.0 / 3.0)
-  small = x2 < t0
-  x2s = jnp.where(small, x2, 0.0)
-  x = jnp.sqrt(jnp.where(small, 1.0, x2))
-
-  half = jnp.exp(0.5 * x)
-  half_inv = 1.0 / half
-  full, full_inv = jnp.square(half), jnp.square(half_inv)
-  sinhc_direct = 0.5 * (full - full_inv) / x
-  cosh_direct = 0.5 * (full + full_inv)
-  sinhc_half_direct = (half - half_inv) / x  # (h - 1/h)/2 / (x/2)
-
-  # Series: sinh(x)/x = 1 + x2/6 + x2**2/120 (+ x2**3/5040),
-  #         cosh(x)   = 1 + x2/2 + x2**2/24  (+ x2**3/720).
-  sinhc_series = 1.0 + x2s / 6.0 * (1.0 + x2s / 20.0)
-  x2q = 0.25 * x2s
-  sinhc_half_series = 1.0 + x2q / 6.0 * (1.0 + x2q / 20.0)
-  cosh_series = 1.0 + x2s / 2.0 * (1.0 + x2s / 12.0)
-  # One term beyond the others: this is the cancellation-free form of
-  # sinh(x)/x - 1, and it is evaluated over the wider shared range.
-  sinhc_m1_series = x2s / 6.0 * (1.0 + x2s / 20.0 * (1.0 + x2s / 42.0))
+  n = _series_order(_eps_of(x2))
+  # sinh(x)/x = sum x2**i / (2i+1)!;  cosh(x) = sum x2**i / (2i)!.
+  sinhc_c = [1.0 / math.factorial(2 * i + 1) for i in range(n + 1)]
+  cosh_c = [1.0 / math.factorial(2 * i) for i in range(n + 1)]
+  # sinh(x)/x - 1 = x2 * sum x2**i / (2i+3)!, i.e. the same series with the
+  # constant term dropped and one factor of x2 pulled out front.
+  sinhc_m1_c = [1.0 / math.factorial(2 * i + 3) for i in range(n)]
 
   return (
-      jnp.where(small, sinhc_series, sinhc_direct),
-      jnp.where(small, sinhc_half_series, sinhc_half_direct),
-      jnp.where(small, sinhc_m1_series, sinhc_direct - 1.0),
-      jnp.where(small, cosh_series, cosh_direct),
+      _horner(x2, sinhc_c),
+      # sinh(x/2)/(x/2) is the same series evaluated at (x/2)**2 = x2/4.
+      _horner(0.25 * x2, sinhc_c),
+      x2 * _horner(x2, sinhc_m1_c),
+      _horner(x2, cosh_c),
   )
 
 
@@ -287,6 +299,12 @@ def _direct_quantities(
   k_mu = k * mu0
   one_plus_kmu = 1.0 + k_mu
 
+  # These exponentials come in two families and neither can be rebuilt from
+  # the other, so each is evaluated in the form it is used in. `exp` carries a
+  # decayed value at full *relative* precision, which `1 + expm1` cannot: by
+  # k*tau = 16 float32 `expm1` has rounded to exactly -1, so `1 + expm1` gives
+  # 0 where the true exponential is 1.1e-7. `expm1` in turn resolves the O(tau)
+  # departure from 1 that `exp` rounds away entirely for a thin layer.
   e2m1 = jnp.expm1(-2.0 * k * tau)                # exp(-2 k tau) - 1
   denom = k * (2.0 + e2m1) - gamma1 * e2m1        # diffuse denominator D
   etm1 = jnp.expm1(-(k + 1.0 / mu0) * tau)        # exp(-(k + 1/mu0) tau) - 1
@@ -302,14 +320,21 @@ def _direct_quantities(
   # only well-scaled where selected) and the quotient-form divisor.
   x_f = jnp.where(factored, x, 0.0)
   eta_safe = jnp.where(factored, 1.0, eta)
+  # The two resonance pairs need phi at +x and -x. One evaluation serves both:
+  # phi(-x) = expm1(-x)/(-x) = (e**x - 1)/(x e**x) = phi(x) / e**x, and
+  # e**x = 1 + x phi(x) identically. On the branch where this form is selected
+  # |x| < 1, so e**x is in [0.37, 2.72] and that reconstruction loses at most
+  # ~1.5 bits -- against a whole transcendental per g-point per cell.
+  phi = _expm1_over_x(x_f)
+  phi_neg = phi / (1.0 + x_f * phi)
   pair_r = jnp.where(
       factored,
-      tau_p * e_ktmu * _expm1_over_x(x_f),
+      tau_p * e_ktmu * phi,
       ((1.0 + e2m1) - e_ktmu) / eta_safe,
   )
   pair_t = jnp.where(
       factored,
-      -e_kt * tau_p * _expm1_over_x(-x_f),
+      -e_kt * tau_p * phi_neg,
       (t0 - e_kt) / eta_safe,
   )
 
@@ -323,7 +348,14 @@ def _direct_quantities(
   t_dir = (ssa / denom) * (
       -c * one_plus_kmu * pair_t + d * e_kt * etm1 / one_plus_kmu
   )
-  return {'r_dir': r_dir, 't_dir': t_dir}
+  # `1 - exp(-tau/mu0)` is the energy-conservation cap the caller clamps
+  # against. Return it from here rather than have the caller evaluate the same
+  # exponential a second time. (The subtraction does cancel for a thin layer,
+  # and `-expm1(-tau/mu0)` would give it exactly -- but only at the cost of
+  # another transcendental, and for no observable gain: a cap that small is far
+  # inside `_SW_CLIP_SHARPNESS`, so the smooth clamp drives r_dir and t_dir to
+  # zero there whether or not the cap itself is resolved.)
+  return {'r_dir': r_dir, 't_dir': t_dir, 'one_minus_t0': 1.0 - t0}
 
 
 def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
@@ -375,12 +407,17 @@ def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
   small = x2 < _KTAU_SWITCH**2
   gsum = jnp.maximum(gamma1 + gamma2, eps)
 
-  # --- small-k*tau branch (safe operands: argument clipped to the switch
-  # point inside the branch so sinh/cosh never overflow when unselected).
+  # --- small-k*tau branch (safe operand: the argument is clipped to the switch
+  # point when this branch is *not* the selected one, both so the truncated
+  # series stay inside the interval they are accurate on and so their leading
+  # x2**n term cannot overflow to inf for a thick layer and put a `0 * inf`
+  # NaN into the reverse pass of the select below).
   x2c = jnp.where(small, x2, _KTAU_SWITCH**2)
-  # All four hyperbolic quantities share one sqrt and one exp; see
-  # `_hyperbolics`. Evaluating them separately was the single largest source
-  # of transcendentals in this solve (issue #22).
+  # All four hyperbolic quantities come from truncated series in x2 sharing one
+  # clipped argument: no sqrt, no exp, no inner branch. See `_hyperbolics`.
+  # Evaluating them separately was the single largest source of transcendentals
+  # in this solve (issue #22), and switching to an exp-based direct form over
+  # part of the range still paid for that exp on every call (issue #27).
   shc, shc_half, shc_m1, ch = _hyperbolics(x2c)
   c_small = ch + gamma1 * tau * shc
   r_small = gamma2 * tau * shc / c_small
@@ -579,15 +616,19 @@ def sw_cell_properties(
   # `sw_cell_source`). Away from the degenerate cap the floor is inactive, so
   # the upper-cap smoothing is preserved.
 
-  # Direct transmittance.
-  t0 = jnp.exp(-optical_depth / jnp.cos(zenith))
+  # The cap is `1 - exp(-optical_depth / cos(zenith))`. It comes back from
+  # `_direct_quantities`, which already evaluates that exponential, rather than
+  # being rebuilt from a second one here.
+  one_minus_t0 = direct['one_minus_t0']
   r_dir = jnp.maximum(
-      smooth_ops.smooth_minimum(r_dir_unconstrained, 1 - t0, _SW_CLIP_SHARPNESS),
+      smooth_ops.smooth_minimum(
+          r_dir_unconstrained, one_minus_t0, _SW_CLIP_SHARPNESS
+      ),
       0.0,
   )
   t_dir = jnp.maximum(
       smooth_ops.smooth_minimum(
-          t_dir_unconstrained, 1 - t0 - r_dir, _SW_CLIP_SHARPNESS
+          t_dir_unconstrained, one_minus_t0 - r_dir, _SW_CLIP_SHARPNESS
       ),
       0.0,
   )
