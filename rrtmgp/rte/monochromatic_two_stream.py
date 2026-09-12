@@ -250,8 +250,31 @@ def _direct_quantities(
     tau: Array,
     ssa: Array,
     zenith: float | Array,
+    *,
+    mu0: Array | None = None,
+    k: Array | None = None,
+    e1: Array | None = None,
+    e2m1: Array | None = None,
+    denom: Array | None = None,
 ) -> StatesMap:
   """Direct-beam reflectance and transmittance (MW80 eqs 14-15), f32-stable.
+
+  The exp-scaled quantities that this beam shares with the diffuse solution --
+  ``k``, ``mu0 = cos(zenith)``, ``e1 = exp(-k tau)``, ``e2m1 = expm1(-2 k tau)``
+  and the diffuse denominator ``denom`` -- are accepted as keyword arguments so
+  ``sw_cell_properties`` can compute them once, in ``_diffuse_and_shared``, and
+  hand them straight here rather than have XLA emit a second
+  ``exp``/``sqrt``/denominator per g-point (issue #27). Left at their ``None``
+  default (e.g. the standalone direct-beam unit test) they are computed locally,
+  so the function stays self-contained and correct on its own.
+
+  Divisions here are left as literal ``a / b`` rather than hoisted into shared
+  reciprocals: in XLA's cost model a divide counts as one flop, so replacing
+  ``N`` divides by ``1/b`` + ``N`` multiplies only *adds* flops, and under the
+  ``use_scan=False`` unrolled recurrence that arithmetic is amplified ~47x --
+  measurably raising the very solve flops issue #27 is reducing. (The dedup of
+  the exp/expm1/sqrt/cos *transcendentals* above, which a divide-heavy GPU
+  cares about most, is kept.)
 
   Meador and Weaver's eqs 14-15 are catastrophically ill-conditioned in
   float32 in two regimes:
@@ -294,31 +317,41 @@ def _direct_quantities(
   ``exp(-tau/mu0)``; as before, only the diffusely-transmitted part is
   returned (the direct beam is handled separately in ``sw_cell_source``).
   """
-  mu0 = jnp.cos(zenith)
-  k = _k_fn(gamma1, gamma2)
-  k_mu = k * mu0
-  one_plus_kmu = 1.0 + k_mu
-
+  if mu0 is None:
+    mu0 = jnp.cos(zenith)
+  if k is None:
+    k = _k_fn(gamma1, gamma2)
   # These exponentials come in two families and neither can be rebuilt from
   # the other, so each is evaluated in the form it is used in. `exp` carries a
   # decayed value at full *relative* precision, which `1 + expm1` cannot: by
   # k*tau = 16 float32 `expm1` has rounded to exactly -1, so `1 + expm1` gives
   # 0 where the true exponential is 1.1e-7. `expm1` in turn resolves the O(tau)
   # departure from 1 that `exp` rounds away entirely for a thin layer.
-  e2m1 = jnp.expm1(-2.0 * k * tau)                # exp(-2 k tau) - 1
-  denom = k * (2.0 + e2m1) - gamma1 * e2m1        # diffuse denominator D
+  if e1 is None:
+    e1 = jnp.exp(-k * tau)                        # exp(-k tau)
+  if e2m1 is None:
+    e2m1 = jnp.expm1(-2.0 * k * tau)              # exp(-2 k tau) - 1
+  if denom is None:
+    denom = k * (2.0 + e2m1) - gamma1 * e2m1      # diffuse denominator D
+
+  k_mu = k * mu0
+  one_plus_kmu = 1.0 + k_mu
+
   etm1 = jnp.expm1(-(k + 1.0 / mu0) * tau)        # exp(-(k + 1/mu0) tau) - 1
   e_ktmu = 1.0 + etm1                             # exp(-(k + 1/mu0) tau)
-  e_kt = jnp.exp(-k * tau)
-  t0 = jnp.exp(-tau / mu0)
+  e_kt = e1                                       # exp(-k tau) (shared)
+  t0 = jnp.exp(-tau / mu0)                        # exp(-tau/mu0)
 
   eta = 1.0 - k_mu * k_mu
   tau_p = tau / (mu0 * one_plus_kmu)
   x = eta * tau_p
   factored = jnp.abs(x) < 1.0
-  # Safe operands: clip the factored-form argument (its phi/tau' pieces are
-  # only well-scaled where selected) and the quotient-form divisor.
-  x_f = jnp.where(factored, x, 0.0)
+  # Safe operands: `jnp.clip` (not a `where`) bounds the factored-form argument
+  # to the [-1, 1] where its series/phi pieces are well-scaled -- leaving the
+  # selected |x| < 1 untouched while keeping `_expm1_over_x` from overflowing on
+  # the discarded quotient domain -- and a single `where` floors the quotient
+  # divisor (eta -> 0 only inside the factored domain, where it is discarded).
+  x_f = jnp.clip(x, -1.0, 1.0)
   eta_safe = jnp.where(factored, 1.0, eta)
   # The two resonance pairs need phi at +x and -x. One evaluation serves both:
   # phi(-x) = expm1(-x)/(-x) = (e**x - 1)/(x e**x) = phi(x) / e**x, and
@@ -358,7 +391,9 @@ def _direct_quantities(
   return {'r_dir': r_dir, 't_dir': t_dir, 'one_minus_t0': 1.0 - t0}
 
 
-def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
+def _diffuse_and_shared(
+    gamma1: Array, gamma2: Array, tau: Array, *, expm1_denom: bool
+) -> tuple[StatesMap, StatesMap]:
   """Diffuse two-stream quantities (MW80 eqs 25-26), float32-stable.
 
   Two algebraically exact evaluations are blended at ``k*tau = 1``:
@@ -394,6 +429,42 @@ def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
   (``cosh(x) - 1 = 2 sinh^2(x/2)``, computed as squares — never by
   subtraction) and, on the thick branch, from
   ``k (1 - exp(-k tau))^2 = k expm1(-k tau)^2``.
+
+  **Select-count reduction (issue #27).** The two branches are kept — the
+  predicate and the k-free small branch are what keep the conservative-
+  scattering (``k^2 = 0``) reverse-mode gradient finite — but the branch is now
+  applied only at the *four outputs*. The interior safe-operands that used to be
+  three further ``jnp.where`` (the series argument, the large-branch ``k tau``
+  and the ``g_minus_t`` divisor) are instead clamped with ``jnp.minimum`` /
+  ``jnp.maximum``: those touch only the *unselected* branch (they leave the
+  selected values bit-for-bit unchanged) so they need no per-output select.
+  This drops the producer's ``select_n`` count (longwave 7 -> 4, and 13 -> 9 in
+  the shortwave producer that also calls ``_direct_quantities``); the #27
+  forensics identify the two-branch guard scheme's extra selects/where as the
+  GPU fusion-breaker behind the throughput regression, so shrinking that count
+  is the lever, to be confirmed on GPU.
+
+  ``expm1_denom`` selects how the large branch forms
+  ``a = 1 - exp(-2 k tau)`` and the denominator ``D``:
+
+  * ``False`` (longwave) — ``a = 1 - e1**2`` from a single ``exp(-k tau)``.
+    The large branch is only selected for ``k*tau >= 1``, where that
+    subtraction does not cancel, so it is exact *and* costs no ``expm1``. The
+    longwave path has no direct beam, and a spurious ``expm1`` here would blow
+    its per-cell transcendental budget (``performance_test``).
+  * ``True`` (shortwave) — ``a = -expm1(-2 k tau)`` and ``D`` built from the
+    same ``expm1``. The shortwave direct beam already pays for that ``expm1``
+    (it is evaluated at all tau, where ``1 - e1**2`` *would* cancel), so
+    sharing the identical ``e2m1``/``D`` with it costs nothing extra and lets
+    ``_direct_quantities`` skip recomputing the denominator (issue #27). The
+    resulting large-branch values differ from the ``False`` form only by a
+    rounding ulp, on the ``k*tau >= 1`` domain where both are well-conditioned.
+
+  The shared exp-scaled intermediates (``k``, ``exp(-k tau)``,
+  ``expm1(-2 k tau)`` when formed, and the diffuse denominator ``D``) are
+  returned alongside the diffuse quantities so ``sw_cell_properties`` can
+  thread them into ``_direct_quantities`` rather than have XLA emit a second
+  ``exp``/``sqrt``/denominator per g-point.
   """
   eps = _eps_of(gamma1)
   k2 = _k_squared(gamma1, gamma2)
@@ -402,22 +473,20 @@ def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
   # x2 = (k*tau)^2 = k2*tau^2 — never through sqrt(k2), whose reverse-mode
   # derivative is infinite at the conservative-scattering point k2 = 0 (see
   # the note above the hyperbolic helpers). ``k`` itself (eps-floored, safe
-  # adjoint) is used only by the large branch.
+  # adjoint) is used only by the large branch and the shared direct-beam terms.
   x2 = k2 * jnp.square(tau)
   small = x2 < _KTAU_SWITCH**2
   gsum = jnp.maximum(gamma1 + gamma2, eps)
 
-  # --- small-k*tau branch (safe operand: the argument is clipped to the switch
-  # point when this branch is *not* the selected one, both so the truncated
-  # series stay inside the interval they are accurate on and so their leading
-  # x2**n term cannot overflow to inf for a thick layer and put a `0 * inf`
-  # NaN into the reverse pass of the select below).
-  x2c = jnp.where(small, x2, _KTAU_SWITCH**2)
-  # All four hyperbolic quantities come from truncated series in x2 sharing one
-  # clipped argument: no sqrt, no exp, no inner branch. See `_hyperbolics`.
-  # Evaluating them separately was the single largest source of transcendentals
-  # in this solve (issue #22), and switching to an exp-based direct form over
-  # part of the range still paid for that exp on every call (issue #27).
+  # --- small-k*tau branch (k-free series; exact conservative-scattering limit,
+  # cancellation-free thin layers). `jnp.minimum` clamps the series argument to
+  # the switch point *without a select*: on the selected small branch x2 < 1 so
+  # it is inactive, and on a thick (unselected) layer it stops the truncated
+  # polynomial's leading x2**n term overflowing to inf and poisoning the output
+  # select's reverse pass. All four hyperbolic quantities come from truncated
+  # series in x2 sharing this one argument — no sqrt, no exp, no inner branch
+  # (see `_hyperbolics`; issue #22).
+  x2c = jnp.minimum(x2, _KTAU_SWITCH**2)
   shc, shc_half, shc_m1, ch = _hyperbolics(x2c)
   c_small = ch + gamma1 * tau * shc
   r_small = gamma2 * tau * shc / c_small
@@ -429,33 +498,51 @@ def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
   gmt_small = (0.5 * k2 * tau * jnp.square(shc_half) / gsum
                + shc_m1) / c_small
 
-  # --- large-k*tau branch (exp-scaled; safe at any tau).
-  ktau_big = jnp.where(small, _KTAU_SWITCH, k * tau)
-  # One exp serves the whole branch. `expm1` and a second `exp` are not needed
-  # here: this branch is only selected for `k*tau >= 1`, so `e1 <= exp(-1)` and
-  # neither `e1 - 1` (in [-1, -0.63]) nor `1 - e1**2` (in [0.86, 1]) cancels.
-  # `expm1` earns its keep near zero, which this branch never sees.
-  e1 = jnp.exp(-ktau_big)
-  e2 = jnp.square(e1)                  # exp(-2 k tau)
+  # --- exp-scaled large-k*tau branch, and (when shared) the direct beam's
+  # intermediates. See `expm1_denom` above for why the longwave path forms
+  # `a = 1 - e1**2` (no expm1) while the shortwave path forms it from expm1 so
+  # the identical `e2m1`/denominator carry into `_direct_quantities`.
+  e1 = jnp.exp(-k * tau)                          # exp(-k tau)
+  if expm1_denom:
+    e2m1 = jnp.expm1(-2.0 * k * tau)              # exp(-2 k tau) - 1
+    a = -e2m1                                     # 1 - exp(-2 k tau)
+    d_big = k * (2.0 + e2m1) - gamma1 * e2m1      # k (1 + e2) + gamma1 a
+  else:
+    e2m1 = None
+    e2 = jnp.square(e1)                           # exp(-2 k tau)
+    a = 1.0 - e2                                  # no cancellation for k*tau>=1
+    d_big = k * (1.0 + e2) + gamma1 * a
   em1 = e1 - 1.0                       # in [-1, 0)
-  a = 1.0 - e2                         # 1 - exp(-2 k tau), no cancellation
-  d_big = k * (1.0 + e2) + gamma1 * a
   r_big = gamma2 * a / d_big
   t_big = 2.0 * k * e1 / d_big
   # D - 2k e^{-ktau} -/+ gamma2*(1-e^{-2ktau}) = k(1-e^{-ktau})^2 + (g1-/+g2)a
   omrt_big = (k * jnp.square(em1) + (gamma1 - gamma2) * a) / d_big
-  # Safe operand: on the small branch (unselected here) tau can be 0;
-  # ktau >= 1 on the selected branch guarantees tau > 0.
-  tau_big = jnp.where(small, 1.0, tau)
-  g_big = (k * jnp.square(em1) + gsum * a) / (tau_big * gsum * d_big)
+  # `g_minus_t` divides by tau; on the small branch (unselected here) tau can
+  # be 0. `jnp.maximum` — not a `where` — floors the divisor without a select:
+  # on the selected large branch k*tau >= 1 guarantees tau > 0, so it is
+  # inactive there and the discarded small-branch value stays finite.
+  tau_safe = jnp.maximum(tau, eps)
+  g_big = (k * jnp.square(em1) + gsum * a) / (tau_safe * gsum * d_big)
   gmt_big = g_big - t_big
 
-  return {
+  diffuse = {
       'r_diff': jnp.where(small, r_small, r_big),
       't_diff': jnp.where(small, t_small, t_big),
       'one_minus_r_minus_t': jnp.where(small, omrt_small, omrt_big),
       'g_minus_t': jnp.where(small, gmt_small, gmt_big),
   }
+  shared = {'k': k, 'e1': e1, 'e2m1': e2m1, 'denom': d_big}
+  return diffuse, shared
+
+
+def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
+  """Diffuse two-stream quantities only (see `_diffuse_and_shared`).
+
+  The longwave path has no direct beam, so it discards the shared exp-scaled
+  intermediates that the shortwave path threads into `_direct_quantities`.
+  """
+  diffuse, _ = _diffuse_and_shared(gamma1, gamma2, tau, expm1_denom=False)
+  return diffuse
 
 
 
@@ -569,17 +656,24 @@ def sw_cell_properties(
   # in `lw_cell_source_and_properties` for details.
   optical_depth = jnp.maximum(optical_depth, 0.0)
 
-  # Exchange rate coefficients from Zdunkowski et al. (1980).
+  # Exchange rate coefficients from Zdunkowski et al. (1980). `cos(zenith)` is
+  # formed once here and reused for the direct beam (issue #27: it was
+  # otherwise recomputed inside `_direct_quantities`).
+  mu0 = jnp.cos(zenith)
   g = asymmetry_factor
   gamma1 = 0.25 * (8 - ssa * (5 + 3 * g))
   gamma2 = 0.25 * 3 * ssa * (1 - g)
-  gamma3 = 0.25 * (2 - 3 * jnp.cos(zenith) * g)
+  gamma3 = 0.25 * (2 - 3 * mu0 * g)
   gamma4 = 1 - gamma3
   alpha1 = gamma1 * gamma4 + gamma2 * gamma3
   alpha2 = gamma1 * gamma3 + gamma2 * gamma4
 
-  # Diffuse reflectance and transmittance.
-  diffuse = _diffuse_quantities(gamma1, gamma2, optical_depth)
+  # Diffuse reflectance and transmittance, plus the exp-scaled intermediates
+  # (k, exp(-k tau), expm1(-2 k tau), the diffuse denominator and its
+  # reciprocal) that the direct beam reuses instead of recomputing.
+  diffuse, shared = _diffuse_and_shared(
+      gamma1, gamma2, optical_depth, expm1_denom=True
+  )
   r_diff = diffuse['r_diff']
   t_diff = diffuse['t_diff']
 
@@ -591,6 +685,8 @@ def sw_cell_properties(
   direct = _direct_quantities(
       gamma1, gamma2, gamma3, gamma4, alpha1, alpha2, optical_depth, ssa,
       zenith,
+      mu0=mu0, k=shared['k'], e1=shared['e1'], e2m1=shared['e2m1'],
+      denom=shared['denom'],
   )
   r_dir_unconstrained = direct['r_dir']
   t_dir_unconstrained = direct['t_dir']
