@@ -35,6 +35,11 @@ a loaded CI runner:
   3. **Arithmetic in a cell kernel, diluted below the noise floor of a
      whole-solve budget.** See below.
 
+  4. **More kernel launches for the same arithmetic.** On an accelerator this
+     workload is launch-bound, not flop-bound, so this is a distinct failure
+     mode that (1)-(3) cannot see at all. Caught by the launch-count budgets
+     below.
+
 The budgets are ceilings with headroom, not exact values; they are meant to
 catch a multiplicative regression, not to freeze the implementation. If a change
 genuinely needs more arithmetic, raise the number here deliberately and say why
@@ -59,9 +64,33 @@ regression through, both worth stating because they are easy to reintroduce:
     because the unrolled form multiplies per-cell arithmetic in a way the
     scan form does not. A budget is only meaningful for the configuration it
     was measured in, so both are now pinned.
+
+**Why arithmetic budgets alone are not enough.** Flops and transcendentals
+turned out not to predict throughput on this workload at all, and the evidence
+is unambiguous:
+
+  * Cutting the longwave solve's transcendentals back to 0.2.1's exact count
+    (whole-solve 9.17M -> 3.44M) changed end-to-end GCM throughput by nothing:
+    20.68 -> 20.45 s/simulated-day, the same product, inside run-to-run noise.
+  * A follow-up that deduplicated exponentials and cut `select_n` counts (SW
+    13 -> 9, LW 7 -> 4 per element) also changed throughput by nothing.
+  * XLA's cost model said `use_scan=True` should shrink the 0.3.0 solve
+    regression from 3.15x/7.74x to 1.34x/1.99x. Measured end to end it was
+    44-49% *slower*, because a scan serialises kernel launches that the
+    unrolled form issues back to back.
+
+What did track the regression is the number of kernel launches. Between 0.2.1
+and 0.3.0-era main the GCM's radiation call went from 89,733 to 132,832
+launches (+48%) against a measured radiation time of 850.5 -> 1193.5 ms
+(+40%), while the *average* kernel got slightly faster (9.48 -> 8.99 us). The
+GPU is busy only 64-74% of the wall time at 86% occupancy: the solve is
+launch-bound, and a change that adds launches costs time even if it removes
+arithmetic. Hence guard 4.
 """
 
+import collections
 import functools
+import re
 from pathlib import Path
 from typing import TypeAlias
 
@@ -169,9 +198,198 @@ _MAX_TRANSCENDENTALS = {
 _MAX_KERNEL_FLOPS = {'sw': 380_000_000, 'lw': 370_000_000}
 _MAX_KERNEL_TRANSCENDENTALS = {'sw': 10_900_000, 'lw': 3_300_000}
 
+# Kernel-launch budgets for a whole solve, keyed by (platform, band,
+# use_scan). This is the number of kernels the backend issues per call -- the
+# launches in the g-point loop body multiplied by `n_gpt`, plus the handful
+# outside it -- which is what the GCM actually pays for on an accelerator (see
+# the module docstring for why flops do not predict it).
+#
+# Reference values on the implementation these were written against, CPU
+# backend, jax 0.10.2, at the `_N_HORIZ` shape:
+#
+#                      launches/solve   g-point body   n_gpt
+#   LW use_scan=False      117,036          457         256
+#   LW use_scan=True       275,244        1,075         256
+#   SW use_scan=False       82,674          369         224
+#   SW use_scan=True       273,970        1,223         224
+#
+# Both `use_scan` settings are pinned for the same reason the arithmetic
+# budgets are, and the numbers show why it matters: `use_scan=True` issues
+# 2.4x / 3.3x the launches of the unrolled form while XLA's cost model reports
+# it as *cheaper* in flops. That inversion is exactly the one that made the
+# scan 44-49% slower in the GCM, and only this metric has the sign right.
+#
+# **Backend dependence, and how far this is trusted.** Kernel count is a
+# property of the compiled executable, so it is backend-specific: CPU and GPU
+# do not fuse identically, and the absolute CPU numbers here are ~1.5x the GPU
+# ones. The budgets are therefore keyed by platform and a platform with no
+# entry skips rather than asserting something it has not been calibrated for.
+#
+# What was checked before trusting the CPU numbers as a guard is that they
+# reproduce the *ratio* that the GPU traces measured. Counting the solve this
+# way on CPU at 0.2.1 and at 0.3.0-era main gives 134,640 -> 201,824 launches,
+# a factor of 1.499, against the 1.484 measured on GPU with a profiler. The
+# split also matches: the CPU count attributes 78,144 of main's launches to the
+# minor-gas scan where the GPU trace attributes 78,594. So the CPU metric is
+# not the GPU's number, but it tracks the GPU's *change* to about 1%, which is
+# what a regression guard needs.
+#
+# The ceilings carry ~20% headroom -- looser than the arithmetic budgets,
+# because fusion decisions do shift a few percent across XLA releases, and
+# tighter than the +48% regression that motivated the guard, so a repeat of it
+# cannot fit underneath.
+#
+# They are set from the *current* count, which is still ~1.5x 0.2.1's. The
+# guard freezes today's cost so the next increment has to be argued for; it
+# does not certify that today's cost is right. Most of what is being frozen is
+# one structural change: 0.3.0 replaced the minor-gas absorber loop -- a
+# `while_loop` that ran each band's own handful of intervals -- with a
+# fixed-length `scan`, because a data-dependent trip count is not
+# reverse-mode differentiable. Even bounded to the widest band it now runs the
+# worst case for every g-point, which is 73% of the launches 0.3.0 added.
+_MAX_LAUNCHES = {
+    ('cpu', 'lw', False): 140_000,
+    ('cpu', 'lw', True): 330_000,
+    ('cpu', 'sw', False): 99_000,
+    ('cpu', 'sw', True): 329_000,
+}
 
+# HLO text parsing for the launch count. Instruction lines look like
+#   %name = f32[16,16,62]{2,1,0} fusion(%a, %b), kind=kLoop, calls=%fused.1
+# or, for a tuple-shaped result,
+#   %name = (s32[], f32[8]{0}) while(%t), condition=%c, body=%b, ...
+# The opcode is the first `word(` in the line: the result shape that precedes
+# it uses brackets and braces, or is a bare parenthesised tuple, so neither
+# form can match.
+_HLO_DECL = re.compile(r'^\s*(ENTRY\s+)?%?([\w.\-]+)\s*\(')
+_HLO_INSTR = re.compile(r'^\s+%?([\w.\-]+)\s*=\s*(.*)$')
+_HLO_OPCODE = re.compile(r'(?:^|[\s)])([a-z][\w\-]*)\(')
+_HLO_TRIP = re.compile(r'"known_trip_count":\{"n":"(\d+)"\}')
+
+# Pure metadata and addressing: never a kernel launch on any backend.
+_NOT_A_LAUNCH = frozenset({
+    'parameter', 'constant', 'tuple', 'get-tuple-element', 'bitcast',
+    'after-all', 'token', 'partition-id', 'replica-id', 'get-dimension-size',
+    'set-dimension-size', 'domain', 'opt-barrier', 'optimization-barrier',
+})
+# Control flow: the launches are those of the sub-computations, not of the
+# instruction itself. Note `to_apply` (the reducer of a `reduce`, the
+# comparator of a `sort`) is deliberately *not* treated as control flow -- it
+# is inlined into the parent kernel, not launched separately.
+_HLO_CONTROL = frozenset({'while', 'conditional', 'call', 'async-start'})
+
+
+def _parse_hlo(text: str) -> tuple[dict[str, list], str | None]:
+    """Split an HLO module into computations.
+
+    Returns `({name: [(opcode, line), ...]}, entry_name)`. Nested `{...}`
+    inside an instruction (fusion bodies are separate computations, but
+    sharding and backend-config braces are not) is handled by only closing a
+    computation on a line that is exactly `}`.
+    """
+    comps: dict[str, list] = {}
+    entry = None
+    cur, instrs = None, []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if cur is None:
+            m = _HLO_DECL.match(line)
+            if m and stripped.endswith('{'):
+                cur, instrs = m.group(2), []
+                if m.group(1):
+                    entry = cur
+            continue
+        if stripped == '}':
+            comps[cur] = instrs
+            cur = None
+            continue
+        m = _HLO_INSTR.match(line)
+        if m:
+            rest = m.group(2)
+            op = _HLO_OPCODE.search(rest)
+            instrs.append((op.group(1) if op else '?', rest))
+    return comps, entry
+
+
+def _hlo_callees(opcode: str, line: str) -> list[tuple[str, int]]:
+    """`(computation, repeat count)` pairs a control instruction invokes."""
+    out = []
+    if opcode == 'while':
+        body = re.search(r'body=%?([\w.\-]+)', line)
+        trip = _HLO_TRIP.search(line)
+        if body:
+            # A `while` whose trip count XLA could not determine is charged a
+            # single iteration. That under-counts, so it makes the budget a
+            # floor rather than a ceiling for such a program -- worth knowing,
+            # but the current solves contain no such loop (the minor-gas loop
+            # became a fixed-length scan in 0.3.0).
+            out.append((body.group(1), int(trip.group(1)) if trip else 1))
+    elif opcode == 'conditional':
+        m = re.search(r'branch_computations=\{([^}]*)\}', line)
+        names = list(m.group(1).split(',')) if m else []
+        for key in ('true_computation', 'false_computation'):
+            b = re.search(key + r'=%?([\w.\-]+)', line)
+            if b:
+                names.append(b.group(1))
+        out += [(n.strip().lstrip('%'), 1) for n in names if n.strip()]
+    else:
+        m = re.search(r'calls=\{?%?([\w.\-]+)', line)
+        if m:
+            out.append((m.group(1), 1))
+    return out
+
+
+def _count_launches(text: str, histogram=None) -> int:
+    """Kernel launches issued per call of a compiled module.
+
+    Walks the *optimized* HLO from its entry computation. A `fusion` is one
+    launch and its body is not descended into; a `while` costs its static trip
+    count times its body, which is what makes this count the quantity the GCM
+    pays -- for a solve that is (g-point body launches) x `n_gpt` rather than
+    the body size alone. Only one branch of a `conditional` runs, but which one
+    is data-dependent, so the most expensive is charged.
+    """
+    comps, entry = _parse_hlo(text)
+    memo: dict[str, int] = {}
+
+    def walk(name: str, weight: int) -> int:
+        if name not in comps:
+            return 0
+        if name in memo and histogram is None:
+            return memo[name]
+        total = 0
+        for opcode, line in comps[name]:
+            if opcode in _NOT_A_LAUNCH:
+                continue
+            if opcode == 'fusion':
+                total += 1
+                if histogram is not None:
+                    histogram['fusion'] += weight
+                continue
+            if opcode in _HLO_CONTROL:
+                callees = _hlo_callees(opcode, line)
+                if opcode == 'conditional' and callees:
+                    total += max(walk(c, weight) for c, _ in callees)
+                else:
+                    for callee, trip in callees:
+                        total += trip * walk(callee, weight * trip)
+                continue
+            total += 1
+            if histogram is not None:
+                histogram[opcode] += weight
+        memo[name] = total
+        return total
+
+    return walk(entry, 1) if entry else 0
+
+
+@functools.lru_cache(maxsize=None)
 def _radiation_setup():
-    """Build the optics library, atmospheric state, and a small column batch."""
+    """Build the optics library, atmospheric state, and a small column batch.
+
+    Cached: every guard in this file wants the same inputs, and reading the
+    g256/g224 lookup tables off disk each time dominates the non-compile cost.
+    """
     ds = nc.Dataset(_ROOT / _ATMOS_STATE, 'r')
     params = radiative_transfer.RadiativeTransfer(
         optics=radiative_transfer.OpticsParameters(
@@ -254,21 +472,41 @@ def _cost_of(fn, *args) -> dict[str, float]:
     return cost[0] if isinstance(cost, list) else cost
 
 
-def _compiled_cost(band: str, use_scan: bool) -> dict[str, float]:
-    """Compile the solve for `band` and return XLA's cost analysis."""
+@functools.lru_cache(maxsize=None)
+def _compiled_solve(band: str, use_scan: bool):
+    """The compiled solve for `band`, cached.
+
+    Compiling the solve at the production shape is the expensive part of this
+    file, and the flops, transcendental and launch-count guards all want the
+    same four executables. Caching keeps the suite to one compile each.
+    """
     (optics_lib, atmos_state, p, t, molecules, vmr_fields,
      sfc_temperature) = _radiation_setup()
-    if band == 'lw':
-        fn = lambda temp: two_stream.solve_lw(
-            p, temp, molecules, optics_lib, atmos_state, vmr_fields,
-            sfc_temperature, use_scan=use_scan,
-        )['flux_net']
-    else:
-        fn = lambda temp: two_stream.solve_sw(
+    def solve(temp):
+        if band == 'lw':
+            return two_stream.solve_lw(
+                p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+                sfc_temperature, use_scan=use_scan,
+            )['flux_net']
+        return two_stream.solve_sw(
             p, temp, molecules, optics_lib, atmos_state, vmr_fields,
             use_scan=use_scan,
         )['flux_net']
-    return _cost_of(fn, t)
+
+    return jax.jit(solve).lower(t).compile()
+
+
+def _compiled_cost(band: str, use_scan: bool) -> dict[str, float]:
+    """Compile the solve for `band` and return XLA's cost analysis."""
+    cost = _compiled_solve(band, use_scan).cost_analysis()
+    return cost[0] if isinstance(cost, list) else cost
+
+
+def _solve_launch_count(band: str, use_scan: bool):
+    """Kernel launches per solve, and a histogram of what issues them."""
+    histogram = collections.Counter()
+    text = _compiled_solve(band, use_scan).as_text()
+    return _count_launches(text, histogram), histogram
 
 
 def _kernel_cost(band: str) -> dict[str, float]:
@@ -286,15 +524,18 @@ def _kernel_cost(band: str) -> dict[str, float]:
     ssa = jnp.asarray(rng.uniform(0.0, 1.0, shape), f32)
     asymmetry = jnp.asarray(rng.uniform(0.0, 0.9, shape), f32)
     if band == 'sw':
-        fn = lambda tau, ssa, g: monochromatic_two_stream.sw_cell_properties(
-            0.5, tau, ssa, g
+        def sw_kernel(tau, ssa, g):
+            return monochromatic_two_stream.sw_cell_properties(0.5, tau, ssa, g)
+
+        return _cost_of(sw_kernel, tau, ssa, asymmetry)
+
+    def lw_kernel(tau, ssa, s, g):
+        return monochromatic_two_stream.lw_cell_source_and_properties(
+            tau, ssa, s, s, g
         )
-        return _cost_of(fn, tau, ssa, asymmetry)
+
     src = jnp.asarray(rng.uniform(0.0, 10.0, shape), f32)
-    fn = lambda tau, ssa, s, g: (
-        monochromatic_two_stream.lw_cell_source_and_properties(tau, ssa, s, s, g)
-    )
-    return _cost_of(fn, tau, ssa, src, asymmetry)
+    return _cost_of(lw_kernel, tau, ssa, src, asymmetry)
 
 
 class PerformanceTest(unittest.TestCase):
@@ -403,6 +644,53 @@ class PerformanceTest(unittest.TestCase):
             with self.subTest(use_scan=use_scan):
                 self._assert_within_budget('sw', use_scan)
 
+    def test_longwave_solve_launch_count_within_budget(self):
+        """Launches, not arithmetic -- the metric that tracked issue #27.
+
+        Both `use_scan` settings again, and here the two are not merely
+        different budgets for the same program: the scan form issues several
+        times the launches while reporting *fewer* flops. Pinning only one of
+        them would leave the cheaper-looking, slower configuration unguarded.
+        """
+        for use_scan in (True, False):
+            with self.subTest(use_scan=use_scan):
+                self._assert_launches_within_budget('lw', use_scan)
+
+    def test_shortwave_solve_launch_count_within_budget(self):
+        for use_scan in (True, False):
+            with self.subTest(use_scan=use_scan):
+                self._assert_launches_within_budget('sw', use_scan)
+
+    def test_launch_count_sees_loop_trip_counts(self):
+        """The counter must multiply a loop body by its trip count.
+
+        This is the property that makes the metric worth having over a plain
+        instruction count, and the one a refactor of `_count_launches` could
+        silently drop -- leaving a guard that reports a few hundred launches
+        for a solve that issues a hundred thousand, and passes forever.
+        """
+        module = '\n'.join([
+            'HloModule m',
+            '%body (p: f32[4]) -> f32[4] {',
+            '  %p = f32[4] parameter(0)',
+            '  %f = f32[4] fusion(%p), kind=kLoop, calls=%fused',
+            '}',
+            'ENTRY %main (a: f32[4]) -> f32[4] {',
+            '  %a = f32[4] parameter(0)',
+            '  %w = f32[4] while(%a), condition=%cond, body=%body, '
+            'backend_config={"known_trip_count":{"n":"256"}}',
+            '}',
+        ])
+        self.assertEqual(_count_launches(module), 256)
+
+        # ...and a loop XLA could not bound is charged one iteration, so the
+        # number stays a lower bound rather than silently becoming zero.
+        self.assertEqual(
+            _count_launches(module.replace(
+                ', backend_config={"known_trip_count":{"n":"256"}}', '')),
+            1,
+        )
+
     def test_longwave_cell_kernel_within_budget(self):
         self._assert_kernel_within_budget('lw')
 
@@ -456,6 +744,43 @@ class PerformanceTest(unittest.TestCase):
                  f'{_MAX_TRANSCENDENTALS[band, use_scan]:,} budget. Note that '
                  f'a `jnp.where` evaluates both branches, so a "safe" branch '
                  f'guarding a sqrt/exp costs the same as taking it.'),
+        )
+
+    def _assert_launches_within_budget(self, band: str, use_scan: bool):
+        """Kernel launches per solve stay under budget on this backend.
+
+        The budgets are calibrated per platform because fusion is, so a
+        platform that has not been calibrated skips with instructions rather
+        than asserting a number measured somewhere else.
+        """
+        platform = jax.devices()[0].platform
+        key = (platform, band, use_scan)
+        if key not in _MAX_LAUNCHES:
+            self.skipTest(
+                f'no launch budget calibrated for platform {platform!r}. '
+                f'Kernel count is a property of the compiled executable and '
+                f'differs between backends, so asserting the CPU number here '
+                f'would be meaningless. To calibrate, measure the current '
+                f'count on this backend and add ({platform!r}, {band!r}, '
+                f'{use_scan}) to _MAX_LAUNCHES with ~20% headroom.'
+            )
+
+        label = f'{band.upper()} solve (use_scan={use_scan}) on {platform}'
+        launches, histogram = _solve_launch_count(band, use_scan)
+        self.assertGreater(
+            launches, 0,
+            msg=(f'{label}: no launches counted. The optimized-HLO text no '
+                 f'longer parses -- the guard is disabled, not satisfied.'),
+        )
+        self.assertLessEqual(
+            launches, _MAX_LAUNCHES[key],
+            msg=(f'{label} issues {launches:,} kernel launches, over the '
+                 f'{_MAX_LAUNCHES[key]:,} budget. This is the metric that '
+                 f'moved with the issue #27 regression while the flops and '
+                 f'transcendental budgets above stayed green, so do not raise '
+                 f'it on the strength of an arithmetic saving -- the GCM is '
+                 f'launch-bound here and pays per launch. Biggest '
+                 f'contributors: {histogram.most_common(5)}.'),
         )
 
     def _assert_kernel_within_budget(self, band: str):
