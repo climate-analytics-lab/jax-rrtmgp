@@ -403,6 +403,73 @@ class PerformanceTest(unittest.TestCase):
             with self.subTest(use_scan=use_scan):
                 self._assert_within_budget('sw', use_scan)
 
+    def test_gpt_chunk_shortens_the_spectral_loop(self):
+        """`gpt_chunk=G` must run G times fewer iterations for the same work.
+
+        This is the only property of the chunking that is worth asserting
+        deterministically. The *point* of it is a G-fold cut in GPU kernel
+        launches, and neither `cost_analysis()` nor this module can see launches
+        at all -- but launches are `body kernels x iterations`, the body is
+        unchanged by construction, so the trip count is the half of the product
+        that is measurable here. (The other half was checked by reading fusion
+        counts out of the compiled body: 243 -> 249 for LW and 253 -> 260 for SW
+        going from G=1 to G=16, i.e. flat.)
+
+        The second assertion is the one that would catch chunking going wrong in
+        the expensive direction: the total *element-operations issued*, which
+        `jaxpr_cost` weights by array size and trip count, must stay flat. Fewer
+        iterations over proportionally bigger arrays is a restructuring; fewer
+        iterations at the same total cost as before would mean the chunk is
+        recomputing something per g-point that used to be shared.
+        """
+        (optics_lib, atmos_state, p, t, molecules, vmr_fields,
+         sfc_temperature) = _radiation_setup()
+
+        def counts_for(gpt_chunk):
+            return jaxpr_cost.op_counts(
+                lambda temp: two_stream.solve_lw(
+                    p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+                    sfc_temperature, gpt_chunk=gpt_chunk,
+                )['flux_net'],
+                t,
+            )
+
+        n_gpt = optics_lib.n_gpt_lw
+        base = counts_for(1)
+        self.assertIn(
+            n_gpt, base.scan_lengths,
+            msg=(f'no scan of length n_gpt={n_gpt} found; the spectral loop no '
+                 f'longer lowers to a scan and this guard needs updating. '
+                 f'Lengths seen: {sorted(set(base.scan_lengths))}'),
+        )
+
+        for gpt_chunk in (2, 8):
+            with self.subTest(gpt_chunk=gpt_chunk):
+                counts = counts_for(gpt_chunk)
+                expected = n_gpt // gpt_chunk
+                self.assertIn(
+                    expected, counts.scan_lengths,
+                    msg=(f'gpt_chunk={gpt_chunk} did not shorten the spectral '
+                         f'loop to {expected} iterations; lengths seen: '
+                         f'{sorted(set(counts.scan_lengths))}'),
+                )
+                self.assertNotIn(
+                    n_gpt, counts.scan_lengths,
+                    msg=(f'gpt_chunk={gpt_chunk} left a full-length ({n_gpt}) '
+                         f'g-point loop in the program, so the chunk is being '
+                         f'solved on top of the unchunked loop rather than '
+                         f'instead of it.'),
+                )
+                # Same arithmetic, differently shaped. 10% covers the handful of
+                # extra index/mask ops the chunked form adds per iteration.
+                self.assertLessEqual(
+                    counts.total, 1.1 * base.total,
+                    msg=(f'gpt_chunk={gpt_chunk} issues {counts.total:,.0f} '
+                         f'element-operations against {base.total:,.0f} '
+                         f'unchunked. Chunking is meant to regroup the same '
+                         f'work, not add to it.'),
+                )
+
     def test_longwave_cell_kernel_within_budget(self):
         self._assert_kernel_within_budget('lw')
 
