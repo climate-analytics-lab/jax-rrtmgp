@@ -134,6 +134,7 @@ class RRTMGP:
       # bindings.
       sfc_alb: float | Array | None = None,
       sfc_emis: float | Array | None = None,
+      gpt_chunk: int = two_stream.DEFAULT_GPT_CHUNK,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -175,6 +176,13 @@ class RRTMGP:
     passed through unmodified (no delta-scaling). LW and SW are independent —
     pass one or both. Aerosols are also applied to the clear-sky diagnostic
     (CMIP convention: "clear-sky" = cloud-free, aerosols included).
+
+    `gpt_chunk` sets how many g-points the spectral loop solves per iteration.
+    It changes no physics -- only the order in which independent g-point fluxes
+    are summed -- and exists to cut GPU kernel launches on a solve that is
+    launch bound rather than flop bound. See
+    `two_stream._solve_over_gpoints`, which also records the two alternative
+    fixes that were measured and failed.
 
     Returns:
       A dictionary containing the following keys:
@@ -268,6 +276,7 @@ class RRTMGP:
         cloud_r_eff_ice=cloud_r_eff_ice,
         cloud_path_ice=ice_water_path,
         use_scan=use_scan,
+        gpt_chunk=gpt_chunk,
         cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
         aerosol_optics=aerosol_optics_lw,
@@ -284,6 +293,7 @@ class RRTMGP:
         cloud_r_eff_ice=cloud_r_eff_ice,
         cloud_path_ice=ice_water_path,
         use_scan=use_scan,
+        gpt_chunk=gpt_chunk,
         cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
         aerosol_optics=aerosol_optics_sw,
@@ -360,6 +370,7 @@ class RRTMGP:
           cloud_r_eff_ice=None,
           cloud_path_ice=None,
           use_scan=use_scan,
+          gpt_chunk=gpt_chunk,
           aerosol_optics=aerosol_optics_lw,
       )
       sw_fluxes_clearsky = two_stream.solve_sw(
@@ -374,6 +385,7 @@ class RRTMGP:
           cloud_r_eff_ice=None,
           cloud_path_ice=None,
           use_scan=use_scan,
+          gpt_chunk=gpt_chunk,
           aerosol_optics=aerosol_optics_sw,
       )
       # Compute the heating rate in K/s.
