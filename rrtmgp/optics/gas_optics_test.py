@@ -197,6 +197,104 @@ class GasOpticsTest(unittest.TestCase):
             [[1.768588e-7]], minor_optical_depth, rtol=1e-5, atol=1e-12
         )
 
+  def test_minor_optical_depth_across_the_troposphere_split(self):
+    """Cells either side of `p_ref_tropo` draw on their own absorber table.
+
+    RRTMGP splits the minor absorbers into a lower- and an upper-atmosphere
+    table and a cell uses exactly one of them. The two are walked as one merged
+    interval list with a per-cell mask, so a field spanning the split is the
+    case that pins the mask: getting it wrong silently gives a cell the wrong
+    half's absorbers, which no single-regime test would see.
+    """
+    lookup = self.gas_optics_lw
+    p_tropo = float(lookup.p_ref_tropo)
+    # One cell below the reference pressure, one above.
+    p = jnp.array([[73509.51892419, 5000.0]], dtype=jnp.float_)
+    self.assertGreater(float(p[0, 0]), p_tropo)
+    self.assertLess(float(p[0, 1]), p_tropo)
+    temperature = jnp.array([[310.0, 260.0]], dtype=jnp.float_)
+    moles = jnp.array([[1e24, 1e24]], dtype=jnp.float_)
+    vmr_fields = {
+        lookup.idx_h2o: jnp.array([[1.2e-3, 4.0e-6]], dtype=jnp.float_),
+    }
+
+    for igpt, expected in ((100, [[3.7550384e-07, 2.6859974e-09]]),
+                           (20, [[3.4000088e-05, 3.0309238e-08]])):
+      with self.subTest(f'gpt{igpt}'):
+        minor_optical_depth = gas_optics.compute_minor_optical_depth(
+            lookup, self.vmr_lib, moles, temperature, p, igpt, vmr_fields
+        )
+        np.testing.assert_allclose(
+            minor_optical_depth, expected, rtol=1e-5, atol=1e-12
+        )
+
+  def test_minor_optical_depth_gradients(self):
+    """Reverse-mode gradients through the absorber batch must be right.
+
+    This code path is a fixed-size batch rather than a data-dependent loop
+    precisely so that it can be differentiated -- a `while_loop` with a
+    data-dependent trip count cannot be -- so a gradient that is wrong or
+    non-finite defeats the reason for the structure.
+    """
+    lookup = self.gas_optics_lw
+    p = jnp.array([[73509.51892419, 5000.0]], dtype=jnp.float_)
+    temperature = jnp.array([[310.0, 260.0]], dtype=jnp.float_)
+    moles = jnp.array([[1e24, 1e24]], dtype=jnp.float_)
+    vmr_h2o = jnp.array([[1.2e-3, 4.0e-6]], dtype=jnp.float_)
+
+    def total_optical_depth(h2o):
+      return jnp.sum(gas_optics.compute_minor_optical_depth(
+          lookup, self.vmr_lib, moles, temperature, p, 100,
+          {lookup.idx_h2o: h2o},
+      ))
+
+    grad = jax.grad(total_optical_depth)(vmr_h2o)
+    self.assertTrue(bool(jnp.isfinite(grad).all()))
+
+    # Central differences on the same quantity. The step is large relative to
+    # float32 epsilon because the optical depth itself is ~1e-7.
+    eps = 1e-5
+    for i in range(vmr_h2o.shape[1]):
+      with self.subTest(f'cell{i}'):
+        bump = jnp.zeros_like(vmr_h2o).at[0, i].set(eps)
+        expected = (total_optical_depth(vmr_h2o + bump)
+                    - total_optical_depth(vmr_h2o - bump)) / (2.0 * eps)
+        np.testing.assert_allclose(
+            grad[0, i], expected, rtol=1e-2, atol=1e-6
+        )
+
+  def test_optical_depth_gradients_finite_at_zero_vmr(self):
+    """A cell with both dominant species at exactly zero must still linearise.
+
+    The relative-abundance interpolant divides by the combined volume mixing
+    ratio of the two dominant species and falls back to 0.5 where that is zero.
+    `jnp.where` evaluates both arms, so an unguarded denominator makes the
+    discarded arm NaN and reverse-mode differentiation carries it back into the
+    gradient with respect to every gas concentration -- fine in value, fatal to
+    `jax.grad`.
+    """
+    lookup = self.gas_optics_lw
+    shape = (1, 2)
+    p = jnp.array([[73509.51892419, 5000.0]], dtype=jnp.float_)
+    temperature = jnp.array([[310.0, 260.0]], dtype=jnp.float_)
+    moles = jnp.array([[1e24, 1e24]], dtype=jnp.float_)
+    zero_vmr = jnp.zeros(shape, dtype=jnp.float_)
+
+    for name, fn in (
+        ('minor', gas_optics.compute_minor_optical_depth),
+        ('major', gas_optics.compute_major_optical_depth),
+    ):
+      with self.subTest(name):
+        def total(h2o, fn=fn):
+          return jnp.sum(fn(
+              lookup, self.vmr_lib, moles, temperature, p, 100,
+              {lookup.idx_h2o: h2o, lookup.idx_o3: zero_vmr},
+          ))
+
+        grad = jax.grad(total)(zero_vmr)
+        self.assertTrue(bool(jnp.isfinite(grad).all()),
+                        msg=f'{name} gradient: {grad}')
+
   def test_compute_rayleigh_optical_depth(self):
     """Checks the Rayleigh scattering contribution for a particular g-point."""
     # Temperature corresponding to the 10th reference point.

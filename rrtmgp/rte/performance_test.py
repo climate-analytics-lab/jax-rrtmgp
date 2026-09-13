@@ -141,10 +141,18 @@ _N_HORIZ = 136
 # against:
 #
 #                        flops          transcendentals
-#   LW  use_scan=True  2,415,670,272        3,440,256
-#   SW  use_scan=True  2,245,821,696       11,467,520
-#   LW  use_scan=False 6,818,315,776        3,440,256
-#   SW  use_scan=False 10,076,223,488      11,467,520
+#   LW  use_scan=True  2,352,600,064        3,440,256
+#   SW  use_scan=True  1,544,009,984       11,467,520
+#   LW  use_scan=False 3,056,969,984        3,440,256
+#   SW  use_scan=False 3,009,946,112       11,467,520
+#
+# The flops figures roughly halved when the minor-absorber loop became a
+# batched evaluation: the temperature and mixing-fraction interpolants used to
+# be rebuilt once per absorber interval and are now built once for all of them.
+# The old figures also *flattered* the sequential form, because
+# `cost_analysis()` charges a loop body once whatever its trip count -- the
+# per-interval work it hid is precisely what this budget cannot see, which is
+# why the launch-count budgets below exist.
 #
 # The ceilings carry ~30% headroom. They are set from the *current* numbers
 # rather than left slack at a historical high-water mark: the transcendental
@@ -166,10 +174,10 @@ _N_HORIZ = 136
 # because that setting unrolls the vertical recurrence into the g-point body;
 # they are budgets for a different program, not a looser bound on the same one.
 _MAX_FLOPS = {
-    ('lw', True): 3_200_000_000,
-    ('sw', True): 3_100_000_000,
-    ('lw', False): 8_200_000_000,
-    ('sw', False): 12_100_000_000,
+    ('lw', True): 3_050_000_000,
+    ('sw', True): 2_000_000_000,
+    ('lw', False): 3_960_000_000,
+    ('sw', False): 3_900_000_000,
 }
 _MAX_TRANSCENDENTALS = {
     ('lw', True): 4_500_000,
@@ -208,10 +216,10 @@ _MAX_KERNEL_TRANSCENDENTALS = {'sw': 10_900_000, 'lw': 3_300_000}
 # backend, jax 0.10.2, at the `_N_HORIZ` shape:
 #
 #                      launches/solve   g-point body   n_gpt
-#   LW use_scan=False      117,036          457         256
-#   LW use_scan=True       275,244        1,075         256
-#   SW use_scan=False       82,674          369         224
-#   SW use_scan=True       273,970        1,223         224
+#   LW use_scan=False       58,156          227         256
+#   LW use_scan=True       216,364          845         256
+#   SW use_scan=False       48,850          218         224
+#   SW use_scan=True       240,146        1,072         224
 #
 # Both `use_scan` settings are pinned for the same reason the arithmetic
 # budgets are, and the numbers show why it matters: `use_scan=True` issues
@@ -239,19 +247,27 @@ _MAX_KERNEL_TRANSCENDENTALS = {'sw': 10_900_000, 'lw': 3_300_000}
 # tighter than the +48% regression that motivated the guard, so a repeat of it
 # cannot fit underneath.
 #
-# They are set from the *current* count, which is still ~1.5x 0.2.1's. The
-# guard freezes today's cost so the next increment has to be argued for; it
-# does not certify that today's cost is right. Most of what is being frozen is
-# one structural change: 0.3.0 replaced the minor-gas absorber loop -- a
-# `while_loop` that ran each band's own handful of intervals -- with a
-# fixed-length `scan`, because a data-dependent trip count is not
-# reverse-mode differentiable. Even bounded to the widest band it now runs the
-# worst case for every g-point, which is 73% of the launches 0.3.0 added.
+# They are set from the *current* count. The guard freezes today's cost so the
+# next increment has to be argued for; it does not certify that today's cost is
+# right.
+#
+# Where the numbers have been. The 0.3.0 regression these budgets were first
+# written against measured LW 117,036 / SW 82,674 (199,710 for the pair)
+# against 0.2.1's 134,640, and 73% of what 0.3.0 added was one structural
+# change: the minor-gas absorber loop, a `while_loop` that ran each band's own
+# handful of intervals, became a fixed-length `scan` because a data-dependent
+# trip count is not reverse-mode differentiable. Evaluating those intervals as
+# a batch instead -- differentiable for the same reason a fixed-length scan is,
+# but issuing one interval's worth of launches rather than one set per interval
+# -- took the pair to 107,006, which is below 0.2.1. The minor-gas function
+# compiled on its own went from 245 (LW) / 146 (SW) launches per g-point to 22.
+# A budget left at the old ceiling would not protect that, hence the step down
+# here.
 _MAX_LAUNCHES = {
-    ('cpu', 'lw', False): 140_000,
-    ('cpu', 'lw', True): 330_000,
-    ('cpu', 'sw', False): 99_000,
-    ('cpu', 'sw', True): 329_000,
+    ('cpu', 'lw', False): 70_000,
+    ('cpu', 'lw', True): 260_000,
+    ('cpu', 'sw', False): 59_000,
+    ('cpu', 'sw', True): 288_000,
 }
 
 # HLO text parsing for the launch count. Instruction lines look like
@@ -446,23 +462,48 @@ def _radiation_setup():
             {'h2o': vmr_h2o, 'o3': vmr_o3}, sfc_temperature)
 
 
-def _minor_optical_depth_scan_lengths(lookup, atmos_state, molecules, p, t,
-                                      vmr_fields) -> list[int]:
-    """Trace the real minor-gas optical depth and collect its scan lengths.
+def _minor_optical_depth_structure(lookup, atmos_state, molecules, p, t,
+                                   vmr_fields) -> tuple[list[int], list[int]]:
+    """How many minor-absorber intervals the traced program really evaluates.
 
-    Reads the trip counts off the traced program via `rrtmgp.jaxpr_cost`, so
-    this reflects what the solver actually does rather than what a helper
-    reports.
+    Returns `(batch widths, scan lengths)`. Both are read off the traced
+    program rather than from a helper, so they follow the code that actually
+    runs.
+
+    A "batch width" is the leading extent of any intermediate shaped
+    `(k, *field)`: the absorbers are evaluated as a batch over the interval
+    axis, so `k` is the number of intervals evaluated per cell. Scan lengths
+    are collected too, because a sequential form reappearing is the regression
+    this guards -- it would move the count out of the batch axis and into a
+    trip count, where the arithmetic budgets cannot see it.
     """
     vmr_by_index = {
         lookup.idx_gases[name]: field for name, field in vmr_fields.items()
     }
-    return jaxpr_cost.scan_lengths(
-        lambda temp: gas_optics.compute_minor_optical_depth(
+
+    def fn(temp):
+        return gas_optics.compute_minor_optical_depth(
             lookup, atmos_state.vmr, molecules, temp, p, 0, vmr_by_index
-        ),
-        t,
-    )
+        )
+
+    field = tuple(t.shape)
+    widths: set[int] = set()
+
+    def walk(jaxpr):
+        for eqn in jaxpr.eqns:
+            for var in eqn.outvars:
+                shape = tuple(getattr(getattr(var, 'aval', None), 'shape', ()))
+                if len(shape) == len(field) + 1 and shape[1:] == field:
+                    widths.add(int(shape[0]))
+            for value in eqn.params.values():
+                items = value if isinstance(value, (list, tuple)) else (value,)
+                for item in items:
+                    inner = getattr(item, 'jaxpr', item)
+                    if hasattr(inner, 'eqns'):
+                        walk(inner)
+
+    walk(jax.make_jaxpr(fn)(t).jaxpr)
+    return sorted(widths), jaxpr_cost.scan_lengths(fn, t)
 
 
 def _cost_of(fn, *args) -> dict[str, float]:
@@ -540,12 +581,12 @@ def _kernel_cost(band: str) -> dict[str, float]:
 
 class PerformanceTest(unittest.TestCase):
 
-    def test_minor_gas_scan_is_bounded_by_widest_band(self):
-        """The minor-absorber scan must not walk the whole table.
+    def test_minor_gas_interval_count_is_bounded_by_widest_band(self):
+        """The minor-absorber evaluation must not walk the whole table.
 
-        Each band uses a contiguous run of minor intervals, so the scan only
-        needs to cover the widest band. Scanning the full table instead costs
-        an interpolation per surplus interval per g-point -- invisible to every
+        Each band uses a contiguous run of minor intervals, so only the widest
+        band's run needs covering. Covering the full table instead costs an
+        interpolation per surplus interval per g-point -- invisible to every
         correctness test, because the surplus contributions are masked to zero.
         """
         lw = lookup_gas_optics_longwave.from_nc_file(str(_ROOT / _LW_LOOKUP))
@@ -563,68 +604,85 @@ class PerformanceTest(unittest.TestCase):
         ]
         for label, start, end, n_intervals in cases:
             with self.subTest(label):
-                length = gas_optics.minor_scan_length(start, end, n_intervals)
+                count = gas_optics.minor_interval_count(
+                    start, end, n_intervals
+                )
                 # It must cover the widest band...
                 widths = np.where(
                     np.asarray(start) >= 0,
                     np.asarray(end) - np.asarray(start) + 1,
                     0,
                 )
-                self.assertGreaterEqual(length, int(widths.max()))
+                self.assertGreaterEqual(count, int(widths.max()))
                 # ...and must be a real saving against the full table, which is
                 # the regression this guards. The shipped tables are 4-7x wider
                 # than their widest band; require at least 2x.
                 self.assertLessEqual(
-                    length, n_intervals // 2,
-                    msg=(f'{label}: minor scan length {length} is not '
+                    count, n_intervals // 2,
+                    msg=(f'{label}: minor interval count {count} is not '
                          f'meaningfully shorter than the table dimension '
-                         f'{n_intervals}; the scan is walking intervals no '
-                         f'band uses.'),
+                         f'{n_intervals}; intervals no band uses are being '
+                         f'evaluated.'),
                 )
 
-    def test_minor_gas_scan_trip_count_in_traced_solver(self):
-        """The trip count the solver actually uses, not what a helper returns.
+    def test_minor_gas_intervals_in_traced_solver(self):
+        """What the solver really evaluates, not what a helper returns.
 
-        The check above pins `minor_scan_length`, which is only useful while
-        `_compute_minor_optical_depth` keeps calling it. Reverting that call
-        site to scan the whole table would restore the regression with the
+        The check above pins `minor_interval_count`, which is only useful while
+        `compute_minor_optical_depth` keeps calling it. Reverting that call
+        site to cover the whole table would restore the regression with the
         helper left untouched, and the check above would still pass. This one
-        reads the trip count off the traced program, so it follows the code
-        that actually runs.
+        reads the structure off the traced program, so it follows the code that
+        actually runs, and pins two separate properties of it:
+
+          * the absorbers are evaluated as a *batch*, not a sequence -- a
+            `scan` reappearing would move the interval count into a trip count
+            that the arithmetic budgets cannot see, which is how the issue #22
+            regression hid;
+          * the batch is no wider than the widest band of each half needs.
         """
         (optics_lib, atmos_state, p, t, molecules, vmr_fields,
          _) = _radiation_setup()
         lookup = optics_lib.gas_optics_lw
 
-        lengths = _minor_optical_depth_scan_lengths(
+        widths, scan_lengths = _minor_optical_depth_structure(
             lookup, atmos_state, molecules, p, t, vmr_fields
         )
+        self.assertEqual(
+            scan_lengths, [],
+            msg=(f'the minor-gas optical depth contains scans of length '
+                 f'{scan_lengths}. The absorbers are meant to be evaluated as '
+                 f'a batch: a sequential form issues a full set of kernel '
+                 f'launches per interval per g-point, which is what made this '
+                 f'function 73% of the launches 0.3.0 added.'),
+        )
         self.assertTrue(
-            lengths, 'no scan found in the minor-gas optical depth; the '
-                     'traced structure changed and this guard needs updating'
+            widths,
+            'no batched interval axis found in the minor-gas optical depth; '
+            'the traced structure changed and this guard needs updating',
         )
 
-        # The lower and upper atmosphere are accumulated separately, so the
-        # widest band of either bounds every scan here.
+        # The lower and upper atmosphere are merged into one interval list, so
+        # the batch covers the widest band of each half.
         widest = 0
         for start, end in ((lookup.minor_lower_bnd_start,
                             lookup.minor_lower_bnd_end),
                            (lookup.minor_upper_bnd_start,
                             lookup.minor_upper_bnd_end)):
-            widths = np.where(
+            band_widths = np.where(
                 np.asarray(start) >= 0,
                 np.asarray(end) - np.asarray(start) + 1,
                 0,
             )
-            widest = max(widest, int(widths.max()))
+            widest += int(band_widths.max())
 
-        table_dim = max(lookup.n_minor_absrb_lower, lookup.n_minor_absrb_upper)
+        table_dim = lookup.n_minor_absrb_lower + lookup.n_minor_absrb_upper
         self.assertLessEqual(
-            max(lengths), widest,
-            msg=(f'minor-gas scan runs {max(lengths)} iterations, more than '
-                 f'the widest band ({widest}) needs. Scanning the full table '
-                 f'({table_dim}) evaluates interpolations that are then masked '
-                 f'away -- the issue #22 regression.'),
+            max(widths), widest,
+            msg=(f'minor-gas evaluation covers {max(widths)} intervals, more '
+                 f'than the widest bands ({widest}) need. Covering the full '
+                 f'table ({table_dim}) evaluates interpolations that are then '
+                 f'masked away -- the issue #22 regression.'),
         )
 
     def test_longwave_solve_arithmetic_within_budget(self):

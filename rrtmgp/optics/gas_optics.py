@@ -15,7 +15,7 @@
 """Utility functions for computing optical properties of atmospheric gases."""
 
 import collections
-from typing import TypeAlias
+from typing import NamedTuple, TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -175,8 +175,18 @@ def _compute_relative_abundance_interpolant(
   # Consistent with how the RRTM absorption coefficient tables are designed, the
   # relative abundance defaults to 0.5 when the volume mixing ratio of both
   # dominant species is exactly 0.
+  #
+  # The denominator is substituted before the division rather than selected
+  # after it. `jnp.where` evaluates both arms, so dividing by the unguarded
+  # `combined_vmr` produces a NaN in the discarded arm -- harmless to the value,
+  # but reverse-mode differentiation propagates `0 * NaN` back through the
+  # select and poisons the gradient with respect to every gas concentration.
+  # That made `jax.grad` of the longwave solve non-finite wherever a cell had
+  # both dominant species at exactly zero.
+  is_present = combined_vmr > 0
+  safe_combined_vmr = jnp.where(is_present, combined_vmr, 1.0)
   relative_abundance = jnp.where(
-      combined_vmr > 0, vmr_for_interp[0] / combined_vmr, 0.5
+      is_present, vmr_for_interp[0] / safe_combined_vmr, 0.5
   )
   interpolant = _mixing_fraction_interpolant(
       relative_abundance, lookup_gas_optics.n_mixing_fraction
@@ -273,21 +283,21 @@ def compute_major_optical_depth(
   )
 
 
-def minor_scan_length(
+def minor_interval_count(
     minor_bnd_start: Array,
     minor_bnd_end: Array,
     minor_absorber_intervals: int,
 ) -> int:
-  """Static length of the minor-absorber scan: the widest band's range.
+  """Static number of minor-absorber intervals to evaluate: the widest band.
 
-  Each band draws on a contiguous range of minor-absorber intervals. The scan
-  that accumulates their optical depth must have a compile-time length (a
-  data-dependent `while_loop` is not reverse-mode differentiable), but that
-  length only has to cover the *widest* band, not the whole table: the scan
-  walks the offset within a band, not the absolute interval index.
+  Each band draws on a contiguous range of minor-absorber intervals. How many
+  intervals are evaluated must be a compile-time constant (a data-dependent
+  `while_loop` is not reverse-mode differentiable), but that count only has to
+  cover the *widest* band, not the whole table: the evaluation walks the offset
+  within a band, not the absolute interval index.
 
   This distinction is worth a lot. For the shipped tables the widest band spans
-  5-11 intervals against table dimensions of 24-60, so scanning the full table
+  5-11 intervals against table dimensions of 24-60, so covering the full table
   would evaluate roughly 12-16x more interpolations than any band actually
   uses, all of them masked away afterwards. That was the dominant cost in the
   runtime regression of issue #22.
@@ -299,7 +309,7 @@ def minor_scan_length(
     minor_absorber_intervals: Size of the table's minor-interval dimension.
 
   Returns:
-    The scan length, as a Python int so it stays a compile-time constant.
+    The interval count, as a Python int so it stays a compile-time constant.
   """
   # These are loaded lookup constants, never traced values, so converting to
   # numpy here is safe under `jit` and keeps the result static.
@@ -312,175 +322,68 @@ def minor_scan_length(
   return int(np.clip(widths.max(), 0, minor_absorber_intervals))
 
 
-def _compute_minor_optical_depth(
-    lookup: AbstractLookupGasOptics,
-    vmr_lib: LookupVolumeMixingRatio,
-    molecules: Array,
-    temperature: Array,
-    p: Array,
-    igpt: Array,
-    is_lower_atmosphere: bool,
-    vmr_fields: dict[int, Array] | None = None,
-) -> Array:
-  """Compute the optical depth from minor gases given atmosphere region.
+class _MinorAbsorberTables(NamedTuple):
+  """The lower- and upper-atmosphere minor-absorber tables as a single list.
 
-  Args:
-    lookup: An `AbstractLookupGasOptics` object containing a RRTMGP index for
-      all relevant gases and a lookup table for minor absorption coefficients.
-    vmr_lib: A `LookupVolumeMixingRatio` object containing the volume mixing
-      ratio of all relevant atmospheric gases.
-    molecules: The number of molecules in an atmospheric grid cell per area
-      [molecules/m^2]
-    temperature: The temperature of the flow field [K].
-    p: The pressure field (in Pa).
-    igpt: The absorption rank (g-point) index for which the optical depth will
-      be computed.
-    is_lower_atmosphere: A boolean indicating whether in the lower atmosphere.
-    vmr_fields: An optional dictionary containing precomputed volume mixing
-      ratio fields, keyed by gas index, that will overwrite the global means for
-      those gases that have a vmr field already available.
-
-  Returns:
-    An `Array` with the pointwise optical depth contributions from the minor
-    species.
+  RRTMGP splits every minor-absorber quantity in two, one table for the
+  atmosphere below the reference troposphere pressure and one for above, and a
+  cell uses exactly one of them. The two are structurally identical -- same
+  reference temperature and mixing-fraction axes, same per-interval metadata --
+  so concatenating them along the interval axis (and shifting the upper
+  contributor offsets past the end of the lower coefficient table) gives one
+  list that a single pass can walk, with a per-cell mask deciding which half of
+  it applies. See `compute_minor_optical_depth` for why that is worth doing.
   """
-  # The troposphere index is 1 for levels above the troposphere limit and 0
-  # otherwise.
-  tropo_idx = jnp.where(p <= lookup.p_ref_tropo, 1, 0)
-  if is_lower_atmosphere:
-    minor_absorber_intervals = lookup.n_minor_absrb_lower
-    minor_bnd_start = lookup.minor_lower_bnd_start
-    minor_bnd_end = lookup.minor_lower_bnd_end
-    idx_gases_minor = lookup.idx_minor_gases_lower
-    minor_scales_with_density = lookup.minor_lower_scales_with_density
-    idx_scaling_gas = lookup.idx_scaling_gases_lower
-    scale_by_complement = lookup.lower_scale_by_complement
-    minor_gpt_shift = lookup.minor_lower_gpt_shift
-    kminor = lookup.kminor_lower
-  else:
-    minor_absorber_intervals = lookup.n_minor_absrb_upper
-    minor_bnd_start = lookup.minor_upper_bnd_start
-    minor_bnd_end = lookup.minor_upper_bnd_end
-    idx_gases_minor = lookup.idx_minor_gases_upper
-    minor_scales_with_density = lookup.minor_upper_scales_with_density
-    idx_scaling_gas = lookup.idx_scaling_gases_upper
-    scale_by_complement = lookup.upper_scale_by_complement
-    minor_gpt_shift = lookup.minor_upper_gpt_shift
-    kminor = lookup.kminor_upper
 
-  ibnd = lookup.g_point_to_bnd[igpt]
-  loc_in_bnd = igpt - lookup.bnd_lims_gpt[ibnd, 0]
-  temperature_interpolant = optics_utils.create_linear_interpolant(
-      temperature, lookup.t_ref
+  # Minor absorption coefficients `(n_t_ref, n_eta, n_contrib_lower +
+  # n_contrib_upper)`.
+  kminor: Array
+  # Per-interval metadata, each `(n_minor_absrb_lower + n_minor_absrb_upper)`.
+  idx_gases: Array
+  scales_with_density: Array
+  idx_scaling_gas: Array
+  scale_by_complement: Array
+  # Offset into `kminor`, already shifted for the upper-atmosphere half.
+  gpt_shift: Array
+  # Where the upper-atmosphere half starts in the interval axis, and the total
+  # interval count. Python ints: they bound indices at trace time.
+  n_lower: int
+  n_total: int
+
+
+def _merge_minor_absorber_tables(
+    lookup: AbstractLookupGasOptics,
+) -> _MinorAbsorberTables:
+  """Concatenate a lookup's lower- and upper-atmosphere minor tables."""
+
+  def cat(lower: Array, upper: Array) -> Array:
+    return jnp.concatenate([lower, upper], axis=-1)
+
+  # The upper half's contributor offsets address `kminor_upper`, which now sits
+  # after `kminor_lower` in the concatenated coefficient table.
+  n_contrib_lower = lookup.kminor_lower.shape[-1]
+  return _MinorAbsorberTables(
+      kminor=cat(lookup.kminor_lower, lookup.kminor_upper),
+      idx_gases=cat(
+          lookup.idx_minor_gases_lower, lookup.idx_minor_gases_upper
+      ),
+      scales_with_density=cat(
+          lookup.minor_lower_scales_with_density,
+          lookup.minor_upper_scales_with_density,
+      ),
+      idx_scaling_gas=cat(
+          lookup.idx_scaling_gases_lower, lookup.idx_scaling_gases_upper
+      ),
+      scale_by_complement=cat(
+          lookup.lower_scale_by_complement, lookup.upper_scale_by_complement
+      ),
+      gpt_shift=cat(
+          lookup.minor_lower_gpt_shift,
+          lookup.minor_upper_gpt_shift + n_contrib_lower,
+      ),
+      n_lower=lookup.n_minor_absrb_lower,
+      n_total=lookup.n_minor_absrb_lower + lookup.n_minor_absrb_upper,
   )
-
-  if vmr_fields is not None and lookup.idx_h2o in vmr_fields:
-    dry_factor = 1.0 / (1.0 + vmr_fields[lookup.idx_h2o])
-  else:
-    dry_factor = 1.0
-
-  def mix_interpolant_fn(t: IndexAndWeight) -> Interpolant:
-    """Relative abundance interpolant that depends on `t`."""
-    return _compute_relative_abundance_interpolant(
-        lookup, vmr_lib, tropo_idx, t.idx, ibnd, False, vmr_fields
-    )
-
-  def scale_with_gas_fn(i):
-    sgas = jnp.maximum(idx_scaling_gas[i], 0)
-    sgas_idx = sgas * jnp.ones_like(tropo_idx)
-    scaling_vmr = get_vmr(lookup, vmr_lib, sgas_idx, vmr_fields)
-    scaling = jax.lax.cond(
-        scale_by_complement[i] == 1,
-        lambda: (1.0 - scaling_vmr * dry_factor),
-        lambda: scaling_vmr * dry_factor,
-    )
-    return lambda: scaling
-
-  def scale_with_density_fn(i):
-    scaling = _PASCAL_TO_HPASCAL_FACTOR * p / temperature
-    scaling *= jax.lax.cond(
-        idx_scaling_gas[i] > 0,
-        scale_with_gas_fn(i),
-        lambda: jnp.ones_like(temperature),
-    )
-    return lambda: scaling
-
-  # Optical depth is aggregated over all the minor absorbers contributing to
-  # the frequency band. The contributing intervals form the contiguous range
-  # ``[minor_start_idx, minor_bnd_end[ibnd]]`` within the static
-  # ``minor_absorber_intervals`` table dimension.
-  #
-  # A `lax.while_loop` (or `fori_loop`) with data-dependent start/stop bounds
-  # cannot be reverse-mode differentiated (JAX raises outright), so the loop is
-  # expressed as a fixed-length `lax.scan` with each iteration masked to the
-  # band. The length has to be a compile-time constant, but it does NOT have to
-  # be the whole table: only the *widest* band's range needs to fit. Scanning
-  # all `minor_absorber_intervals` instead would evaluate an interpolation per
-  # interval per g-point for intervals that are then masked away -- roughly
-  # 12-16x more work than the original band-restricted loop, which dominated
-  # the runtime regression in issue #22.
-  #
-  # So the scan runs over the offset `j` within the band, `i = start + j`, for a
-  # static length equal to the widest band range in the table. Iterations past
-  # this band's end are masked out and add exactly 0.0, so the sum is identical
-  # to the band-restricted loop while staying differentiable in both modes.
-  minor_start_idx = minor_bnd_start[ibnd]
-  minor_end_idx = minor_bnd_end[ibnd]
-  # ``minor_start_idx < 0`` flags a band with no minor absorbers; the mask below
-  # is then never satisfied, so no interval contributes (matching the original
-  # loop, which set the start index past the end and never executed the body).
-  has_minor = minor_start_idx >= 0
-
-  max_band_width = minor_scan_length(
-      minor_bnd_start, minor_bnd_end, minor_absorber_intervals
-  )
-
-  if max_band_width == 0:
-    # No band in this table has any minor absorber.
-    return jnp.zeros_like(temperature)
-
-  def scan_fn(tau_minor: Array, j: Array) -> tuple[Array, None]:
-    # Absolute interval index for offset ``j`` within this band's range.
-    i_unclamped = minor_start_idx + j
-    # Whether interval ``i`` belongs to this band's contiguous minor range.
-    in_band = jnp.logical_and(
-        jnp.logical_and(i_unclamped <= minor_end_idx, has_minor),
-        i_unclamped < minor_absorber_intervals,
-    )
-    # The index is only read when `in_band`; clamp it so the out-of-range
-    # iterations of a narrower-than-maximum band stay inside the table.
-    i = jnp.clip(i_unclamped, 0, minor_absorber_intervals - 1)
-    # Map the minor contributor to the RRTMGP gas index.
-    gas_idx = idx_gases_minor[i] * jnp.ones_like(tropo_idx)
-    vmr_minor = get_vmr(lookup, vmr_lib, gas_idx, vmr_fields)
-    scaling = vmr_minor * molecules / _M2_TO_CM2_FACTOR
-    scaling *= jax.lax.cond(
-        minor_scales_with_density[i] == 1,
-        scale_with_density_fn(i),
-        lambda: jnp.ones_like(temperature),
-    )
-    # Obtain the global contributor index needed to index into the `kminor`
-    # table.
-    k_loc = minor_gpt_shift[i] + loc_in_bnd
-    contribution = (
-        optics_utils.interpolate(
-            kminor[..., k_loc],
-            collections.OrderedDict((
-                ('t', lambda: temperature_interpolant),
-                ('m', mix_interpolant_fn),
-            )),
-        )
-        * scaling
-    )
-    tau_minor = tau_minor + jnp.where(in_band, contribution, 0.0)
-    return tau_minor, None
-
-  tau_minor_0 = jnp.zeros_like(temperature)
-  # ``max_band_width`` is a Python int, so the scan length is static and
-  # reverse-mode differentiable.
-  offsets = jnp.arange(max_band_width, dtype=minor_start_idx.dtype)
-  tau_minor, _ = jax.lax.scan(scan_fn, tau_minor_0, offsets)
-  return tau_minor
 
 
 def compute_minor_optical_depth(
@@ -493,6 +396,41 @@ def compute_minor_optical_depth(
     vmr_fields: dict[int, Array] | None = None,
 ) -> Array:
   """Compute the optical depth contributions from minor gases.
+
+  Every minor absorber that contributes to the g-point's band is evaluated in
+  a single batched pass, structured around two observations about the cost of
+  this function. It is the hottest piece of the radiative transfer solve on an
+  accelerator, where the workload is launch-bound rather than flop-bound (the
+  GPU is busy only 64-74% of the wall time and the average kernel is already
+  small), and a bisect of the 0.3.0 throughput regression attributed 73% of the
+  kernel launches it added to exactly this code. Two earlier attempts to
+  recover that regression by cutting *arithmetic* out of the two-stream kernels
+  recovered nothing at all, which is the evidence that launches, not flops, are
+  what this costs.
+
+  The two observations:
+
+  * **The absorbers are a batch, not a sequence.** Each contributes an
+    independent term to a sum, so the per-interval quantities carry the
+    interval as a leading axis, the coefficient lookup gathers every interval
+    in one go, and one reduction sums the axis away. The number of intervals
+    must still be a compile-time constant -- a `while_loop` with a
+    data-dependent trip count is not reverse-mode differentiable, and this code
+    path exists to be differentiated -- but a static batch width is as
+    differentiable as a static loop length while costing the launches of a
+    single interval instead of one set per interval. Only the *widest* band's
+    range needs to fit: covering the whole table would evaluate 12-16x more
+    interpolations than any band uses, all masked away, which was the issue #22
+    regression.
+
+  * **Lower and upper atmosphere are one pass, not two.** Which of RRTMGP's two
+    minor-absorber tables a cell uses depends only on its pressure, not on the
+    g-point, so evaluating both and selecting afterwards doubled the work for
+    every cell. The tables are concatenated (`_merge_minor_absorber_tables`)
+    into one interval list whose slots carry which half they came from, and the
+    per-cell mask keeps only the slots on that cell's side of the reference
+    troposphere pressure. Same total number of slots as the two passes had
+    between them, half the number of passes.
 
   Args:
     lookup: An instance of `AbstractLookupGasOptics` containing a RRTMGP index
@@ -514,27 +452,156 @@ def compute_minor_optical_depth(
     An `Array` with the pointwise optical depth contributions from the minor
     species.
   """
+  # How many intervals the widest band of each half spans. Both are Python
+  # ints, so the batch width below is a compile-time constant.
+  width_lower = minor_interval_count(
+      lookup.minor_lower_bnd_start,
+      lookup.minor_lower_bnd_end,
+      lookup.n_minor_absrb_lower,
+  )
+  width_upper = minor_interval_count(
+      lookup.minor_upper_bnd_start,
+      lookup.minor_upper_bnd_end,
+      lookup.n_minor_absrb_upper,
+  )
+  n_slots = width_lower + width_upper
+  if n_slots == 0:
+    # No band in either table has any minor absorber.
+    return jnp.zeros_like(temperature)
 
-  # The troposphere index is 1 for levels above the troposphere limit and 0
+  tables = _merge_minor_absorber_tables(lookup)
+
+  # Which side of the reference troposphere pressure each cell is on. The
+  # troposphere index is 1 for levels above the troposphere limit and 0
   # otherwise.
-  def minor_tau(is_lower_atmos: bool) -> Array:
-    """Compute the minor optical depth assuming an atmosphere level."""
-    return _compute_minor_optical_depth(
-        lookup,
-        vmr_lib,
-        molecules,
-        temperature,
-        p,
-        igpt,
-        is_lower_atmos,
-        vmr_fields,
+  is_lower_atmos = p > lookup.p_ref_tropo
+  tropo_idx = jnp.where(is_lower_atmos, 0, 1)
+
+  ibnd = lookup.g_point_to_bnd[igpt]
+  loc_in_bnd = igpt - lookup.bnd_lims_gpt[ibnd, 0]
+  temperature_interpolant = optics_utils.create_linear_interpolant(
+      temperature, lookup.t_ref
+  )
+
+  if vmr_fields is not None and lookup.idx_h2o in vmr_fields:
+    dry_factor = 1.0 / (1.0 + vmr_fields[lookup.idx_h2o])
+  else:
+    dry_factor = 1.0
+
+  def mix_interpolant_fn(t: IndexAndWeight) -> Interpolant:
+    """Relative abundance interpolant that depends on `t`."""
+    return _compute_relative_abundance_interpolant(
+        lookup, vmr_lib, tropo_idx, t.idx, ibnd, False, vmr_fields
     )
 
-  return jnp.where(
-      p > lookup.p_ref_tropo,
-      minor_tau(is_lower_atmos=True),
-      minor_tau(is_lower_atmos=False),
+  def per_slot(values: Array) -> Array:
+    """Shape a per-slot vector to broadcast against the field's axes.
+
+    Keeping per-slot quantities at `(n_slots, 1, ..., 1)` rather than
+    broadcasting them to the field's shape is deliberate: only the quantities
+    that genuinely vary over both slot *and* cell -- the gathered absorption
+    coefficients and the scaling that multiplies them -- are ever materialised
+    at `(n_slots, *field)`.
+    """
+    return values.reshape(values.shape + (1,) * temperature.ndim)
+
+  # The slot layout is static: slots `[0, width_lower)` walk the lower
+  # atmosphere's band range and the rest walk the upper's, so each slot's
+  # interval index depends only on the band, never on the cell. That is what
+  # keeps the metadata lookups below per-slot vectors rather than per-cell
+  # fields.
+  slot = np.arange(n_slots)
+  slot_is_lower = slot < width_lower
+  index_dtype = lookup.minor_lower_bnd_start.dtype
+  offset_in_side = jnp.asarray(
+      np.where(slot_is_lower, slot, slot - width_lower), dtype=index_dtype
   )
+
+  # Each half's contributing intervals form the contiguous range
+  # ``[bnd_start[ibnd], bnd_end[ibnd]]``; a negative start flags a band with no
+  # minor absorbers in that half, so no slot contributes.
+  lower_start = lookup.minor_lower_bnd_start[ibnd]
+  upper_start = lookup.minor_upper_bnd_start[ibnd]
+  slot_start = jnp.where(
+      slot_is_lower, lower_start, upper_start + tables.n_lower
+  )
+  slot_end = jnp.where(
+      slot_is_lower,
+      lookup.minor_lower_bnd_end[ibnd],
+      lookup.minor_upper_bnd_end[ibnd] + tables.n_lower,
+  )
+  slot_has_minor = jnp.where(
+      slot_is_lower, lower_start >= 0, upper_start >= 0
+  )
+  # A slot may only address intervals within its own half of the merged list.
+  slot_limit = jnp.where(slot_is_lower, tables.n_lower, tables.n_total)
+
+  i_unclamped = slot_start + offset_in_side
+  in_range = jnp.logical_and(
+      jnp.logical_and(i_unclamped <= slot_end, slot_has_minor),
+      i_unclamped < slot_limit,
+  )
+  # The index is only read where `in_range`; clamp it so the surplus slots of a
+  # narrower-than-widest band stay inside the table.
+  i = jnp.clip(i_unclamped, 0, tables.n_total - 1)
+  # A slot contributes to a cell only if it came from the half of the tables
+  # that cell's pressure selects.
+  contributes = jnp.logical_and(
+      per_slot(in_range), per_slot(jnp.asarray(slot_is_lower)) == is_lower_atmos
+  )
+
+  # Map each minor contributor to the RRTMGP gas index.
+  vmr_minor = get_vmr(
+      lookup, vmr_lib, per_slot(tables.idx_gases[i]), vmr_fields
+  )
+  scaling = vmr_minor * molecules / _M2_TO_CM2_FACTOR
+
+  # Density scaling, and the scaling gas it may in turn be scaled by. The
+  # sequential form selected these with `lax.cond` on a scalar per-interval
+  # flag; batched over slots the flags are a vector, so the selection is a
+  # `where` over both arms. Neither arm can produce a non-finite value (no
+  # division by a possibly-zero quantity, no fractional power), so evaluating
+  # both is safe for reverse-mode differentiation as well as for the value.
+  scaling_vmr = get_vmr(
+      lookup,
+      vmr_lib,
+      per_slot(jnp.maximum(tables.idx_scaling_gas[i], 0)),
+      vmr_fields,
+  )
+  gas_scaling = jnp.where(
+      per_slot(tables.scale_by_complement[i] == 1),
+      1.0 - scaling_vmr * dry_factor,
+      scaling_vmr * dry_factor,
+  )
+  gas_scaling = jnp.where(
+      per_slot(tables.idx_scaling_gas[i] > 0), gas_scaling, 1.0
+  )
+  density_scaling = _PASCAL_TO_HPASCAL_FACTOR * p / temperature * gas_scaling
+  scaling = scaling * jnp.where(
+      per_slot(tables.scales_with_density[i] == 1), density_scaling, 1.0
+  )
+
+  # Global contributor indices into the merged `kminor` table, one per slot.
+  # The table is sliced down to just those contributors -- `(n_t, n_eta,
+  # n_slots)` -- so the slot becomes an ordinary, exactly-indexed table axis
+  # that the temperature/mixing-fraction interpolation gathers alongside the
+  # axes it interpolates. Indexing the slot axis rather than broadcasting the
+  # table across the field is what keeps this cheap in memory.
+  k_loc = tables.gpt_shift[i] + loc_in_bnd
+  coeffs = tables.kminor[..., k_loc]
+  slot_idx = per_slot(jnp.arange(n_slots))
+  contribution = (
+      optics_utils.interpolate(
+          coeffs,
+          collections.OrderedDict((
+              ('t', lambda: temperature_interpolant),
+              ('m', mix_interpolant_fn),
+              ('i', lambda: optics_utils.exact_index(slot_idx, coeffs.dtype)),
+          )),
+      )
+      * scaling
+  )
+  return jnp.sum(jnp.where(contributes, contribution, 0.0), axis=0)
 
 
 def compute_rayleigh_optical_depth(

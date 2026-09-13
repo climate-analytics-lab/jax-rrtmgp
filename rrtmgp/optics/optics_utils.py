@@ -79,6 +79,29 @@ class Interpolant:
   interp_high: IndexAndWeight
 
 
+def exact_index(idx: Array, dtype) -> IndexAndWeight:
+  """An axis of a lookup table that is indexed exactly, not interpolated.
+
+  `interpolate` accepts one of these in place of an `Interpolant` for any axis
+  where a single entry is selected rather than a value interpolated between
+  two. It contributes a unit weight and no extra interpolation branches, so
+  the axis costs nothing beyond carrying its index into the same lookup as the
+  interpolated axes.
+
+  This is what lets a table be indexed on a "which entry" axis whose index is
+  itself an array -- one lookup over the whole batch instead of slicing the
+  table once per entry.
+
+  Args:
+    idx: Index array for the axis. Broadcast against the other axes' indices.
+    dtype: Floating dtype of the table, so the unit weight does not promote.
+
+  Returns:
+    An `IndexAndWeight` selecting `idx` with weight one.
+  """
+  return IndexAndWeight(idx, jnp.ones((), dtype=dtype))
+
+
 def _einsum_expression_from_lookup_table(table: Array):
   """Return an einsum expression for performing matmul on a lookup table."""
   rank = table.ndim
@@ -297,6 +320,11 @@ def interpolate_orig(
           if k in dependency_args[varname]
       }
       interpolant = interpolant_fn(**interpolant_fn_kwargs)
+      if isinstance(interpolant, IndexAndWeight):
+        # An exactly-indexed axis (see `exact_index`): one endpoint, so it
+        # joins every lookup rather than doubling the number of them.
+        idx_weight_dict[varname] = interpolant
+        continue
       idx_weight_dict_low = idx_weight_dict.copy()
       idx_weight_dict_low[varname] = interpolant.interp_low
       weighted_indices.append(idx_weight_dict_low)
@@ -420,7 +448,9 @@ def interpolate(
       of `coeffs` and their order should match the order of the axes. Note that
       they should be sorted in topological order (dependent indices appearing
       after the indices they depend on). The axes of `coeffs` are assumed to
-      already conform to this ordering.
+      already conform to this ordering. A function may return an
+      `IndexAndWeight` (see `exact_index`) instead of an `Interpolant` for an
+      axis that is indexed exactly rather than interpolated.
 
   Returns:
     An `Array` of the same shape as any of the index arrays, but with the
