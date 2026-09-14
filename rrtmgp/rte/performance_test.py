@@ -229,18 +229,21 @@ _MAX_KERNEL_TRANSCENDENTALS = {'sw': 10_900_000, 'lw': 3_300_000}
 #
 # **Backend dependence, and how far this is trusted.** Kernel count is a
 # property of the compiled executable, so it is backend-specific: CPU and GPU
-# do not fuse identically, and the absolute CPU numbers here are ~1.5x the GPU
-# ones. The budgets are therefore keyed by platform and a platform with no
+# do not fuse identically, and the absolute CPU numbers here run 1.3-1.5x the
+# GPU ones. The budgets are therefore keyed by platform and a platform with no
 # entry skips rather than asserting something it has not been calibrated for.
 #
-# What was checked before trusting the CPU numbers as a guard is that they
-# reproduce the *ratio* that the GPU traces measured. Counting the solve this
-# way on CPU at 0.2.1 and at 0.3.0-era main gives 134,640 -> 201,824 launches,
-# a factor of 1.499, against the 1.484 measured on GPU with a profiler. The
-# split also matches: the CPU count attributes 78,144 of main's launches to the
-# minor-gas scan where the GPU trace attributes 78,594. So the CPU metric is
-# not the GPU's number, but it tracks the GPU's *change* to about 1%, which is
-# what a regression guard needs.
+# This metric is a regression *detector*, not a throughput predictor, and the
+# distinction is load-bearing. Counting the solve this way on CPU gives 116,228
+# at 0.2.1 and 201,886 at 0.3.0-era main -- a factor of 1.737, where the GPU
+# profiler measured 1.480, so the CPU count overstates even the *ratio* by
+# ~17%. Nor is a launch count proportional to wall time once a change alters
+# how much work there is: the batched minor-gas form below cuts flops and bytes
+# ~50% alongside launches, and measured 11.99 s/sim-day on an A100 where a
+# launch-proportional fit predicted 15.83. What the count does do reliably is
+# move, sharply and in the right direction, when kernel *structure* regresses
+# -- including for `use_scan`, whose sign XLA's flop cost model gets backwards
+# -- which is precisely what the flops and transcendental budgets above missed.
 #
 # The ceilings carry ~20% headroom -- looser than the arithmetic budgets,
 # because fusion decisions do shift a few percent across XLA releases, and
@@ -253,7 +256,7 @@ _MAX_KERNEL_TRANSCENDENTALS = {'sw': 10_900_000, 'lw': 3_300_000}
 #
 # Where the numbers have been. The 0.3.0 regression these budgets were first
 # written against measured LW 117,036 / SW 82,674 (199,710 for the pair)
-# against 0.2.1's 134,640, and 73% of what 0.3.0 added was one structural
+# against 0.2.1's 116,228, and ~80% of what 0.3.0 added was one structural
 # change: the minor-gas absorber loop, a `while_loop` that ran each band's own
 # handful of intervals, became a fixed-length `scan` because a data-dependent
 # trip count is not reverse-mode differentiable. Evaluating those intervals as
@@ -752,20 +755,18 @@ class PerformanceTest(unittest.TestCase):
     def test_gpt_chunk_shortens_the_spectral_loop(self):
         """`gpt_chunk=G` must run G times fewer iterations for the same work.
 
-        This is the only property of the chunking that is worth asserting
-        deterministically. The *point* of it is a G-fold cut in GPU kernel
-        launches, and neither `cost_analysis()` nor this module can see launches
-        at all -- but launches are `body kernels x iterations`, the body is
-        unchanged by construction, so the trip count is the half of the product
-        that is measurable here. (The other half was checked by reading fusion
-        counts out of the compiled body: 243 -> 249 for LW and 253 -> 260 for SW
-        going from G=1 to G=16, i.e. flat.)
+        Chunking exists to cut GPU kernel launches, so the third assertion below
+        measures launches directly with `_count_launches` rather than arguing
+        from a proxy. The trip-count assertions are kept because they localise a
+        failure: launches are `body kernels x iterations`, so if the total stops
+        falling, the trip count says whether the loop failed to shorten or the
+        body grew to compensate.
 
-        The second assertion is the one that would catch chunking going wrong in
-        the expensive direction: the total *element-operations issued*, which
-        `jaxpr_cost` weights by array size and trip count, must stay flat. Fewer
-        iterations over proportionally bigger arrays is a restructuring; fewer
-        iterations at the same total cost as before would mean the chunk is
+        The `jaxpr_cost` assertion is the one that would catch chunking going
+        wrong in the expensive direction: the total *element-operations issued*,
+        which `jaxpr_cost` weights by array size and trip count, must stay flat.
+        Fewer iterations over proportionally bigger arrays is a restructuring;
+        fewer iterations at the same total cost as before would mean the chunk is
         recomputing something per g-point that used to be shared.
         """
         (optics_lib, atmos_state, p, t, molecules, vmr_fields,
@@ -815,6 +816,30 @@ class PerformanceTest(unittest.TestCase):
                          f'unchunked. Chunking is meant to regroup the same '
                          f'work, not add to it.'),
                 )
+
+        # The thing chunking is actually for, measured rather than inferred.
+        # Compiling is the expensive part of this file, so one band at one
+        # setting is enough: the ratio is a property of the loop structure,
+        # which both bands share. The floor is deliberately far below the ~7.7x
+        # observed at G=8 -- this guards against chunking silently ceasing to
+        # cut launches, not against it drifting a few percent.
+        def launches_at(gpt_chunk):
+            compiled = jax.jit(
+                lambda temp: two_stream.solve_lw(
+                    p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+                    sfc_temperature, gpt_chunk=gpt_chunk,
+                )['flux_net']
+            ).lower(t).compile()
+            return _count_launches(compiled.as_text())
+
+        unchunked, chunked = launches_at(1), launches_at(8)
+        self.assertLess(
+            chunked, unchunked / 4,
+            msg=(f'gpt_chunk=8 issues {chunked:,} kernel launches against '
+                 f'{unchunked:,} unchunked, under the 4x cut this is for. The '
+                 f'trip-count assertions above say whether the loop failed to '
+                 f'shorten or the body grew to absorb the saving.'),
+        )
 
     def test_longwave_cell_kernel_within_budget(self):
         self._assert_kernel_within_budget('lw')
