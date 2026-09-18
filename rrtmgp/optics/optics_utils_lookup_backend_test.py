@@ -105,5 +105,33 @@ class LookupBackendEquivalenceTest(unittest.TestCase):
                                atol=1e-4)
 
 
+  def _fns_exact_index(self):
+    """An interpolated axis plus one that is indexed exactly."""
+    ti = optics_utils.create_linear_interpolant(self.t, self.t_ref)
+    pi = optics_utils.create_linear_interpolant(self.p, self.p_ref)
+    entry = jnp.arange(self.m_ref.size).reshape((-1, 1, 1))
+    return collections.OrderedDict((
+        ('t', lambda: ti),
+        ('p', lambda: pi),
+        ('m', lambda: optics_utils.exact_index(entry, self.table3.dtype)),
+    ))
+
+  def test_interpolate_exact_index_agree(self):
+    fns = self._fns_exact_index()
+    mm, ga = _both(lambda: optics_utils.interpolate(self.table3, fns))
+    np.testing.assert_allclose(np.asarray(mm), np.asarray(ga), rtol=1e-5,
+                               atol=1e-5)
+
+  def test_grad_exact_index_agree(self):
+    fns = self._fns_exact_index()
+
+    def loss(table):
+      return jnp.sum(optics_utils.interpolate(table, fns) ** 2)
+
+    g_mm, g_ga = _both(lambda: jax.grad(loss)(self.table3))
+    np.testing.assert_allclose(np.asarray(g_mm), np.asarray(g_ga), rtol=1e-4,
+                               atol=1e-4)
+
+
 if __name__ == "__main__":
   unittest.main()

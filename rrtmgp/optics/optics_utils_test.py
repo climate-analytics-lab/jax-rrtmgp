@@ -313,5 +313,53 @@ class OpticsUtilsTest(unittest.TestCase):
                   ("optimized" if use_optimized_interpolation else "orig")
       )
 
+  @parameterized.expand([(True,), (False,)])
+  def test_exact_index_axis_matches_slicing_that_axis(
+      self, use_optimized_interpolation
+  ):
+    """An exactly-indexed axis selects, rather than interpolating, an entry.
+
+    This is what lets a caller evaluate a whole batch of table entries in one
+    lookup instead of slicing the table once per entry, so the property that
+    matters is that the batched result equals the per-entry one.
+    """
+    key = jax.random.split(jax.random.PRNGKey(7), 3)
+    n_t, n_m, n_entry = 6, 5, 4
+    t_ref = jnp.linspace(180.0, 320.0, n_t)
+    m_ref = jnp.linspace(0.0, 1.0, n_m)
+    table = jax.random.normal(key[0], (n_t, n_m, n_entry))
+    field = (3, 2)
+    t = jax.random.uniform(key[1], field, minval=185.0, maxval=315.0)
+    m = jax.random.uniform(key[2], field, minval=0.05, maxval=0.95)
+
+    interpolate_fn = (
+        optics_utils.interpolate_optimized
+        if use_optimized_interpolation else optics_utils.interpolate_orig
+    )
+    t_interp = optics_utils.create_linear_interpolant(t, t_ref)
+    m_interp = optics_utils.create_linear_interpolant(m, m_ref)
+
+    # One lookup over every entry: the entry index carries a leading batch
+    # axis that broadcasts against the field's axes.
+    entry = jnp.arange(n_entry).reshape((n_entry, 1, 1))
+    batched = interpolate_fn(
+        table,
+        OrderedDict((
+            ('t', lambda: t_interp),
+            ('m', lambda: m_interp),
+            ('e', lambda: optics_utils.exact_index(entry, table.dtype)),
+        )),
+    )
+    self.assertEqual(batched.shape, (n_entry,) + field)
+
+    # The same thing one entry at a time, with the entry axis sliced away.
+    for i in range(n_entry):
+      one = interpolate_fn(
+          table[..., i],
+          OrderedDict((('t', lambda: t_interp), ('m', lambda: m_interp))),
+      )
+      np.testing.assert_allclose(batched[i], one, rtol=1e-6, atol=1e-6)
+
+
 if __name__ == '__main__':
   unittest.main()
