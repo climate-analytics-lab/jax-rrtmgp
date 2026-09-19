@@ -14,7 +14,7 @@
 
 """A library for solving the two-stream radiative transfer equation."""
 
-from typing import TypeAlias, cast
+from typing import Callable, TypeAlias, cast
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +32,127 @@ AbstractLookupGasOptics: TypeAlias = (
     lookup_gas_optics_base.AbstractLookupGasOptics
 )
 AtmosphericState: TypeAlias = atmospheric_state.AtmosphericState
+
+# Number of g-points solved per iteration of the spectral loop (see
+# `_solve_over_gpoints`). One is the historical behaviour and is bit-for-bit
+# identical to it; a larger value trades memory for kernel launches and is the
+# lever for the launch-bound GPU regression documented there. Left at 1 until a
+# GPU A/B confirms the win -- the recommendation, on the structural evidence, is
+# 8.
+DEFAULT_GPT_CHUNK = 1
+
+
+def _gpt_chunk_plan(n_gpt: int, gpt_chunk: int) -> tuple[int, int, bool]:
+  """Resolve a requested g-point chunk size against a spectrum of `n_gpt`.
+
+  Returns the chunk size actually used, the number of loop iterations, and
+  whether the last iteration needs masking because `n_gpt` is not a multiple of
+  the chunk.
+
+  The remainder is handled by *padding* (the tail iteration re-solves already
+  valid g-points and discards them) rather than by a separate remainder
+  iteration: a second, differently-shaped loop body would be a second compiled
+  program, doubling compile time and defeating the point of the exercise, which
+  is to emit *fewer* distinct kernels. The shipped RRTMGP tables have
+  `n_gpt` = 256 / 224, so every chunk size that is a power of two up to 16
+  divides exactly and no masking is emitted at all.
+  """
+  if gpt_chunk < 1:
+    raise ValueError(f'gpt_chunk must be >= 1, got {gpt_chunk}.')
+  chunk = min(int(gpt_chunk), n_gpt)
+  n_chunks = -(-n_gpt // chunk)  # ceil
+  return chunk, n_chunks, n_chunks * chunk != n_gpt
+
+
+def _solve_over_gpoints(
+    one_gpt: Callable[[Array], dict[str, Array]],
+    n_gpt: int,
+    gpt_chunk: int,
+    init_val: dict[str, Array],
+) -> dict[str, Array]:
+  """Accumulate `one_gpt` over the spectrum, `gpt_chunk` g-points at a time.
+
+  Every g-point is an independent radiative transfer problem, so the spectral
+  loop can process any number of them per iteration; only the order in which
+  their fluxes are summed changes.
+
+  **Why this exists.** The solve is *launch bound* on GPU, not flop bound. The
+  0.3.0 two-stream rewrite cost ~30-34% of end-to-end GCM throughput while the
+  average kernel *duration* fell (9.48 -> 8.99 us): the radiation call went from
+  ~9.0k to ~13.3k kernel launches per model step and the device sat idle 26-36%
+  of the wall time. With `use_scan=False` (the default) the vertical recurrence
+  is unrolled over ~47 levels, so one iteration of this loop issues hundreds of
+  kernels over small `(nx, ny)` slices, and there are `n_gpt` ~ 240 iterations.
+  Processing `G` g-points per iteration issues the *same* kernels on arrays that
+  are `G` times larger, `n_gpt / G` times -- roughly a `G`-fold cut in launches
+  for identical arithmetic, which is exactly what an 8.5-of-80-GiB,
+  64-74%-utilised workload has headroom for.
+
+  **Two other levers were tried and failed; do not retry them.**
+
+  * *Rearranging the arithmetic.* Collapsing the rewritten two-stream's
+    two-branch selects and deduplicating its transcendentals (the parent commit
+    of this one) measured 20.45 vs 20.68 s/sim-day -- no recovery. Cutting the
+    number of `select`s did not cut the number of fusion roots.
+  * *`use_scan=True`.* XLA's cost model predicts a large win; the measurement is
+    44-49% *slower* end to end, because a `scan` serialises the very kernel
+    launches that are the bottleneck.
+
+  The corollary is that XLA's flop/byte cost model is not a throughput proxy on
+  this workload. The only quantity that tracked the regression is the launch
+  count, which is what this function reduces.
+
+  Args:
+    one_gpt: Solves a single g-point, given its (traced, scalar) index, and
+      returns a dict of flux fields.
+    n_gpt: Number of g-points in the spectrum.
+    gpt_chunk: Number of g-points to solve per loop iteration.
+    init_val: Zeroed accumulator with the same structure as `one_gpt`'s result.
+
+  Returns:
+    The spectral sum of `one_gpt` over all `n_gpt` g-points.
+  """
+  chunk, n_chunks, needs_mask = _gpt_chunk_plan(n_gpt, gpt_chunk)
+
+  if chunk == 1:
+    # Identical program to the unchunked solver, not merely equivalent: no
+    # leading axis is introduced and the spectral sum is accumulated in the same
+    # order, so this path is bit-for-bit the historical result.
+    def step_fn(igpt, cumulative):
+      return jax.tree.map(jnp.add, one_gpt(igpt), cumulative)
+
+    return jax.lax.fori_loop(0, n_gpt, step_fn, init_val)
+
+  # `vmap` over the g-point index is what batches the chunk. It is used here in
+  # preference to threading a g-axis through the gas-optics lookups by hand for
+  # two reasons: it is exact by construction (the batched program computes the
+  # same values as the scalar one), and -- critically -- the *inside* of the
+  # optics and cell kernels keeps its original rank, so the positional `[:, :,
+  # k]` slicing and `dim=2` shift operators that are written throughout
+  # `optics.py`, `gas_optics.py` and `monochromatic_two_stream.py` stay correct
+  # with no edits. Only `igpt` is mapped, so every loop-invariant operand --
+  # above all the multi-megabyte `kmajor` / `kminor` tables -- stays a single
+  # shared, *unbatched* operand rather than being broadcast across the chunk.
+  # That is the issue #8 failure mode, and avoiding it is the reason the mapped
+  # axis is the g-point index and nothing else.
+  def step_fn(ichunk, cumulative):
+    igpt = ichunk * chunk + jnp.arange(chunk)
+    if needs_mask:
+      valid = igpt < n_gpt
+      # Clamp rather than let the gather run out of bounds: the surplus
+      # iterations re-solve the last g-point and are zeroed below.
+      igpt = jnp.minimum(igpt, n_gpt - 1)
+    per_gpt = jax.vmap(one_gpt)(igpt)
+
+    def reduce_and_add(chunked: Array, cumulative: Array) -> Array:
+      if needs_mask:
+        mask = valid.reshape((chunk,) + (1,) * (chunked.ndim - 1))
+        chunked = jnp.where(mask, chunked, jnp.zeros_like(chunked))
+      return jnp.sum(chunked, axis=0) + cumulative
+
+    return jax.tree.map(reduce_and_add, per_gpt, cumulative)
+
+  return jax.lax.fori_loop(0, n_chunks, step_fn, init_val)
 
 
 def _compute_local_properties_lw(
@@ -128,6 +249,7 @@ def solve_lw(
     cloud_path_liq_per_gpt: Array | None = None,
     cloud_path_ice_per_gpt: Array | None = None,
     aerosol_optics: dict[str, Array] | None = None,
+    gpt_chunk: int = DEFAULT_GPT_CHUNK,
 ) -> dict[str, Array]:
   """Solves two-stream radiative transfer equation over the longwave spectrum.
 
@@ -173,6 +295,10 @@ def solve_lw(
       properties via the mass-weighted mix in
       `OpticsScheme.combine_optical_properties`. Aerosol values are passed
       through as-is (no delta-scaling). Requires the `RRTMOptics` scheme.
+    gpt_chunk: Number of g-points solved per iteration of the spectral loop.
+      Purely a performance knob -- g-points are independent problems, so the
+      only thing it changes is the order in which their fluxes are summed. See
+      `_solve_over_gpoints` for why it exists and what it trades.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -193,7 +319,7 @@ def solve_lw(
     )
     g_point_to_bnd_lw = optics_lib.gas_optics_lw.g_point_to_bnd
 
-  def step_fn(igpt, cumulative_flux):
+  def one_gpt(igpt):
     cpl = (
         cloud_path_liq_per_gpt[igpt]
         if cloud_path_liq_per_gpt is not None
@@ -248,8 +374,8 @@ def solve_lw(
         sfc_emissivity_lw,
         use_scan,
     )
-    # cumulative_flux keys: 'flux_up', 'flux_down', 'flux_net'
-    return jax.tree.map(jnp.add, fluxes, cumulative_flux)
+    # keys: 'flux_up', 'flux_down', 'flux_net'
+    return fluxes
 
   flux_keys = ['flux_up', 'flux_down', 'flux_net']
   init_val = {key: jnp.zeros_like(temperature) for key in flux_keys}
@@ -263,7 +389,9 @@ def solve_lw(
   # downwelling boundary value with a spurious nonzero flux and degraded the
   # net flux (and hence the top layer's heating rate) at the top of the
   # atmosphere. See `toa_flux_test.py` and issue #19.
-  return jax.lax.fori_loop(0, optics_lib.n_gpt_lw, step_fn, init_val)
+  return _solve_over_gpoints(
+      one_gpt, optics_lib.n_gpt_lw, gpt_chunk, init_val
+  )
 
 
 def solve_sw(
@@ -281,6 +409,7 @@ def solve_sw(
     cloud_path_liq_per_gpt: Array | None = None,
     cloud_path_ice_per_gpt: Array | None = None,
     aerosol_optics: dict[str, Array] | None = None,
+    gpt_chunk: int = DEFAULT_GPT_CHUNK,
 ) -> dict[str, Array]:
   """Solves the two-stream radiative transfer equation for shortwave.
 
@@ -322,6 +451,10 @@ def solve_sw(
       properties via the mass-weighted mix in
       `OpticsScheme.combine_optical_properties`. Aerosol values are passed
       through as-is (no delta-scaling). Requires the `RRTMOptics` scheme.
+    gpt_chunk: Number of g-points solved per iteration of the spectral loop.
+      Purely a performance knob -- g-points are independent problems, so the
+      only thing it changes is the order in which their fluxes are summed. See
+      `_solve_over_gpoints` for why it exists and what it trades.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -360,7 +493,7 @@ def solve_sw(
   # fluxes are masked to zero below, so this placeholder never reaches output.
   safe_zenith = jnp.where(night, jnp.zeros_like(jnp.asarray(zenith)), zenith)
 
-  def step_fn(igpt, partial_fluxes):
+  def one_gpt(igpt):
     cpl = (
         cloud_path_liq_per_gpt[igpt]
         if cloud_path_liq_per_gpt is not None
@@ -426,15 +559,16 @@ def solve_sw(
         flux_down_dir=sources_2stream['flux_down_dir'],
         use_scan=use_scan,
     )
-    total_sw_fluxes = jax.tree.map(jnp.add, sw_fluxes, partial_fluxes)
-    return total_sw_fluxes
+    return sw_fluxes
 
   flux_keys = ['flux_up', 'flux_down', 'flux_net']
   fluxes_0 = {key: jnp.zeros_like(temperature) for key in flux_keys}
 
   # As in `solve_lw`, the top halo face is the top of the atmosphere and the
   # solver already produces the correct value there, so it is left untouched.
-  fluxes = jax.lax.fori_loop(0, optics_lib.n_gpt_sw, step_fn, fluxes_0)
+  fluxes = _solve_over_gpoints(
+      one_gpt, optics_lib.n_gpt_sw, gpt_chunk, fluxes_0
+  )
   # Zero out columns where the sun is at or below the horizon. `night` is a
   # scalar (single column) or, under a column `vmap`, a per-column scalar; it
   # broadcasts over the trailing spatial/vertical axes of each flux field.

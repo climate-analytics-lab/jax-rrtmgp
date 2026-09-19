@@ -752,6 +752,95 @@ class PerformanceTest(unittest.TestCase):
             1,
         )
 
+    def test_gpt_chunk_shortens_the_spectral_loop(self):
+        """`gpt_chunk=G` must run G times fewer iterations for the same work.
+
+        Chunking exists to cut GPU kernel launches, so the third assertion below
+        measures launches directly with `_count_launches` rather than arguing
+        from a proxy. The trip-count assertions are kept because they localise a
+        failure: launches are `body kernels x iterations`, so if the total stops
+        falling, the trip count says whether the loop failed to shorten or the
+        body grew to compensate.
+
+        The `jaxpr_cost` assertion is the one that would catch chunking going
+        wrong in the expensive direction: the total *element-operations issued*,
+        which `jaxpr_cost` weights by array size and trip count, must stay flat.
+        Fewer iterations over proportionally bigger arrays is a restructuring;
+        fewer iterations at the same total cost as before would mean the chunk is
+        recomputing something per g-point that used to be shared.
+        """
+        (optics_lib, atmos_state, p, t, molecules, vmr_fields,
+         sfc_temperature) = _radiation_setup()
+
+        def counts_for(gpt_chunk):
+            return jaxpr_cost.op_counts(
+                lambda temp: two_stream.solve_lw(
+                    p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+                    sfc_temperature, gpt_chunk=gpt_chunk,
+                )['flux_net'],
+                t,
+            )
+
+        n_gpt = optics_lib.n_gpt_lw
+        base = counts_for(1)
+        self.assertIn(
+            n_gpt, base.scan_lengths,
+            msg=(f'no scan of length n_gpt={n_gpt} found; the spectral loop no '
+                 f'longer lowers to a scan and this guard needs updating. '
+                 f'Lengths seen: {sorted(set(base.scan_lengths))}'),
+        )
+
+        for gpt_chunk in (2, 8):
+            with self.subTest(gpt_chunk=gpt_chunk):
+                counts = counts_for(gpt_chunk)
+                expected = n_gpt // gpt_chunk
+                self.assertIn(
+                    expected, counts.scan_lengths,
+                    msg=(f'gpt_chunk={gpt_chunk} did not shorten the spectral '
+                         f'loop to {expected} iterations; lengths seen: '
+                         f'{sorted(set(counts.scan_lengths))}'),
+                )
+                self.assertNotIn(
+                    n_gpt, counts.scan_lengths,
+                    msg=(f'gpt_chunk={gpt_chunk} left a full-length ({n_gpt}) '
+                         f'g-point loop in the program, so the chunk is being '
+                         f'solved on top of the unchunked loop rather than '
+                         f'instead of it.'),
+                )
+                # Same arithmetic, differently shaped. 10% covers the handful of
+                # extra index/mask ops the chunked form adds per iteration.
+                self.assertLessEqual(
+                    counts.total, 1.1 * base.total,
+                    msg=(f'gpt_chunk={gpt_chunk} issues {counts.total:,.0f} '
+                         f'element-operations against {base.total:,.0f} '
+                         f'unchunked. Chunking is meant to regroup the same '
+                         f'work, not add to it.'),
+                )
+
+        # The thing chunking is actually for, measured rather than inferred.
+        # Compiling is the expensive part of this file, so one band at one
+        # setting is enough: the ratio is a property of the loop structure,
+        # which both bands share. The floor is deliberately far below the ~7.7x
+        # observed at G=8 -- this guards against chunking silently ceasing to
+        # cut launches, not against it drifting a few percent.
+        def launches_at(gpt_chunk):
+            compiled = jax.jit(
+                lambda temp: two_stream.solve_lw(
+                    p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+                    sfc_temperature, gpt_chunk=gpt_chunk,
+                )['flux_net']
+            ).lower(t).compile()
+            return _count_launches(compiled.as_text())
+
+        unchunked, chunked = launches_at(1), launches_at(8)
+        self.assertLess(
+            chunked, unchunked / 4,
+            msg=(f'gpt_chunk=8 issues {chunked:,} kernel launches against '
+                 f'{unchunked:,} unchunked, under the 4x cut this is for. The '
+                 f'trip-count assertions above say whether the loop failed to '
+                 f'shorten or the body grew to absorb the saving.'),
+        )
+
     def test_longwave_cell_kernel_within_budget(self):
         self._assert_kernel_within_budget('lw')
 

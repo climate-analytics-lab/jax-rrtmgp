@@ -540,5 +540,279 @@ class AllSkyTest(unittest.TestCase):
         )
 
 
+class GPointChunkingTest(unittest.TestCase):
+  """`gpt_chunk` must change only the cost of the solve, never its answer.
+
+  Solving several g-points per iteration of the spectral loop is a pure
+  restructuring -- g-points are independent radiative transfer problems -- so
+  every chunk size must reproduce the unchunked fluxes to within the reordering
+  of one floating-point sum. The cases below deliberately exercise the three
+  quantities that are indexed *per g-point* rather than per column, because a
+  chunked gather of any of them is where a silent mis-association would live:
+  the gas-optics table slices, the McICA per-g-point cloud sub-column, and the
+  per-band aerosol lookup (whose band index varies *within* a chunk once the
+  chunk is wider than a band's g-point range).
+  """
+
+  def _setup(self, n_horiz=2):
+    """Cloudy single-profile column batch with the compact lookup tables."""
+    site = 0
+    (
+        pressure_allsites,
+        pressure_level_allsites,
+        temperature_allsites,
+        temperature_level_allsites,
+        vmr_profiles_allsites,
+        _,
+    ) = _setup_atmospheric_profiles()
+    # Compact tables (g128 / g112) keep compile time down; they have the same
+    # band/g-point structure as the full ones.
+    radiation_params = _setup_radiation_params(use_compact_lookup=True)
+    atmos_state = atmospheric_state.from_config(
+        radiation_params.atmospheric_state_cfg
+    )
+    optics_lib = optics.optics_factory(radiation_params.optics, atmos_state.vmr)
+
+    convert_to_3d = functools.partial(
+        test_util.convert_to_3d_array_and_tile, dim=2, num_repeats=n_horiz
+    )
+    sfc_temperature = temperature_level_allsites[site, 1] * jnp.ones(
+        (n_horiz, n_horiz), dtype=jnp.float_
+    )
+    vmr_fields = {
+        k: convert_to_3d(v[site, :]) for k, v in vmr_profiles_allsites.items()
+    }
+    p = convert_to_3d(pressure_allsites[site, :])
+    pressure_level = convert_to_3d(pressure_level_allsites[site, :])
+    temperature = convert_to_3d(temperature_allsites[site, :])
+    molecules = _air_molecules_per_area(pressure_level, vmr_fields['h2o'])
+
+    ones = jnp.ones_like(p)
+    in_cloud = jnp.logical_and(p > 10000, p < 90000)
+    cloud = {
+        'cloud_r_eff_liq': jnp.where(
+            jnp.logical_and(in_cloud, temperature > 263), 1.2e-5 * ones, 0.0
+        ),
+        'cloud_path_liq': jnp.where(
+            jnp.logical_and(in_cloud, temperature > 263), 1e-2 * ones, 0.0
+        ),
+        'cloud_r_eff_ice': jnp.where(
+            jnp.logical_and(in_cloud, temperature < 273), 4.75e-5 * ones, 0.0
+        ),
+        'cloud_path_ice': jnp.where(
+            jnp.logical_and(in_cloud, temperature < 273), 1e-2 * ones, 0.0
+        ),
+    }
+    return (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+            sfc_temperature, cloud)
+
+  def _mcica_and_aerosol(self, optics_lib, band, cloud, shape):
+    """McICA sub-columns and a band-dependent aerosol bundle for `band`."""
+    rng = np.random.default_rng(0)
+    n_gpt = optics_lib.n_gpt_lw if band == 'lw' else optics_lib.n_gpt_sw
+    gas_lookup = (
+        optics_lib.gas_optics_lw if band == 'lw' else optics_lib.gas_optics_sw
+    )
+    n_bnd = gas_lookup.n_bnd
+
+    def subcolumns(path):
+      draw = jnp.asarray(rng.random((n_gpt,) + shape) < 0.5, jnp.float_)
+      return draw * path
+
+    # The aerosol optical depth is a different multiple of a base value in every
+    # band, so a chunk that gathered the wrong band -- or broadcast one band's
+    # value across the chunk -- cannot agree with the unchunked solve.
+    scale = jnp.arange(1, n_bnd + 1, dtype=jnp.float_).reshape(
+        (n_bnd,) + (1,) * len(shape)
+    )
+    aerosol = {
+        'optical_depth': scale * jnp.full((n_bnd,) + shape, 2e-2, jnp.float_),
+        'ssa': (scale / n_bnd) * jnp.full((n_bnd,) + shape, 0.8, jnp.float_),
+        'asymmetry_factor': jnp.full((n_bnd,) + shape, 0.6, jnp.float_),
+    }
+    return {
+        'cloud_path_liq_per_gpt': subcolumns(cloud['cloud_path_liq']),
+        'cloud_path_ice_per_gpt': subcolumns(cloud['cloud_path_ice']),
+        'aerosol_optics': aerosol,
+    }
+
+  def _solve(self, band, gpt_chunk, extra=None):
+    (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+     sfc_temperature, cloud) = self._cached
+    kwargs = dict(cloud)
+    if extra is not None:
+      kwargs.update(extra)
+    if band == 'lw':
+      return two_stream.solve_lw(
+          p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+          sfc_temperature, gpt_chunk=gpt_chunk, **kwargs
+      )
+    return two_stream.solve_sw(
+        p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+        gpt_chunk=gpt_chunk, **kwargs
+    )
+
+  # Loading the profiles and solving the unchunked reference are the same work
+  # for every parameterisation below, and an unrolled solve is not cheap to
+  # compile, so both are memoised on the class rather than redone per case.
+  _fixture = None
+  _reference = {}
+
+  def setUp(self):
+    super().setUp()
+    if GPointChunkingTest._fixture is None:
+      GPointChunkingTest._fixture = self._setup()
+    self._cached = GPointChunkingTest._fixture
+
+  def _extra_for(self, band, with_mcica):
+    if not with_mcica:
+      return None
+    return self._mcica_and_aerosol(
+        self._cached[0], band, self._cached[7], self._cached[3].shape
+    )
+
+  def _reference_for(self, band, with_mcica):
+    key = (band, with_mcica)
+    if key not in GPointChunkingTest._reference:
+      GPointChunkingTest._reference[key] = self._solve(
+          band, 1, self._extra_for(band, with_mcica)
+      )
+    return GPointChunkingTest._reference[key]
+
+  @parameterized.expand([
+      (band, chunk, with_mcica)
+      # 3 is deliberately not a divisor of the g-point count (128 / 112): it
+      # exercises the padded tail iteration, whose surplus g-points must be
+      # masked out of the spectral sum rather than double-counted.
+      for band, chunk, with_mcica in product(
+          ('lw', 'sw'), (2, 16, 3), (False, True)
+      )
+  ])
+  def test_gpt_chunk_matches_unchunked(self, band, chunk, with_mcica):
+    ref = self._reference_for(band, with_mcica)
+    got = self._solve(band, chunk, self._extra_for(band, with_mcica))
+    for key in ('flux_up', 'flux_down', 'flux_net'):
+      # The only admissible difference is the reordered spectral sum, which at
+      # float32 over ~128 g-points is a few ulp of the total.
+      np.testing.assert_allclose(
+          np.asarray(got[key]), np.asarray(ref[key]), rtol=1e-5, atol=1e-4,
+          err_msg=f'{band} {key} changed with gpt_chunk={chunk}',
+      )
+
+  def test_gpt_chunk_keeps_gas_optics_tables_shared(self):
+    """The chunk must gather table *slices*, not replicate whole tables.
+
+    This is the g-point analogue of the issue #8 per-column blowup guarded in
+    `test_solve_sw_vmap_keeps_gas_optics_tables_shared`. The chunk is batched by
+    mapping over the g-point index; a loop-invariant operand dragged into that
+    map would materialise a `[chunk, *table.shape]` buffer -- for `kmajor`, the
+    whole ~3 MB table once per chunk element. That must not happen. What the
+    chunk *is* expected to materialise is the per-g-point table slice it already
+    took at chunk size one, `chunk` of them: `[chunk, 14, 60, 9]`, a few hundred
+    kB, which is the design.
+
+    The second assertion states the same invariant as a number rather than a
+    string match, and is the one that actually matters: the whole trade here is
+    launches for memory, so memory must grow no faster than the *fields* do. It
+    is measured at a column batch large enough for the fields to dominate the
+    scratch -- at the two-by-two grid the rest of this class uses, a field is
+    176 elements and the per-g-point table slices alone are several times the
+    whole rest of the program, so the ratio there measures nothing.
+    """
+    chunk = 8
+    fixture = self._setup(n_horiz=12)
+    optics_lib, _, _, temperature = fixture[0], fixture[1], fixture[2], fixture[3]
+
+    def compile_at(gpt_chunk):
+      saved, self._cached = self._cached, fixture
+      try:
+        return jax.jit(
+            lambda t: self._solve_with_temperature('sw', gpt_chunk, t)['flux_net']
+        ).lower(temperature).compile()
+      finally:
+        self._cached = saved
+
+    compiled = compile_at(chunk)
+    ks = optics_lib.gas_optics_sw.kmajor.shape  # (14, 60, 9, n_gpt)
+    needle = 'f32[' + ','.join(str(d) for d in (chunk,) + tuple(ks))
+    self.assertNotIn(
+        needle, compiled.as_text(),
+        msg=(f'the whole gas-optics kmajor table is replicated across the '
+             f'g-point chunk ("{needle}" found in compiled HLO); the chunk must '
+             f'index the table, not copy it. See issue #8 for the per-column '
+             f'version of this failure.'),
+    )
+
+    unchunked_bytes = compile_at(1).memory_analysis().temp_size_in_bytes
+    chunked_bytes = compiled.memory_analysis().temp_size_in_bytes
+    # Linear in the chunk, with 25% of slack for the per-g-point table slices
+    # and the chunk's own index bookkeeping, neither of which scales with the
+    # fields. A replicated table would be orders of magnitude over this.
+    self.assertLessEqual(
+        chunked_bytes, 1.25 * chunk * unchunked_bytes,
+        msg=(f'gpt_chunk={chunk} needs {chunked_bytes:,} bytes of scratch '
+             f'against {unchunked_bytes:,} unchunked -- more than the {chunk}x '
+             f'the batched fields account for, so something table-sized is '
+             f'being replicated per g-point.'),
+    )
+
+  def _solve_with_temperature(self, band, gpt_chunk, temperature):
+    """`_solve` with the temperature taken from an argument, for lowering."""
+    (optics_lib, atmos_state, p, _, molecules, vmr_fields,
+     sfc_temperature, cloud) = self._cached
+    if band == 'lw':
+      return two_stream.solve_lw(
+          p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+          sfc_temperature, gpt_chunk=gpt_chunk, **cloud
+      )
+    return two_stream.solve_sw(
+        p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+        gpt_chunk=gpt_chunk, **cloud
+    )
+
+  def test_gradients_stay_finite_under_chunking(self):
+    """Reverse mode through the *whole* chunked solve, not a kernel in isolation.
+
+    Differentiating the solve end to end is the point: a NaN in the two-stream
+    cell kernels once got past a standalone kernel test and only showed up
+    through the full reverse pass. The cloudy column below drives the kernels
+    into their awkward regimes -- optically thin layers at cloud edges, and the
+    near-conservative-scattering limit inside the cloud -- while staying a
+    configuration the model actually produces.
+
+    The aerosol path is deliberately *not* differentiated here. Supplying any
+    `aerosol_optics` bundle NaNs the reverse pass of `solve_sw` on the RFMIP
+    clear-sky profile, at `gpt_chunk=1` and on the parent commit alike, so it is
+    a pre-existing defect in the aerosol mix rather than anything chunking does;
+    including it would make this test fail for an unrelated reason. Reproduce
+    with `solve_sw(..., aerosol_optics={'optical_depth': full(1e-2), 'ssa':
+    full(1.0), 'asymmetry_factor': zeros})` under `jax.grad` -- the forward
+    fluxes are finite, only the cotangents are not.
+    """
+    (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+     sfc_temperature, cloud) = self._cached
+
+    def loss(temp, gpt_chunk):
+      fluxes = two_stream.solve_sw(
+          p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+          gpt_chunk=gpt_chunk, **cloud
+      )
+      return jnp.sum(fluxes['flux_net'] ** 2)
+
+    ref = np.asarray(jax.grad(loss)(temperature, 1))
+    self.assertTrue(np.all(np.isfinite(ref)), 'unchunked gradient is not finite')
+    for chunk in (2, 8):
+      got = np.asarray(jax.grad(loss)(temperature, chunk))
+      self.assertTrue(
+          np.all(np.isfinite(got)),
+          msg=f'gradient has non-finite values at gpt_chunk={chunk}',
+      )
+      scale = max(np.max(np.abs(ref)), 1e-30)
+      np.testing.assert_allclose(
+          got / scale, ref / scale, rtol=1e-4, atol=1e-5,
+          err_msg=f'gradient changed with gpt_chunk={chunk}',
+      )
+
+
 if __name__ == '__main__':
   unittest.main()
