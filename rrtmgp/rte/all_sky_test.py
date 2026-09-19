@@ -780,14 +780,14 @@ class GPointChunkingTest(unittest.TestCase):
     near-conservative-scattering limit inside the cloud -- while staying a
     configuration the model actually produces.
 
-    The aerosol path is deliberately *not* differentiated here. Supplying any
-    `aerosol_optics` bundle NaNs the reverse pass of `solve_sw` on the RFMIP
-    clear-sky profile, at `gpt_chunk=1` and on the parent commit alike, so it is
-    a pre-existing defect in the aerosol mix rather than anything chunking does;
-    including it would make this test fail for an unrelated reason. Reproduce
-    with `solve_sw(..., aerosol_optics={'optical_depth': full(1e-2), 'ssa':
-    full(1.0), 'asymmetry_factor': zeros})` under `jax.grad` -- the forward
-    fluxes are finite, only the cotangents are not.
+    The aerosol path is exercised separately in
+    `test_aerosol_gradients_stay_finite` rather than here, only to keep this
+    test's cloud-edge / in-cloud focus uncluttered -- not because it is
+    unsafe. (An earlier revision of this comment claimed an `aerosol_optics`
+    bundle NaN'd the reverse pass; that was the conservative-scattering
+    `k^2 = 0` defect, which was already fixed for gas, cloud *and* aerosol by
+    the `x2`-parameterised two-stream helpers -- see issue #30 and the sweep
+    in `test_aerosol_gradients_stay_finite`.)
     """
     (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
      sfc_temperature, cloud) = self._cached
@@ -811,6 +811,83 @@ class GPointChunkingTest(unittest.TestCase):
       np.testing.assert_allclose(
           got / scale, ref / scale, rtol=1e-4, atol=1e-5,
           err_msg=f'gradient changed with gpt_chunk={chunk}',
+      )
+
+  def test_aerosol_gradients_stay_finite(self):
+    """Reverse mode through the *whole* solve *with* an `aerosol_optics` bundle.
+
+    Regression for issue #30. A per-band aerosol bundle is mixed into the
+    gas+cloud optics via `combine_optical_properties`, and its single-scattering
+    albedo drives the *combined* `ssa` into regimes a gas/cloud-only column may
+    never reach on its own -- in particular `ssa = 1` exactly, which lands the
+    two-stream at conservative scattering `k^2 = (gamma1+gamma2)(gamma1-gamma2)
+    = 0`. That is the same degenerate point at which a `sqrt(k2)` on the reverse
+    path once manufactured `0 * inf = NaN` cotangents (fixed for gas, cloud and
+    aerosol alike by the `x2`-parameterised hyperbolic helpers in
+    `monochromatic_two_stream`). The `combine_optical_properties` normalisations
+    themselves divide by `jnp.maximum(x, EPSILON)`, whose clamped-branch adjoint
+    is a finite zero, so they add no new poison.
+
+    The sweep includes the corners the issue calls out -- `optical_depth`
+    spanning zero / tiny / physical, and `ssa = 1.0` reached *exactly* (not
+    merely approached) -- for both the shortwave and longwave solves, since both
+    share the mix and the diffuse two-stream code. Forward fluxes were finite
+    throughout even when the reverse pass was not, so a finite-forward assertion
+    would not have caught the original defect; the cotangents are what matter.
+    """
+    (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+     sfc_temperature, cloud) = self._cached
+
+    def band_bundle(n_bnd, optical_depth, ssa, asymmetry):
+      shape = (n_bnd,) + temperature.shape
+      return {
+          'optical_depth': jnp.full(shape, optical_depth, jnp.float_),
+          'ssa': jnp.full(shape, ssa, jnp.float_),
+          'asymmetry_factor': jnp.full(shape, asymmetry, jnp.float_),
+      }
+
+    # One compiled reverse pass per band, reused across every bundle below
+    # (the bundle is a traced argument), so the whole sweep costs two solves'
+    # worth of compilation rather than one per parameter combination.
+    @jax.jit
+    def sw_grad(temp, aerosol):
+      def loss(t):
+        fluxes = two_stream.solve_sw(
+            p, t, molecules, optics_lib, atmos_state, vmr_fields,
+            aerosol_optics=aerosol, gpt_chunk=1, **cloud
+        )
+        return jnp.sum(fluxes['flux_net'] ** 2)
+      return jax.grad(loss)(temp)
+
+    @jax.jit
+    def lw_grad(temp, aerosol):
+      def loss(t):
+        fluxes = two_stream.solve_lw(
+            p, t, molecules, optics_lib, atmos_state, vmr_fields,
+            sfc_temperature, aerosol_optics=aerosol, gpt_chunk=1, **cloud
+        )
+        return jnp.sum(fluxes['flux_net'] ** 2)
+      return jax.grad(loss)(temp)
+
+    optical_depths = (0.0, 1e-8, 1e-2)
+    ssas = (0.0, 0.999, 1.0)  # 1.0 exactly -> combined ssa can hit k^2 = 0
+    asymmetries = (0.0, 0.85)
+    cases = [
+        (band, grad_fn, n_bnd, od, ssa, g)
+        for band, grad_fn, n_bnd in (
+            ('sw', sw_grad, optics_lib.gas_optics_sw.n_bnd),
+            ('lw', lw_grad, optics_lib.gas_optics_lw.n_bnd),
+        )
+        for od in optical_depths
+        for ssa in ssas
+        for g in asymmetries
+    ]
+    for band, grad_fn, n_bnd, od, ssa, g in cases:
+      grad = np.asarray(grad_fn(temperature, band_bundle(n_bnd, od, ssa, g)))
+      self.assertTrue(
+          np.all(np.isfinite(grad)),
+          msg=(f'{band} temperature gradient has non-finite values with '
+               f'aerosol optical_depth={od}, ssa={ssa}, asymmetry={g}'),
       )
 
 
