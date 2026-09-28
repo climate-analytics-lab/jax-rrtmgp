@@ -52,7 +52,13 @@ _M2_TO_CM2_FACTOR = 1e4
 def _pressure_interpolant(
     p: Array, p_ref: Array, troposphere_offset: Array | None = None
 ) -> Interpolant:
-  """Create a pressure interpolant based on reference pressure values."""
+  """Create a pressure interpolant based on reference pressure values.
+
+  Outside the table (above ~1096 hPa or below ~1 Pa) the log-pressure axis is
+  extrapolated along its end interval, as RRTMGP's `fpress` is
+  (`mo_gas_optics_rrtmgp_kernels.F90::interpolation`: the index is limited to
+  the interior, the fraction is not).
+  """
   log_p = jnp.log(p)
   log_p_ref = jnp.log(p_ref)
   return optics_utils.create_linear_interpolant(
@@ -63,7 +69,14 @@ def _pressure_interpolant(
 def _mixing_fraction_interpolant(
     f: Array, n_mixing_fraction: int
 ) -> Interpolant:
-  """Create a mixing fraction interpolant based on desired number of points."""
+  """Create a mixing fraction interpolant based on desired number of points.
+
+  The binary-species parameter eta lies in [0, 1] by construction for
+  non-negative mixing ratios, so this axis only meets its end nodes, where the
+  interpolant is continuous (eta = 1 selects the last entry with unit weight).
+  A negative mixing ratio supplied by a caller would be extrapolated like the
+  other gas-optics axes.
+  """
   return optics_utils.create_linear_interpolant(
       f, jnp.linspace(0.0, 1.0, n_mixing_fraction, dtype=jnp.float_)
   )
@@ -273,12 +286,17 @@ def compute_major_optical_depth(
       ('p', lambda: p_interp),
       ('m', mix_interpolant_fn),
   ))
+  # Temperature and pressure outside the table are extrapolated along its end
+  # interval (see `create_linear_interpolant`), which can go negative for a
+  # large enough excursion; an absorption coefficient cannot.
   return (
       molecules
       / _M2_TO_CM2_FACTOR
-      * optics_utils.interpolate(
-          lookup_gas_optics.kmajor[..., igpt],
-          interpolant_fns=interpolant_fn_dict,
+      * optics_utils.floor_at_zero(
+          optics_utils.interpolate(
+              lookup_gas_optics.kmajor[..., igpt],
+              interpolant_fns=interpolant_fn_dict,
+          )
       )
   )
 
@@ -590,14 +608,21 @@ def compute_minor_optical_depth(
   k_loc = tables.gpt_shift[i] + loc_in_bnd
   coeffs = tables.kminor[..., k_loc]
   slot_idx = per_slot(jnp.arange(n_slots))
+  # Floored for the same reason as the major coefficient: temperature outside
+  # the table is extrapolated along its end interval.
   contribution = (
-      optics_utils.interpolate(
-          coeffs,
-          collections.OrderedDict((
-              ('t', lambda: temperature_interpolant),
-              ('m', mix_interpolant_fn),
-              ('i', lambda: optics_utils.exact_index(slot_idx, coeffs.dtype)),
-          )),
+      optics_utils.floor_at_zero(
+          optics_utils.interpolate(
+              coeffs,
+              collections.OrderedDict((
+                  ('t', lambda: temperature_interpolant),
+                  ('m', mix_interpolant_fn),
+                  (
+                      'i',
+                      lambda: optics_utils.exact_index(slot_idx, coeffs.dtype),
+                  ),
+              )),
+          )
       )
       * scaling
   )
@@ -652,11 +677,13 @@ def compute_rayleigh_optical_depth(
   interpolant_fns = collections.OrderedDict(
       (('t', lambda: temperature_interpolant), ('m', mix_interpolant_fn))
   )
-  rayl_tau_lower = optics_utils.interpolate(
-      lkp.rayl_lower[..., igpt], interpolant_fns
+  # Floored for the same reason as the absorption coefficients: temperature
+  # outside the table is extrapolated along its end interval.
+  rayl_tau_lower = optics_utils.floor_at_zero(
+      optics_utils.interpolate(lkp.rayl_lower[..., igpt], interpolant_fns)
   )
-  rayl_tau_upper = optics_utils.interpolate(
-      lkp.rayl_upper[..., igpt], interpolant_fns
+  rayl_tau_upper = optics_utils.floor_at_zero(
+      optics_utils.interpolate(lkp.rayl_upper[..., igpt], interpolant_fns)
   )
   if vmr_fields is not None and lkp.idx_h2o in vmr_fields:
     factor = 1.0 + vmr_fields[lkp.idx_h2o]
@@ -720,9 +747,12 @@ def compute_planck_fraction(
       ('m', mix_interpolant_fn),
   ))
 
-  # 3-D interpolation of the Planck fraction.
-  return optics_utils.interpolate(
-      lookup.planck_fraction[..., igpt], interpolants_fns
+  # 3-D interpolation of the Planck fraction, floored because temperature and
+  # pressure outside the table are extrapolated along its end interval.
+  return optics_utils.floor_at_zero(
+      optics_utils.interpolate(
+          lookup.planck_fraction[..., igpt], interpolants_fns
+      )
   )
 
 
@@ -748,11 +778,18 @@ def compute_planck_sources(
   """
   ibnd = lookup.g_point_to_bnd[igpt]
 
-  # 1-D interpolation of the Planck source.
+  # 1-D interpolation of the Planck source. Outside the table the source is
+  # extrapolated along the end interval, as RRTMG's `planckFunction` does
+  # (ECHAM6 `mo_lrtm_driver.f90`) and as RRTMGP's `interpolate1D` does within
+  # one table step of either end. The linear extension of the band-integrated
+  # Planck function below 160 K reaches zero somewhere between roughly 110 and
+  # 155 K depending on the band, so the source is floored there.
   interpolant = optics_utils.create_linear_interpolant(
       temperature, lookup.t_planck
   )
-  return planck_fraction * optics_utils.interpolate(
-      lookup.totplnk[ibnd, :],
-      collections.OrderedDict({'t': lambda: interpolant}),
+  return planck_fraction * optics_utils.floor_at_zero(
+      optics_utils.interpolate(
+          lookup.totplnk[ibnd, :],
+          collections.OrderedDict({'t': lambda: interpolant}),
+      )
   )
