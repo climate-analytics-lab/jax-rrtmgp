@@ -263,6 +263,11 @@ def floor_at_zero(x: Array) -> Array:
   what the kernels should return if they were to see one. A jitted library
   cannot raise, so the result is floored at zero instead.
 
+  Only use it on a quantity that stands on its own. Flooring the members of a
+  partition element-wise (the Planck fractions of a band, which sum to one)
+  changes their sum; such a table is clamped instead of extrapolated, so that
+  it never needs a floor.
+
   The select is written `where(x < 0, 0, x)` rather than `maximum(x, 0)`:
 
   * where `x >= 0`, which is everywhere inside a table, it returns `x` itself

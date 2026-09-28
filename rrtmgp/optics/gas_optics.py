@@ -50,19 +50,23 @@ _M2_TO_CM2_FACTOR = 1e4
 
 
 def _pressure_interpolant(
-    p: Array, p_ref: Array, troposphere_offset: Array | None = None
+    p: Array,
+    p_ref: Array,
+    troposphere_offset: Array | None = None,
+    out_of_range: str = optics_utils.EXTRAPOLATE,
 ) -> Interpolant:
   """Create a pressure interpolant based on reference pressure values.
 
   Outside the table (above ~1096 hPa or below ~1 Pa) the log-pressure axis is
   extrapolated along its end interval, as RRTMGP's `fpress` is
   (`mo_gas_optics_rrtmgp_kernels.F90::interpolation`: the index is limited to
-  the interior, the fraction is not).
+  the interior, the fraction is not). The Planck fraction passes
+  `out_of_range=CLAMP` instead; see `compute_planck_fraction`.
   """
   log_p = jnp.log(p)
   log_p_ref = jnp.log(p_ref)
   return optics_utils.create_linear_interpolant(
-      log_p, log_p_ref, offset=troposphere_offset
+      log_p, log_p_ref, offset=troposphere_offset, out_of_range=out_of_range
   )
 
 
@@ -727,11 +731,36 @@ def compute_planck_fraction(
   # The troposphere index is 1 for levels above the troposphere limit and 0
   # otherwise.
   tropo_idx = jnp.where(p <= lookup.p_ref_tropo, 1, 0)
+  # The Planck fractions of a band partition the band's Planck source among its
+  # g-points: they sum to one over the band, and that sum is what conserves the
+  # band's emitted energy once the solver adds the g-points up. Temperature and
+  # pressure outside the table are therefore CLAMPED here, not extrapolated
+  # like the absorption coefficients:
+  #
+  # * With every weight in [0, 1] the fraction is a convex combination of
+  #   non-negative table entries, so it is non-negative and its band sum is a
+  #   convex combination of the table's own band sums (1 to ~1e-4) -- with no
+  #   floor. Extrapolating instead drives single fractions negative (band 10
+  #   of the shipped tables: -0.08 at 40 K), and flooring those element-wise
+  #   inflates the band sum, by up to 8% (g128) / 15% (g256) at 40 K, i.e. a
+  #   cold layer would emit more band energy than its band source.
+  # * The temperature dependence of the emitted energy is carried by the band
+  #   source (`compute_planck_sources`), which still extrapolates. RRTMG's
+  #   Planck fractions do not depend on temperature or pressure at all, only on
+  #   the binary-species parameter (ECHAM6 `mo_lrtm_gas_optics.f90`, `fracs =
+  #   fracrefa(ig, jpl) + fpl * (...)`). RRTMGP interpolates them with the same
+  #   weights as `kmajor` (`compute_Planck_source` in
+  #   `mo_gas_optics_rrtmgp_kernels.F90`), unfloored, which keeps the band sum
+  #   but not the sign; its inputs never leave the table because the frontend
+  #   rejects them (`check_values`).
+  #
+  # Inside the table the clamp is the identity, so in-range fractions are
+  # unchanged.
   temperature_interpolant = optics_utils.create_linear_interpolant(
-      temperature, lookup.t_ref
+      temperature, lookup.t_ref, out_of_range=optics_utils.CLAMP
   )
   pressure_interpolant = _pressure_interpolant(
-      p, lookup.p_ref, tropo_idx
+      p, lookup.p_ref, tropo_idx, out_of_range=optics_utils.CLAMP
   )
   ibnd = lookup.g_point_to_bnd[igpt]
 
@@ -747,12 +776,9 @@ def compute_planck_fraction(
       ('m', mix_interpolant_fn),
   ))
 
-  # 3-D interpolation of the Planck fraction, floored because temperature and
-  # pressure outside the table are extrapolated along its end interval.
-  return optics_utils.floor_at_zero(
-      optics_utils.interpolate(
-          lookup.planck_fraction[..., igpt], interpolants_fns
-      )
+  # 3-D interpolation of the Planck fraction.
+  return optics_utils.interpolate(
+      lookup.planck_fraction[..., igpt], interpolants_fns
   )
 
 

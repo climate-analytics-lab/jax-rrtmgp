@@ -499,5 +499,71 @@ class GasOpticsTest(unittest.TestCase):
     )
     self.assertEqual(slopes[2], 0.0)
 
+  def test_planck_fractions_partition_the_band_outside_the_tables(self):
+    """The fractions of a band stay non-negative and keep their band sum.
+
+    Planck fractions partition a band's Planck source among its g-points, so
+    their band sum is what conserves the band's emitted energy. Outside the
+    temperature and pressure tables they are clamped (see
+    `compute_planck_fraction`): every fraction is non-negative and each band
+    sums to exactly what it sums to at the nearest in-table state, which is
+    the table's own band sum (1 to ~2e-4). Extrapolating and flooring them
+    element-wise instead inflated band 10's sum by 8% (g128) / 15% (g256) at
+    40 K. Checked for every band of both shipped k-distributions.
+    """
+    temps = np.concatenate([
+        np.arange(40.0, 161.0, 5.0), [165.0, 300.0, 355.0, 370.0, 450.0]
+    ])
+    # Surface-like, mid-troposphere, stratosphere, the upper-atmosphere corner
+    # where extrapolation went most negative (~3.3 Pa), and beyond both ends.
+    pressures = np.array([1.2e5, 5.0e4, 100.0, 3.34, 1.005, 0.3])
+    t_grid, p_grid = np.meshgrid(temps, pressures, indexing='ij')
+    t_clamped = np.clip(t_grid, 160.0, 355.0)
+    p_clamped = np.clip(p_grid, 1.00518357, 1.09663316e5)
+    shape = t_grid.shape
+
+    for path in (_LW_LOOKUP_TABLE_FILEPATH,
+                 root / 'rrtmgp/optics/rrtmgp_data/rrtmgp-gas-lw-g128.nc'):
+      lw = lookup_gas_optics_longwave.from_nc_file(path)
+      vmr_fields = {
+          lw.idx_h2o: jnp.full(shape, 4e-6, dtype=jnp.float_),
+          lw.idx_o3: jnp.full(shape, 2e-6, dtype=jnp.float_),
+      }
+
+      @jax.jit
+      def fractions(t, p, lw=lw, vmr_fields=vmr_fields):
+        return jax.vmap(
+            lambda g: gas_optics.compute_planck_fraction(
+                lw, self.vmr_lib, p, t, g, vmr_fields
+            )
+        )(jnp.arange(lw.n_gpt))
+
+      pf = np.asarray(
+          fractions(jnp.asarray(t_grid, jnp.float_),
+                    jnp.asarray(p_grid, jnp.float_)), np.float64)
+      pf_edge = np.asarray(
+          fractions(jnp.asarray(t_clamped, jnp.float_),
+                    jnp.asarray(p_clamped, jnp.float_)), np.float64)
+      self.assertTrue(np.all(np.isfinite(pf)), str(path))
+      self.assertTrue(np.all(pf >= 0), str(path))
+      for b, (g0, g1) in enumerate(np.asarray(lw.bnd_lims_gpt)):
+        band_sum = pf[g0:g1 + 1].sum(axis=0)
+        np.testing.assert_allclose(
+            band_sum, pf_edge[g0:g1 + 1].sum(axis=0), rtol=1e-5,
+            err_msg=f'{path} band {b}',
+        )
+        np.testing.assert_allclose(
+            band_sum, 1.0, atol=5e-4, err_msg=f'{path} band {b}'
+        )
+
+      # Gradients: finite everywhere, zero in temperature outside the table.
+      grad_t, grad_p = jax.grad(
+          lambda t, p: jnp.sum(fractions(t, p)), argnums=(0, 1)
+      )(jnp.asarray(t_grid, jnp.float_), jnp.asarray(p_grid, jnp.float_))
+      self.assertTrue(np.all(np.isfinite(grad_t)), str(path))
+      self.assertTrue(np.all(np.isfinite(grad_p)), str(path))
+      outside = (t_grid < 160.0) | (t_grid > 355.0)
+      np.testing.assert_array_equal(np.asarray(grad_t)[outside], 0.0)
+
 if __name__ == '__main__':
   unittest.main()
