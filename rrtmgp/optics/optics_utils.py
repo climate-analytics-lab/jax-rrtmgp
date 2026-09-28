@@ -246,34 +246,128 @@ def floor_idx(f: Array, reference_values: Array) -> Array:
   return jnp.clip(truncated_div, 0, size - 1)
 
 
+EXTRAPOLATE = 'extrapolate'
+CLAMP = 'clamp'
+
+
+def floor_at_zero(x: Array) -> Array:
+  """Floor an interpolated table value at zero.
+
+  Every RRTMGP gas-optics table (absorption coefficients, Rayleigh
+  coefficients, Planck fractions, the Planck source) is non-negative, and so is
+  any interpolation of it with weights in [0, 1]. Linear extrapolation beyond a
+  table edge is not bounded that way: extending the Planck source's end segment
+  far enough below 160 K, for instance, crosses zero. RRTMGP itself never meets
+  this, because its frontend rejects out-of-range temperatures and pressures
+  (`check_values` in `mo_gas_optics_rrtmgp.F90`), and it says nothing about
+  what the kernels should return if they were to see one. A jitted library
+  cannot raise, so the result is floored at zero instead.
+
+  The select is written `where(x < 0, 0, x)` rather than `maximum(x, 0)`:
+
+  * where `x >= 0`, which is everywhere inside a table, it returns `x` itself
+    (bit-identical, `-0.0` included) with a unit derivative. `maximum` would
+    halve the derivative wherever `x == 0` exactly, which a zero table entry
+    at a node produces;
+  * a NaN input propagates as a NaN instead of being masked to zero.
+
+  Args:
+    x: An interpolated (possibly extrapolated) value of a non-negative table.
+
+  Returns:
+    `x` where it is non-negative, zero where it is negative.
+  """
+  return jnp.where(x < 0, jnp.zeros_like(x), x)
+
+
+def _interval_idx(f: Array, reference_values: Array) -> Array:
+  """Index of the lower node of the table interval that `f` is referred to.
+
+  The same floor computation as `floor_idx`, but limited to `[0, size - 2]`
+  (the lower node of an interval that has an upper node) rather than to
+  `[0, size - 1]`. The two nodes of the chosen interval are therefore always
+  distinct table entries, and a value beyond either end of the table is
+  referred to the end interval rather than to a single end node.
+  """
+  delta = reference_values[1] - reference_values[0]
+  size = reference_values.shape[0]
+  truncated_div = jnp.floor_divide(f - reference_values[0], delta)
+  truncated_div = truncated_div.astype(jnp.int_)
+  return jnp.clip(truncated_div, 0, size - 2)
+
+
 def create_linear_interpolant(
-    f: Array, f_ref: Array, offset: Array | None = None
+    f: Array,
+    f_ref: Array,
+    offset: Array | None = None,
+    out_of_range: str = EXTRAPOLATE,
 ) -> Interpolant:
   """Create a linear interpolant based on the evenly spaced reference values.
 
   The linear interpolant is created by matching the values of `f` to an interval
   of the reference values and storing information about the location of the
-  endpoints. Linear interpolation weights are computed based on the distance of
-  the value from each endpoint.
+  endpoints. Linear interpolation weights are computed based on the signed
+  distance of the value from the lower endpoint.
+
+  Out-of-range values follow the RRTMGP kernels
+  (`rrtmgp/kernels/mo_gas_optics_rrtmgp_kernels.F90::interpolation` and
+  `interpolate1D`) and RRTMG (`mo_rrtm_coeffs.f90`,
+  `mo_lrtm_driver.f90::planckFunction`): the interval index is limited to the
+  interior of the table and the fractional weight is left signed and
+  unbounded. With `out_of_range=EXTRAPOLATE` (the default) a value beyond
+  either end is therefore linearly extrapolated along the end interval, and
+  its derivative is that interval's slope. With `out_of_range=CLAMP` the
+  weight is limited to [0, 1] instead, so beyond either end the result is held
+  at the end entry and its derivative is zero.
+
+  The weight is never passed through `abs`. Inside the table it is
+  non-negative anyway; below the first node, `abs` would reflect the table
+  about that node, giving a value below the table the entry as far above the
+  first node as the value is below it, with a derivative of the wrong sign.
+  At the node itself `abs` has a kink, so its derivative there would be set by
+  a convention of the autodiff system rather than by the table.
+
+  At a node the value is continuous (both adjacent intervals reproduce the
+  node's entry) and the derivative is the one-sided derivative of the interval
+  that starts there, or of the last interval at the table's upper end.
 
   Args:
-    f: A tensor of arbitrary shape whose values must be in the range of
+    f: A tensor of arbitrary shape whose values are to be located in the
       reference values in `f_ref`.
     f_ref: The 1-D tensor of evenly spaced reference values for the variable.
+      Must have at least two entries; may be increasing or decreasing.
     offset: An optional tensor of the same shape as `f` that should be added to
       the interpolant indices.
+    out_of_range: `EXTRAPOLATE` or `CLAMP`, the behaviour for values of `f`
+      beyond either end of `f_ref` (see above). Static.
 
   Returns:
     An `Interpolant` object containing the pointwise floor and ceiling indices
     and interpolation weights of `f`.
   """
-  size = f_ref.shape[0]
+  if out_of_range not in (EXTRAPOLATE, CLAMP):
+    raise ValueError(
+        f'out_of_range must be {EXTRAPOLATE!r} or {CLAMP!r}, got'
+        f' {out_of_range!r}'
+    )
   delta = f_ref[1] - f_ref[0]
-  idx_low = floor_idx(f, f_ref)
-  idx_high = jnp.minimum(idx_low + 1, size - 1)
-  # Compute the interpolant weights for the two endpoints.
+  idx_low = _interval_idx(f, f_ref)
+  idx_high = idx_low + 1
+  # Compute the interpolant weights for the two endpoints. `weight2` is the
+  # signed fractional position of `f` in the interval: in [0, 1] inside the
+  # table, below 0 before its first node and above 1 past its last.
   lower_reference_vals = f_ref[0] + delta * idx_low.astype(f_ref.dtype)
-  weight2 = jnp.abs((f - lower_reference_vals) / delta)
+  weight2 = (f - lower_reference_vals) / delta
+  if out_of_range == CLAMP:
+    # Strict comparisons, so that exactly at an end node the weight is the
+    # unclamped expression and its derivative is the end interval's slope (the
+    # one-sided derivative from inside the table). `jnp.clip` would give half
+    # of it there, splitting the derivative between its two arms at the tie.
+    weight2 = jnp.where(
+        weight2 < 0,
+        jnp.zeros_like(weight2),
+        jnp.where(weight2 > 1, jnp.ones_like(weight2), weight2),
+    )
   weight1 = 1.0 - weight2
   if offset is not None:
     idx_low += offset
