@@ -115,13 +115,15 @@ class OpticsUtilsTest(unittest.TestCase):
     np.testing.assert_equal(floor_idx, expected_floor_idx)
 
   def test_create_linear_interpolant(self):
-    """Tests the creation of a linear interpolant and out of range exception."""
+    """Tests the creation of a linear interpolant inside the table."""
     ref_vals = jnp.array((1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0))
     vals = jnp.array((1.0, 1.5, 5.6, 7.8, 9.0, 10.0))
-    idx_low = jnp.array((0, 0, 4, 6, 8, 9))
+    # The last node is the upper end of the last interval (8, 9), not an
+    # interval of its own: the two nodes of an interval are always distinct.
+    idx_low = jnp.array((0, 0, 4, 6, 8, 8))
     idx_high = jnp.array((1, 1, 5, 7, 9, 9))
-    weight_low = jnp.array((1.0, 0.5, 0.4, 0.2, 1.0, 1.0))
-    weight_high = jnp.array((0.0, 0.5, 0.6, 0.8, 0.0, 0.0))
+    weight_low = jnp.array((1.0, 0.5, 0.4, 0.2, 1.0, 0.0))
+    weight_high = jnp.array((0.0, 0.5, 0.6, 0.8, 0.0, 1.0))
     idx_and_weight_low = IndexAndWeight(idx_low, weight_low)
     idx_and_weight_high = IndexAndWeight(idx_high, weight_high)
     expected_interpolant = Interpolant(idx_and_weight_low, idx_and_weight_high)
@@ -359,6 +361,184 @@ class OpticsUtilsTest(unittest.TestCase):
           OrderedDict((('t', lambda: t_interp), ('m', lambda: m_interp))),
       )
       np.testing.assert_allclose(batched[i], one, rtol=1e-6, atol=1e-6)
+
+
+# RRTMGP's gas-optics temperature axis, 160..355 K in 15 K steps, and a monotone
+# table on it (think Planck source). This is the reproducer of issue #39.
+_T_REF = jnp.arange(160.0, 356.0, 15.0)
+_T_TABLE = _T_REF**4
+
+
+def _interp_1d(x, ref=_T_REF, table=_T_TABLE, mode=optics_utils.EXTRAPOLATE):
+  """Interpolate a 1-D `table` on `ref` at `x` with the package's helper."""
+  itp = optics_utils.create_linear_interpolant(x, ref, out_of_range=mode)
+  return optics_utils.interpolate(table, OrderedDict({'x': lambda: itp}))
+
+
+def _expected_1d(x, ref, table, mode):
+  """Piecewise-linear reference: np.interp inside, end segments outside."""
+  ref, table, x = (np.asarray(v, np.float64) for v in (ref, table, x))
+  if ref[1] < ref[0]:
+    ref, table = ref[::-1], table[::-1]
+  inside = np.interp(x, ref, table)
+  if mode == optics_utils.CLAMP:
+    return inside
+  lo_slope = (table[1] - table[0]) / (ref[1] - ref[0])
+  hi_slope = (table[-1] - table[-2]) / (ref[-1] - ref[-2])
+  return np.where(
+      x < ref[0],
+      table[0] + (x - ref[0]) * lo_slope,
+      np.where(x > ref[-1], table[-1] + (x - ref[-1]) * hi_slope, inside),
+  )
+
+
+def _with_lookup_impl(impl, fn):
+  prev = optics_utils.get_lookup_impl()
+  try:
+    optics_utils.set_lookup_impl(impl)
+    return fn()
+  finally:
+    optics_utils.set_lookup_impl(prev)
+
+
+class OutOfRangeTest(unittest.TestCase):
+  """Values outside a table: extrapolated or clamped, never mirrored (#39)."""
+
+  @parameterized.expand([
+      ('extrapolate_gather', optics_utils.EXTRAPOLATE, 'gather'),
+      ('extrapolate_matmul', optics_utils.EXTRAPOLATE, 'matmul'),
+      ('clamp_gather', optics_utils.CLAMP, 'gather'),
+      ('clamp_matmul', optics_utils.CLAMP, 'matmul'),
+  ])
+  def test_issue_39_reproducer(self, _, mode, impl):
+    """Below, at and above the table, for a monotone table."""
+    temps = jnp.array(
+        [100.0, 130.0, 145.0, 160.0, 175.0, 190.0, 220.0, 340.0, 355.0,
+         370.0, 400.0]
+    )
+    got = _with_lookup_impl(impl, lambda: _interp_1d(temps, mode=mode))
+    np.testing.assert_allclose(
+        got, _expected_1d(temps, _T_REF, _T_TABLE, mode), rtol=2e-6
+    )
+    got = np.asarray(got)
+    # The defect: 145 K came back with the value of 175 K.
+    self.assertNotAlmostEqual(got[2] / got[4], 1.0, places=3)
+    if mode == optics_utils.EXTRAPOLATE:
+      self.assertLess(got[2], got[3])
+    else:
+      self.assertEqual(got[2], got[3])
+    # A monotone table stays monotone through both edges.
+    self.assertTrue(np.all(np.diff(got) >= 0))
+
+  def test_extrapolation_is_the_end_segment_line(self):
+    """Explicit values, independent of the reference helper above."""
+    below = float(_interp_1d(jnp.array([145.0]))[0])
+    above = float(_interp_1d(jnp.array([370.0]))[0])
+    t4 = lambda t: float(t) ** 4
+    np.testing.assert_allclose(below, 2 * t4(160) - t4(175), rtol=1e-6)
+    np.testing.assert_allclose(above, 2 * t4(355) - t4(340), rtol=1e-6)
+    clamped = _interp_1d(jnp.array([145.0, 370.0]), mode=optics_utils.CLAMP)
+    np.testing.assert_allclose(clamped, [t4(160), t4(355)], rtol=1e-6)
+
+  @parameterized.expand([(optics_utils.EXTRAPOLATE,), (optics_utils.CLAMP,)])
+  def test_decreasing_axis(self, mode):
+    """A decreasing axis (RRTMGP's log-pressure axis) behaves the same way."""
+    log_p_ref = jnp.linspace(jnp.log(109663.0), jnp.log(1.005), 59)
+    table = jnp.exp(0.5 * log_p_ref)  # monotone in log p
+    x = jnp.array([12.0, 11.605, 8.0, 3.0, 0.005, -0.5, -2.0])
+    got = _interp_1d(x, ref=log_p_ref, table=table, mode=mode)
+    np.testing.assert_allclose(
+        got, _expected_1d(x, log_p_ref, table, mode), rtol=2e-5, atol=1e-4
+    )
+
+  def test_invalid_mode(self):
+    with self.assertRaises(ValueError):
+      optics_utils.create_linear_interpolant(
+          jnp.array([1.0]), _T_REF, out_of_range='mirror'
+      )
+
+  @parameterized.expand([
+      ('first_node', 160.0), ('interior_node', 235.0), ('last_node', 355.0)
+  ])
+  def test_continuity_across_nodes(self, _, node):
+    """Left and right limits agree at both table edges and inside."""
+    eps = 1e-3
+    for mode in (optics_utils.EXTRAPOLATE, optics_utils.CLAMP):
+      left, at, right = np.asarray(
+          _interp_1d(jnp.array([node - eps, node, node + eps]), mode=mode),
+          np.float64,
+      )
+      entry = node**4
+      # Within the largest one-sided change over eps (slope <= 4 T^3).
+      tol = 4.0 * 355.0**3 * eps * 1.01 + 1e-6 * entry
+      self.assertLess(abs(left - at), tol, (mode, node))
+      self.assertLess(abs(right - at), tol, (mode, node))
+      np.testing.assert_allclose(at, entry, rtol=1e-6)
+
+  def _grad(self, x, mode):
+    f = lambda v: _interp_1d(v[None], mode=mode)[0]
+    return float(jax.grad(f)(jnp.float32(x)))
+
+  def test_derivatives_extrapolating_axis(self):
+    """Slope of the containing (or end) segment everywhere, finite."""
+    seg = lambda i: float((_T_TABLE[i + 1] - _T_TABLE[i]) / 15.0)
+    cases = [
+        (100.0, seg(0)),     # far below: end-segment slope
+        (159.0, seg(0)),     # just below
+        (160.0, seg(0)),     # first node: first segment (one-sided)
+        (167.0, seg(0)),     # inside the first segment
+        (235.0, seg(5)),     # interior node: the segment that starts there
+        (241.0, seg(5)),
+        (355.0, seg(12)),    # last node: last segment (one-sided)
+        (400.0, seg(12)),    # far above: end-segment slope
+    ]
+    for x, want in cases:
+      got = self._grad(x, optics_utils.EXTRAPOLATE)
+      self.assertTrue(np.isfinite(got), x)
+      np.testing.assert_allclose(got, want, rtol=1e-5, err_msg=str(x))
+
+  def test_derivatives_clamped_axis(self):
+    """Zero beyond the ends; the inside slope at the end nodes themselves."""
+    seg = lambda i: float((_T_TABLE[i + 1] - _T_TABLE[i]) / 15.0)
+    cases = [
+        (100.0, 0.0), (159.0, 0.0), (160.0, seg(0)), (235.0, seg(5)),
+        (355.0, seg(12)), (356.0, 0.0), (400.0, 0.0),
+    ]
+    for x, want in cases:
+      got = self._grad(x, optics_utils.CLAMP)
+      np.testing.assert_allclose(got, want, rtol=1e-5, err_msg=str(x))
+
+  def test_derivative_matches_central_difference_and_jvp(self):
+    """Away from nodes, grad == jvp == a central difference, in and out."""
+    f = lambda v: _interp_1d(v)
+    x = jnp.array([101.3, 152.7, 163.1, 222.2, 301.9, 351.4, 362.5, 420.0])
+    h = 0.05
+    fd = (np.asarray(f(x + h), np.float64) - np.asarray(f(x - h), np.float64))
+    fd /= 2 * h
+    grad = jax.vmap(jax.grad(lambda v: f(v[None])[0]))(x)
+    _, tangent = jax.jvp(f, (x,), (jnp.ones_like(x),))
+    np.testing.assert_allclose(grad, fd, rtol=1e-3)
+    np.testing.assert_allclose(tangent, grad, rtol=1e-6)
+
+  def test_derivative_finite_on_a_dense_sweep(self):
+    x = jnp.linspace(0.0, 600.0, 6001)  # hits every node exactly
+    for mode in (optics_utils.EXTRAPOLATE, optics_utils.CLAMP):
+      g = jax.vmap(jax.grad(lambda v: _interp_1d(v[None], mode=mode)[0]))(x)
+      self.assertTrue(np.all(np.isfinite(g)), mode)
+      if mode == optics_utils.EXTRAPOLATE:
+        # Monotone table: the derivative is positive everywhere, including
+        # below the table (where the mirrored table's slope was negative) and
+        # at and above the last node (where the clamped lookup's was zero).
+        self.assertTrue(np.all(np.asarray(g) > 0), mode)
+
+  def test_floor_at_zero(self):
+    x = jnp.array([-2.0, -0.0, 0.0, 3.0, jnp.nan])
+    y = optics_utils.floor_at_zero(x)
+    np.testing.assert_array_equal(y[:4], [0.0, 0.0, 0.0, 3.0])
+    self.assertTrue(np.isnan(y[4]))
+    self.assertTrue(np.signbit(y[1]))  # identity for x >= 0, -0.0 included
+    g = jax.vmap(jax.grad(optics_utils.floor_at_zero))(x[:4])
+    np.testing.assert_array_equal(g, [0.0, 1.0, 1.0, 1.0])
 
 
 if __name__ == '__main__':

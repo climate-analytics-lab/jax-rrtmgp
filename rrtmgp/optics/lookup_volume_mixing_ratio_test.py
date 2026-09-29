@@ -14,6 +14,8 @@
 
 import unittest
 from pathlib import Path
+import jax
+import jax.numpy as jnp
 import numpy as np
 from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import lookup_volume_mixing_ratio
@@ -52,6 +54,50 @@ class LookupVolumeMixingRatioTest(unittest.TestCase):
         lookup_vmr.global_means['n2o'], 3.2698801e-7, delta=1e-12
     )
     self.assertEqual(lookup_vmr.global_means['co'], 1.2e-7)
+
+  def test_sounding_held_at_its_end_values_outside_its_range(self):
+    """Beyond the sounding the profile is clamped, not mirrored (#39).
+
+    The sounding spans 10 Pa to 1032.5 hPa. A model top at 1 Pa used to get
+    the mixing ratio of 100 Pa (the sounding reflected about its top); it now
+    gets the value at 10 Pa, the `np.interp` convention.
+    """
+    atmospheric_state_cfg = radiative_transfer.AtmosphericStateCfg(
+        vmr_global_mean_filepath=_GLOBAL_MEANS_FILEPATH,
+        vmr_sounding_filepath=_SOUNDING_CSV_FILEPATH,
+    )
+    lookup_vmr = lookup_volume_mixing_ratio.from_config(atmospheric_state_cfg)
+    p_ref = np.asarray(lookup_vmr.profiles['p_ref'], np.float64)
+    pressure = jnp.array([1.0, 5.0, 10.0, 523.0, 5.0e4, 103250.0, 1.2e5])
+    fields = lookup_volume_mixing_ratio.reconstruct_vmr_fields_from_pressure(
+        lookup_vmr, pressure
+    )
+    self.assertTrue(fields)
+    for gas, field in fields.items():
+      if gas == 'o3' and lookup_volume_mixing_ratio._USE_RCEMIP_OZONE_PROFILE.value:
+        continue  # Analytic profile, not the sounding.
+      profile = np.asarray(lookup_vmr.profiles[gas], np.float64)
+      field = np.asarray(field, np.float64)
+      # Outside (and at) the ends: exactly the end values.
+      np.testing.assert_allclose(field[:3], profile[0], rtol=1e-6, err_msg=gas)
+      np.testing.assert_allclose(field[-2:], profile[-1], rtol=1e-6, err_msg=gas)
+      # Inside: linear in log-pressure. The helper assumes the sounding's
+      # levels are evenly spaced in log-pressure, which this file's are only to
+      # about 1e-4, hence the looser tolerance.
+      expected = np.interp(np.log(pressure), np.log(p_ref), profile)
+      np.testing.assert_allclose(field, expected, rtol=1e-3, err_msg=gas)
+
+      # Zero derivative beyond either end, finite everywhere.
+      grad = jax.vmap(
+          jax.grad(
+              lambda p, gas=gas:
+              lookup_volume_mixing_ratio.reconstruct_vmr_fields_from_pressure(
+                  lookup_vmr, p[None]
+              )[gas][0]
+          )
+      )(pressure)
+      self.assertTrue(np.all(np.isfinite(grad)), gas)
+      np.testing.assert_array_equal(np.asarray(grad)[[0, 1, -1]], 0.0)
 
 
 if __name__ == '__main__':

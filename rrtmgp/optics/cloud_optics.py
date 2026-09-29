@@ -81,9 +81,14 @@ def compute_optical_properties(
     'g': The combined asymmetry factor contribution from condensates.
   """
   # Convert effective radius from meter to microns to conform to the lookup
-  # tables. Default to the lower bound to prevent an out-of-range error when
-  # interpolating. These default values will later be eliminated by the cloud
-  # mask constructed below.
+  # tables. The size is clamped to the table range, so a particle size outside
+  # the table gets the optical properties of the nearest end of it: RRTMGP
+  # rejects such sizes outright (`check_values` in
+  # `mo_cloud_optics_rrtmgp.F90`), which a jitted function cannot do, and
+  # extrapolating the Mie tables could push the single-scattering albedo or
+  # asymmetry factor outside [0, 1]. The clamp also gives the cloud-free cells,
+  # whose radius is typically zero, a valid size; their contribution is
+  # eliminated by the cloud mask constructed below.
   # Using the name `size` because the lookup tables for RRTMGP use radius for
   # cloud liquid and diameter for cloud ice.
   particle_size = [

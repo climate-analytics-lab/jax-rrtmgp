@@ -108,8 +108,13 @@ def _vmr_interpolant_fn(
   """Create a volume mixing ratio interpolant for the given profile."""
 
   def interpolant_fn(p: Array) -> Array:
+    # Beyond the sounding the profile is held at its end value (the
+    # `np.interp` convention) rather than extrapolated. The sounding is input
+    # data, not an RRTMGP table, so there is no reference rule to follow, and
+    # extending the end segment's log-pressure slope far enough (for ozone, a
+    # model top well above the sounding top) drives the mixing ratio negative.
     interp = optics_utils.create_linear_interpolant(
-        jnp.log(p), jnp.log(p_for_interp)
+        jnp.log(p), jnp.log(p_for_interp), out_of_range=optics_utils.CLAMP
     )
     return optics_utils.interpolate(
         vmr_profile, collections.OrderedDict({'p': lambda: interp})

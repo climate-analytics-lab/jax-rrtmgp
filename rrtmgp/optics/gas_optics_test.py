@@ -386,5 +386,184 @@ class GasOpticsTest(unittest.TestCase):
         planck_src_fn(temperature_top), [[1.008423]], rtol=1e-5, atol=0
     )
 
+  def test_major_optical_depth_extrapolates_below_the_temperature_table(self):
+    """Below 160 K the absorption coefficient continues the end interval.
+
+    Every axis but temperature is held fixed, and 145, 160 and 175 K all use
+    the first temperature interval (the eta axis's temperature dependence goes
+    through the same two corners), so the optical depth is exactly linear in
+    temperature across them. The mirrored lookup of issue #39 returned the
+    175 K value at 145 K instead.
+    """
+    temperature = jnp.array([[145.0, 160.0, 175.0]], dtype=jnp.float_)
+    pressure = jnp.full((1, 3), 8000.0, dtype=jnp.float_)
+    molecules = jnp.array([[1e24]], dtype=jnp.float_)
+    for igpt in (10, 70, 200):
+      tau = np.asarray(
+          gas_optics.compute_major_optical_depth(
+              self.gas_optics_lw, self.vmr_lib, molecules, temperature,
+              pressure, igpt,
+          ),
+          np.float64,
+      )[0]
+      np.testing.assert_allclose(
+          tau[0], max(2 * tau[1] - tau[2], 0.0), rtol=1e-4,
+          atol=1e-6 * tau.max(), err_msg=str(igpt),
+      )
+
+  def test_optical_depths_non_negative_and_finite_far_outside_the_tables(self):
+    """Extrapolation is floored: no negative absorption, no NaN, finite grads.
+
+    The temperatures and pressures span well beyond RRTMGP's tables
+    (160-355 K, 1.005 Pa - 1096 hPa) on both sides.
+    """
+    temperature = jnp.array(
+        [[40.0, 100.0, 150.0, 400.0, 500.0]], dtype=jnp.float_
+    )
+    pressure = jnp.array(
+        [[0.01, 0.5, 5e3, 1.2e5, 2e5]], dtype=jnp.float_
+    )
+    molecules = jnp.array([[1e24]], dtype=jnp.float_)
+    lw, sw = self.gas_optics_lw, self.gas_optics_sw
+
+    def taus(t):
+      return {
+          'major': gas_optics.compute_major_optical_depth(
+              lw, self.vmr_lib, molecules, t, pressure, 70),
+          'minor': gas_optics.compute_minor_optical_depth(
+              lw, self.vmr_lib, molecules, t, pressure, 70),
+          'rayleigh': gas_optics.compute_rayleigh_optical_depth(
+              sw, self.vmr_lib, molecules, t, pressure, 50),
+          'planck_fraction': gas_optics.compute_planck_fraction(
+              lw, self.vmr_lib, pressure, t, 70),
+      }
+
+    for name, tau in taus(temperature).items():
+      self.assertTrue(np.all(np.isfinite(tau)), name)
+      self.assertTrue(np.all(np.asarray(tau) >= 0), name)
+    grads = jax.grad(
+        lambda t: sum(jnp.sum(v) for v in taus(t).values())
+    )(temperature)
+    self.assertTrue(np.all(np.isfinite(grads)))
+
+  def test_planck_source_outside_the_temperature_table(self):
+    """The band Planck source continues its end interval, floored at zero.
+
+    This is RRTMG's `planckFunction` (ECHAM6 `mo_lrtm_driver.f90`): index
+    limited to the table, signed fraction. Above the table the source keeps
+    rising along the last interval; below it the first interval's line is
+    followed until it reaches zero. The source is monotone in temperature
+    throughout, so a colder layer never emits more (issue #39).
+    """
+    lw = self.gas_optics_lw
+    igpt = 100
+    ibnd = int(lw.g_point_to_bnd[igpt])
+    table = np.asarray(lw.totplnk[ibnd], np.float64)
+    t_min, t_max = float(lw.t_planck[0]), float(lw.t_planck[-1])
+    dt = float(lw.t_planck[1] - lw.t_planck[0])
+
+    def src(t):
+      return gas_optics.compute_planck_sources(
+          lw, jnp.ones_like(t), t, igpt
+      )
+
+    temps = jnp.arange(60.0, 450.0, 0.5, dtype=jnp.float_)
+    values = np.asarray(src(temps), np.float64)
+    self.assertTrue(np.all(np.isfinite(values)))
+    self.assertTrue(np.all(values >= 0))
+    self.assertTrue(np.all(np.diff(values) >= 0))
+
+    below = np.array([t_min - 0.5, t_min - 3.0])
+    expected_below = np.maximum(
+        table[0] + (below - t_min) / dt * (table[1] - table[0]), 0.0
+    )
+    above = np.array([t_max + 0.5, t_max + 20.0])
+    expected_above = table[-1] + (above - t_max) / dt * (table[-1] - table[-2])
+    np.testing.assert_allclose(
+        src(jnp.asarray(below, jnp.float_)), expected_below, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        src(jnp.asarray(above, jnp.float_)), expected_above, rtol=1e-5
+    )
+
+    # The derivative is the end interval's slope just outside the table and
+    # zero once the source has been floored.
+    grad = jax.vmap(jax.grad(lambda t: src(t[None])[0]))
+    slopes = np.asarray(
+        grad(jnp.array([t_min - 0.5, t_max + 5.0, 20.0], dtype=jnp.float_))
+    )
+    np.testing.assert_allclose(
+        slopes[:2],
+        [(table[1] - table[0]) / dt, (table[-1] - table[-2]) / dt],
+        rtol=1e-4,
+    )
+    self.assertEqual(slopes[2], 0.0)
+
+  def test_planck_fractions_partition_the_band_outside_the_tables(self):
+    """The fractions of a band stay non-negative and keep their band sum.
+
+    Planck fractions partition a band's Planck source among its g-points, so
+    their band sum is what conserves the band's emitted energy. Outside the
+    temperature and pressure tables they are clamped (see
+    `compute_planck_fraction`): every fraction is non-negative and each band
+    sums to exactly what it sums to at the nearest in-table state, which is
+    the table's own band sum (1 to ~2e-4). Extrapolating and flooring them
+    element-wise instead inflated band 10's sum by 8% (g128) / 15% (g256) at
+    40 K. Checked for every band of both shipped k-distributions.
+    """
+    temps = np.concatenate([
+        np.arange(40.0, 161.0, 5.0), [165.0, 300.0, 355.0, 370.0, 450.0]
+    ])
+    # Surface-like, mid-troposphere, stratosphere, the upper-atmosphere corner
+    # where extrapolation went most negative (~3.3 Pa), and beyond both ends.
+    pressures = np.array([1.2e5, 5.0e4, 100.0, 3.34, 1.005, 0.3])
+    t_grid, p_grid = np.meshgrid(temps, pressures, indexing='ij')
+    t_clamped = np.clip(t_grid, 160.0, 355.0)
+    p_clamped = np.clip(p_grid, 1.00518357, 1.09663316e5)
+    shape = t_grid.shape
+
+    for path in (_LW_LOOKUP_TABLE_FILEPATH,
+                 root / 'rrtmgp/optics/rrtmgp_data/rrtmgp-gas-lw-g128.nc'):
+      lw = lookup_gas_optics_longwave.from_nc_file(path)
+      vmr_fields = {
+          lw.idx_h2o: jnp.full(shape, 4e-6, dtype=jnp.float_),
+          lw.idx_o3: jnp.full(shape, 2e-6, dtype=jnp.float_),
+      }
+
+      @jax.jit
+      def fractions(t, p, lw=lw, vmr_fields=vmr_fields):
+        return jax.vmap(
+            lambda g: gas_optics.compute_planck_fraction(
+                lw, self.vmr_lib, p, t, g, vmr_fields
+            )
+        )(jnp.arange(lw.n_gpt))
+
+      pf = np.asarray(
+          fractions(jnp.asarray(t_grid, jnp.float_),
+                    jnp.asarray(p_grid, jnp.float_)), np.float64)
+      pf_edge = np.asarray(
+          fractions(jnp.asarray(t_clamped, jnp.float_),
+                    jnp.asarray(p_clamped, jnp.float_)), np.float64)
+      self.assertTrue(np.all(np.isfinite(pf)), str(path))
+      self.assertTrue(np.all(pf >= 0), str(path))
+      for b, (g0, g1) in enumerate(np.asarray(lw.bnd_lims_gpt)):
+        band_sum = pf[g0:g1 + 1].sum(axis=0)
+        np.testing.assert_allclose(
+            band_sum, pf_edge[g0:g1 + 1].sum(axis=0), rtol=1e-5,
+            err_msg=f'{path} band {b}',
+        )
+        np.testing.assert_allclose(
+            band_sum, 1.0, atol=5e-4, err_msg=f'{path} band {b}'
+        )
+
+      # Gradients: finite everywhere, zero in temperature outside the table.
+      grad_t, grad_p = jax.grad(
+          lambda t, p: jnp.sum(fractions(t, p)), argnums=(0, 1)
+      )(jnp.asarray(t_grid, jnp.float_), jnp.asarray(p_grid, jnp.float_))
+      self.assertTrue(np.all(np.isfinite(grad_t)), str(path))
+      self.assertTrue(np.all(np.isfinite(grad_p)), str(path))
+      outside = (t_grid < 160.0) | (t_grid > 355.0)
+      np.testing.assert_array_equal(np.asarray(grad_t)[outside], 0.0)
+
 if __name__ == '__main__':
   unittest.main()
