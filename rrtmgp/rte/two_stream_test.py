@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 from typing import TypeAlias
 
@@ -288,6 +289,98 @@ class TestTwoStream(unittest.TestCase):
     np.testing.assert_allclose(
         flux_down, expected_flux_down_direct_sfc, rtol=1e-5, atol=0
     )
+
+  def test_gray_atmosphere_direct_and_diffuse_surface_albedo(self):
+    """A non-scattering atmosphere delivers only direct light to the surface.
+
+    The gray shortwave optics absorb and never scatter, so the whole surface
+    downward flux is the attenuated direct beam, the surface reflects it with
+    the direct albedo alone, and the diffuse albedo has nothing to act on.
+    """
+    zenith = np.deg2rad(52.95)
+    irrad = 1407.679
+    sfc_alb = 0.1
+    halo_width = 1
+    radiation_params = radiative_transfer.RadiativeTransfer(
+        optics=radiative_transfer.OpticsParameters(
+            optics=radiative_transfer.GrayAtmosphereOptics(
+                p0=100_000, d0_lw=5.35, d0_sw=0.22
+            )
+        ),
+        atmospheric_state_cfg=radiative_transfer.AtmosphericStateCfg(
+            sfc_alb=sfc_alb, zenith=zenith, irrad=irrad
+        ),
+    )
+    temperature, pressure = _setup_atmospheric_profiles(
+        radiation_params.optics.optics, 9000, 200.0, 64
+    )
+    convert_to_3d = functools.partial(
+        test_util.convert_to_3d_array_and_tile, dim=2, num_repeats=2
+    )
+    temperature = convert_to_3d(temperature)
+    pressure = convert_to_3d(pressure)
+    molecules = jnp.zeros_like(pressure)
+    atmos_state = atmospheric_state.from_config(
+        radiation_params.atmospheric_state_cfg
+    )
+    optics_lib = optics.optics_factory(radiation_params.optics, atmos_state.vmr)
+
+    def solve(atmos_state=atmos_state, **kwargs):
+      return two_stream.solve_sw(
+          pressure, temperature, molecules, optics_lib, atmos_state, **kwargs
+      )
+
+    default = solve()
+    matching = solve(sfc_alb_dir=sfc_alb, sfc_alb_dif=sfc_alb)
+    for key in ('flux_up', 'flux_down', 'flux_net', 'flux_down_dir_sfc'):
+      np.testing.assert_array_equal(matching[key], default[key], err_msg=key)
+
+    tau = optics_lib.compute_sw_optical_properties(
+        pressure, temperature, molecules, 0
+    )['optical_depth']
+    tau_tot = jnp.sum(_remove_halos(tau), axis=2) / np.cos(zenith)
+    expected_direct = irrad * np.cos(zenith) * np.exp(-tau_tot)
+
+    a_dir, a_dif = 0.3, 0.9
+    fluxes = solve(sfc_alb_dir=a_dir, sfc_alb_dif=a_dif)
+    direct = fluxes['flux_down_dir_sfc']
+    np.testing.assert_allclose(direct, expected_direct, rtol=1e-5, atol=0)
+    np.testing.assert_allclose(
+        fluxes['flux_down'][:, :, halo_width], direct, rtol=1e-6, atol=0
+    )
+    np.testing.assert_allclose(
+        fluxes['flux_up'][:, :, halo_width], a_dir * direct, rtol=1e-6, atol=0
+    )
+    # With nothing diffuse at the surface the diffuse albedo is inert.
+    other_dif = solve(sfc_alb_dir=a_dir, sfc_alb_dif=0.0)
+    for key in ('flux_up', 'flux_down', 'flux_down_dir_sfc'):
+      np.testing.assert_allclose(
+          other_dif[key], fluxes[key], rtol=1e-6, atol=1e-6, err_msg=key
+      )
+
+    # A transparent atmosphere lets the full beam reach the surface.
+    transparent = dataclasses.replace(
+        radiation_params,
+        optics=radiative_transfer.OpticsParameters(
+            optics=radiative_transfer.GrayAtmosphereOptics(
+                p0=100_000, d0_lw=5.35, d0_sw=0.0
+            )
+        ),
+    )
+    optics_lib = optics.optics_factory(transparent.optics, atmos_state.vmr)
+    fluxes = solve(sfc_alb_dir=a_dir, sfc_alb_dif=a_dif)
+    np.testing.assert_allclose(
+        fluxes['flux_down_dir_sfc'], irrad * np.cos(zenith), rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        fluxes['flux_down'][:, :, halo_width], fluxes['flux_down_dir_sfc'],
+        rtol=1e-6,
+    )
+
+    # And no sun, no beam.
+    night = dataclasses.replace(atmos_state, zenith=0.6 * np.pi)
+    fluxes = solve(atmos_state=night, sfc_alb_dir=a_dir, sfc_alb_dif=a_dif)
+    np.testing.assert_array_equal(fluxes['flux_down_dir_sfc'], 0.0)
 
   def test_compute_heating_rate(self):
     """Check the heating rate as derived from fluxes and the pressure field."""

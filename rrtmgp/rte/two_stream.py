@@ -428,6 +428,56 @@ def solve_lw(
   )
 
 
+def _sw_sfc_albedo_by_band(
+    albedo: Array | float,
+    plane: tuple[int, ...],
+    optics_lib: optics_base.OpticsScheme,
+    name: str,
+) -> Array | None:
+  """Resolve a shortwave surface albedo into a per-band table, if it is one.
+
+  A per-column albedo -- anything that broadcasts against the `[nx, ny]`
+  surface plane, as `sfc_alb` always has -- returns `None` and is broadcast
+  inside the g-point loop exactly as `sfc_alb` is. Otherwise the albedo must
+  carry a trailing band axis, `(..., n_bnd_sw)` with the leading axes
+  broadcastable against the plane, and is returned as a `[n_bnd_sw, nx, ny]`
+  table so the g-point loop takes its band with a single gather along the
+  leading axis. A rank-3 array never broadcasts against the plane, so
+  `(nx, ny, n_bnd_sw)` is always read as per band. A `(n_bnd_sw,)` vector is
+  one spectrum for every column (for instance a single column's albedos under
+  a column `vmap`), except on a plane whose last extent happens to be
+  `n_bnd_sw`, where it broadcasts and is therefore read as per column.
+  """
+  shape = tuple(np.shape(albedo))
+  try:
+    if np.broadcast_shapes(shape, plane) == plane:
+      return None
+  except ValueError:
+    pass
+  if not isinstance(optics_lib, optics.RRTMOptics):
+    raise ValueError(
+        f'A per-band {name} requires the RRTMOptics scheme (needs the'
+        ' g_point_to_bnd mapping).'
+    )
+  n_bnd = optics_lib.gas_optics_sw.n_bnd
+  try:
+    band_leading_ok = (
+        len(shape) >= 1
+        and shape[-1] == n_bnd
+        and np.broadcast_shapes(shape[:-1], plane) == plane
+    )
+  except ValueError:
+    band_leading_ok = False
+  if not band_leading_ok:
+    raise ValueError(
+        f'{name} has shape {shape}, which is neither broadcastable against the'
+        f' surface plane {plane} nor per band with a trailing axis of'
+        f' n_bnd_sw = {n_bnd} entries, (..., {n_bnd}).'
+    )
+  by_band = jnp.broadcast_to(jnp.asarray(albedo), plane + (n_bnd,))
+  return jnp.moveaxis(by_band, -1, 0)
+
+
 def solve_sw(
     pressure: Array,
     temperature: Array,
@@ -446,6 +496,8 @@ def solve_sw(
     gpt_chunk: int = DEFAULT_GPT_CHUNK,
     cloud_tau_scale_liq: Array | float | None = None,
     cloud_tau_scale_ice: Array | float | None = None,
+    sfc_alb_dir: Array | float | None = None,
+    sfc_alb_dif: Array | float | None = None,
 ) -> dict[str, Array]:
   """Solves the two-stream radiative transfer equation for shortwave.
 
@@ -500,12 +552,28 @@ def solve_sw(
       cloud paths too. Has no effect in the gray atmosphere, which has no cloud
       optics.
     cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
+    sfc_alb_dir: Optional surface albedo for the direct solar beam. Either a
+      per-column field, broadcastable against the `[nx, ny]` surface plane
+      like `atmos_state.sfc_alb`, or a per-band one with a trailing axis of
+      `n_bnd_sw` entries, `(..., n_bnd_sw)`, e.g. `[nx, ny, n_bnd_sw]` or
+      `[n_bnd_sw]` (one spectrum for every column, e.g. a single column under
+      a column `vmap`); each g-point uses its band's value. An array that broadcasts against the plane is read as
+      per column, so a rank-3 array is the unambiguous per-band form. When
+      omitted, `atmos_state.sfc_alb` is used. A per-band albedo requires the
+      `RRTMOptics` scheme.
+    sfc_alb_dif: Same as above, for diffuse light (the surface reflection of
+      the downwelling diffuse flux).
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
       `flux_up`: The upwelling shortwave radiative flux at cell face i - 1/2.
       `flux_down`: The downwelling shortwave radiative flux at face i - 1/2.
+        This is the total, direct beam plus diffuse.
       `flux_net`: The net shortwave radiative flux at face i - 1/2.
+      `flux_down_dir_sfc`: The direct-beam downwelling flux incident on the
+        surface, a `[nx, ny]` field. It is the part of the surface value of
+        `flux_down` (`flux_down[:, :, 1]`) that arrives unscattered, so the
+        diffuse part is their difference.
   """
   zenith = atmos_state.zenith
   optics_lib = cast(optics.RRTMOptics | optics.GrayAtmosphereOptics, optics_lib)
@@ -519,6 +587,24 @@ def solve_sw(
         'aerosol_optics requires the RRTMOptics scheme (needs per-band'
         ' g_point_to_bnd mapping).'
     )
+    g_point_to_bnd_sw = optics_lib.gas_optics_sw.g_point_to_bnd
+
+  # Surface albedos. Each of the direct and diffuse albedos is either per
+  # column, broadcast inside the g-point loop as `sfc_alb` always has been, or
+  # a per-band table resolved here, outside the loop, into a `[n_bnd_sw, nx,
+  # ny]` layout, so the only per-g-point work it adds is one gather of the
+  # g-point's band.
+  plane = tuple(temperature.shape[:2])
+  alb_dir_by_band = alb_dif_by_band = None
+  if sfc_alb_dir is not None:
+    alb_dir_by_band = _sw_sfc_albedo_by_band(
+        sfc_alb_dir, plane, optics_lib, 'sfc_alb_dir'
+    )
+  if sfc_alb_dif is not None:
+    alb_dif_by_band = _sw_sfc_albedo_by_band(
+        sfc_alb_dif, plane, optics_lib, 'sfc_alb_dif'
+    )
+  if alb_dir_by_band is not None or alb_dif_by_band is not None:
     g_point_to_bnd_sw = optics_lib.gas_optics_sw.g_point_to_bnd
 
   # Sun-at-or-below-horizon handling. This used to be a `jax.lax.cond` that
@@ -578,8 +664,19 @@ def solve_sw(
     )
 
     # Create an xy plane for the surface albedo and top-of-atmospehre flux, but
-    # keep the same horizontal sharding as the temperature.
+    # keep the same horizontal sharding as the temperature. Without a separate
+    # direct or diffuse albedo both are this one plane, as they always were.
     sfc_albedo = atmos_state.sfc_alb * jnp.ones_like(temperature)[:, :, 0]
+
+    def resolve_albedo(albedo, by_band):
+      if albedo is None:
+        return sfc_albedo
+      if by_band is not None:
+        return by_band[g_point_to_bnd_sw[igpt]]
+      return albedo * jnp.ones_like(temperature)[:, :, 0]
+
+    sfc_albedo_dir = resolve_albedo(sfc_alb_dir, alb_dir_by_band)
+    sfc_albedo_dif = resolve_albedo(sfc_alb_dif, alb_dif_by_band)
 
     # Monochromatic top of atmosphere flux.
     solar_flux = atmos_state.irrad * optics_lib.solar_fraction_by_gpt[igpt]
@@ -590,7 +687,7 @@ def solve_sw(
         r_dir=optical_props_2stream['r_dir'],
         optical_depth=sw_optical_props['optical_depth'],
         toa_flux=toa_flux,
-        sfc_albedo_direct=sfc_albedo,
+        sfc_albedo_direct=sfc_albedo_dir,
         zenith=safe_zenith,
         use_scan=use_scan,
     )
@@ -601,14 +698,22 @@ def solve_sw(
         src_up=sources_2stream['src_up'],
         src_down=sources_2stream['src_down'],
         sfc_src=sources_2stream['sfc_src'],
-        sfc_albedo=sfc_albedo,
+        sfc_albedo=sfc_albedo_dif,
         flux_down_dir=sources_2stream['flux_down_dir'],
         use_scan=use_scan,
     )
+    # The direct beam reaching the surface, for the host model's direct /
+    # diffuse partition of the surface flux. Only the surface plane is kept,
+    # so the spectral sum carries one extra 2D field rather than a 3D one.
+    halo_width = 1
+    sw_fluxes['flux_down_dir_sfc'] = sources_2stream['flux_down_dir'][
+        :, :, halo_width
+    ]
     return sw_fluxes
 
   flux_keys = ['flux_up', 'flux_down', 'flux_net']
   fluxes_0 = {key: jnp.zeros_like(temperature) for key in flux_keys}
+  fluxes_0['flux_down_dir_sfc'] = jnp.zeros_like(temperature)[:, :, 0]
 
   # As in `solve_lw`, the top halo face is the top of the atmosphere and the
   # solver already produces the correct value there, so it is left untouched.

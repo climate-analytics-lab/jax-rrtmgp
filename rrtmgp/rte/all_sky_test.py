@@ -1005,5 +1005,236 @@ class CloudTauScaleTest(unittest.TestCase):
       np.testing.assert_array_equal(grad[path == 0], 0.0)
 
 
+class SurfaceAlbedoTest(unittest.TestCase):
+  """Separate direct / diffuse and per-band surface albedos (issue #38).
+
+  The two-stream solver already treats the two separately: the direct beam
+  reaching the surface is reflected with the direct albedo into the diffuse
+  source (`sw_cell_source`), and the diffuse downwelling flux is reflected with
+  the diffuse albedo (`sw_transport`). At the surface face that gives the exact
+  identity
+
+    flux_up = a_dir * F_dir + a_dif * (flux_down - F_dir),
+
+  with `F_dir` the direct beam incident on the surface, which several tests
+  below lean on.
+  """
+
+  _fixture = None
+  _hw = 1  # Surface face of the flux fields.
+
+  def setUp(self):
+    super().setUp()
+    if SurfaceAlbedoTest._fixture is None:
+      SurfaceAlbedoTest._fixture = _compact_cloudy_setup()
+    (self.optics_lib, self.atmos_state, self.p, self.temperature,
+     self.molecules, self.vmr_fields, _, self.cloud) = SurfaceAlbedoTest._fixture
+    self.n_bnd = self.optics_lib.gas_optics_sw.n_bnd
+    self.plane = tuple(self.temperature.shape[:2])
+
+  def tearDown(self):
+    # Each eager solve compiles and caches its own executable, tens of MB
+    # apiece, and the whole suite runs in one process. Drop them so this
+    # class does not add its solves to the suite's peak memory.
+    jax.clear_caches()
+    super().tearDown()
+
+  def _solve(self, cloudy=False, **kwargs):
+    cloud = self.cloud if cloudy else {}
+    return two_stream.solve_sw(
+        self.p, self.temperature, self.molecules, self.optics_lib,
+        self.atmos_state, self.vmr_fields, **cloud, **kwargs
+    )
+
+  def _surface(self, fluxes):
+    hw = self._hw
+    return (np.asarray(fluxes['flux_up'][:, :, hw]),
+            np.asarray(fluxes['flux_down'][:, :, hw]),
+            np.asarray(fluxes['flux_down_dir_sfc']))
+
+  def test_omitted_or_matching_albedos_are_bit_for_bit(self):
+    sfc_alb = self.atmos_state.sfc_alb
+    default = self._solve(cloudy=True)
+    matching = {
+        'scalar': dict(sfc_alb_dir=sfc_alb, sfc_alb_dif=sfc_alb),
+        'direct only': dict(sfc_alb_dir=sfc_alb),
+        'per column': dict(
+            sfc_alb_dir=jnp.full(self.plane, sfc_alb, jnp.float_),
+            sfc_alb_dif=jnp.full(self.plane, sfc_alb, jnp.float_),
+        ),
+        'per band': dict(
+            sfc_alb_dir=jnp.full(self.plane + (self.n_bnd,), sfc_alb,
+                                 jnp.float_),
+            sfc_alb_dif=jnp.full((self.n_bnd,), sfc_alb, jnp.float_)[
+                None, None, :],
+        ),
+    }
+    for name, kwargs in matching.items():
+      got = self._solve(cloudy=True, **kwargs)
+      for key in ('flux_up', 'flux_down', 'flux_net', 'flux_down_dir_sfc'):
+        np.testing.assert_array_equal(
+            np.asarray(got[key]), np.asarray(default[key]),
+            err_msg=f'{name}: {key}',
+        )
+
+  @parameterized.expand([('clear', False), ('cloudy', True)])
+  def test_surface_fluxes_partition_into_direct_and_diffuse(self, _, cloudy):
+    a_dir, a_dif = 0.35, 0.08
+    fluxes = self._solve(cloudy=cloudy, sfc_alb_dir=a_dir, sfc_alb_dif=a_dif)
+    up, down, direct = self._surface(fluxes)
+    self.assertTrue(np.all(direct >= 0.0))
+    self.assertTrue(np.all(direct <= down))
+    np.testing.assert_allclose(
+        up, a_dir * direct + a_dif * (down - direct), rtol=1e-5, atol=1e-4
+    )
+    # The direct beam never sees the surface on its way down, so it does not
+    # depend on either albedo.
+    np.testing.assert_array_equal(
+        direct, np.asarray(self._solve(cloudy=cloudy)['flux_down_dir_sfc'])
+    )
+    if not cloudy:
+      # A clear sky lets a large share of the sun through unscattered.
+      self.assertTrue(np.all(direct > 0.5 * down))
+
+  def test_direct_albedo_is_irrelevant_without_a_direct_beam(self):
+    """Under an opaque cloud all surface light is diffuse."""
+    cloud = dict(self.cloud)
+    cloud['cloud_path_liq'] = 20.0 * cloud['cloud_path_liq']
+    base = two_stream.solve_sw(
+        self.p, self.temperature, self.molecules, self.optics_lib,
+        self.atmos_state, self.vmr_fields, **cloud,
+        sfc_alb_dir=0.0, sfc_alb_dif=0.3,
+    )
+    _, down, direct = self._surface(base)
+    self.assertTrue(np.all(down > 1.0))
+    np.testing.assert_allclose(direct, 0.0, atol=1e-6)
+    bright = two_stream.solve_sw(
+        self.p, self.temperature, self.molecules, self.optics_lib,
+        self.atmos_state, self.vmr_fields, **cloud,
+        sfc_alb_dir=1.0, sfc_alb_dif=0.3,
+    )
+    for key in ('flux_up', 'flux_down'):
+      np.testing.assert_allclose(
+          np.asarray(bright[key]), np.asarray(base[key]), rtol=0, atol=1e-5,
+          err_msg=key,
+      )
+
+  def test_per_band_albedo_uses_each_gpoints_band(self):
+    """Band `k`'s albedo acts on band `k`'s light and nothing else.
+
+    An opaque, purely absorbing aerosol in every band but `k` leaves only band
+    `k`'s direct beam at the surface. With a zero diffuse albedo the surface
+    upward flux is then the direct albedo times that beam, so an albedo that is
+    one in band `k` alone must reflect all of it and one that is one in every
+    other band must reflect none. The aerosol takes its band from the same
+    g-point -> band map, which is tested on its own.
+    """
+    g_to_b = np.asarray(self.optics_lib.gas_optics_sw.g_point_to_bnd)
+    solar = np.asarray(self.optics_lib.solar_fraction_by_gpt)
+    band_solar = np.bincount(g_to_b, weights=solar, minlength=self.n_bnd)
+    k = int(np.argmax(band_solar))
+    only_k = np.arange(self.n_bnd) == k
+    shape = (self.n_bnd,) + self.temperature.shape
+    tau = np.where(only_k, 0.0, 50.0).reshape((self.n_bnd, 1, 1, 1))
+    aerosol = {
+        'optical_depth': jnp.asarray(np.broadcast_to(tau, shape), jnp.float_),
+        'ssa': jnp.zeros(shape, jnp.float_),
+        'asymmetry_factor': jnp.zeros(shape, jnp.float_),
+    }
+
+    def surface_up(albedo_by_band):
+      albedo = jnp.broadcast_to(
+          jnp.asarray(albedo_by_band, jnp.float_), self.plane + (self.n_bnd,)
+      )
+      fluxes = self._solve(
+          aerosol_optics=aerosol, sfc_alb_dir=albedo, sfc_alb_dif=0.0
+      )
+      up, _, direct = self._surface(fluxes)
+      return up, direct
+
+    up_k, direct = surface_up(only_k.astype(float))
+    self.assertTrue(np.all(direct > 1.0))
+    np.testing.assert_allclose(up_k, direct, rtol=1e-5)
+    up_others, _ = surface_up((~only_k).astype(float))
+    np.testing.assert_allclose(up_others, 0.0, atol=1e-4)
+
+  def test_per_band_albedo_is_chunk_invariant(self):
+    """The band gather is per g-point, also inside a g-point chunk."""
+    rng = np.random.default_rng(0)
+    alb_dir = jnp.asarray(rng.uniform(0.0, 1.0, self.plane + (self.n_bnd,)),
+                          jnp.float_)
+    alb_dif = jnp.asarray(rng.uniform(0.0, 1.0, (self.n_bnd,)), jnp.float_)[
+        None, None, :]
+    ref = self._solve(cloudy=True, sfc_alb_dir=alb_dir, sfc_alb_dif=alb_dif)
+    got = self._solve(cloudy=True, sfc_alb_dir=alb_dir, sfc_alb_dif=alb_dif,
+                      gpt_chunk=16)
+    for key in ('flux_up', 'flux_down', 'flux_net', 'flux_down_dir_sfc'):
+      np.testing.assert_allclose(
+          np.asarray(got[key]), np.asarray(ref[key]), rtol=1e-5, atol=1e-4,
+          err_msg=key,
+      )
+
+  def test_albedo_gradients_are_finite(self):
+    """Reverse mode w.r.t. per-band albedos, including the 0 and 1 ends."""
+    alb_dir = jnp.linspace(0.0, 1.0, self.n_bnd, dtype=jnp.float_)
+    alb_dir = jnp.broadcast_to(alb_dir, self.plane + (self.n_bnd,))
+    alb_dif = jnp.linspace(1.0, 0.0, self.n_bnd, dtype=jnp.float_)[
+        None, None, :]
+
+    def loss(alb_dir, alb_dif):
+      fluxes = self._solve(
+          cloudy=True, sfc_alb_dir=alb_dir, sfc_alb_dif=alb_dif
+      )
+      return (jnp.sum(fluxes['flux_net'] ** 2)
+              + jnp.sum(fluxes['flux_down_dir_sfc']))
+
+    grads = jax.grad(loss, argnums=(0, 1))(alb_dir, alb_dif)
+    for name, grad in zip(('sfc_alb_dir', 'sfc_alb_dif'), grads):
+      grad = np.asarray(grad)
+      self.assertTrue(np.all(np.isfinite(grad)), msg=f'd/d{name} not finite')
+      self.assertGreater(np.max(np.abs(grad)), 0.0, msg=name)
+
+  def test_night_columns_have_no_direct_flux(self):
+    night = dataclasses.replace(self.atmos_state, zenith=0.6 * np.pi)
+    fluxes = two_stream.solve_sw(
+        self.p, self.temperature, self.molecules, self.optics_lib, night,
+        self.vmr_fields, sfc_alb_dir=0.2, sfc_alb_dif=0.1,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(fluxes['flux_down_dir_sfc']), 0.0
+    )
+
+  def test_albedo_shape_resolution(self):
+    resolve = two_stream._sw_sfc_albedo_by_band  # pylint: disable=protected-access
+    n = self.n_bnd
+    lib = self.optics_lib
+    # Per column: anything that broadcasts against the plane.
+    for shape in ((), (1,), (2,), (2, 2), (1, 2)):
+      self.assertIsNone(resolve(jnp.zeros(shape), (2, 2), lib, 'a'), shape)
+    # Per band, laid out band-major for the gather.
+    by_band = resolve(
+        jnp.arange(n, dtype=jnp.float_)[None, None, :] * jnp.ones((2, 2, 1)),
+        (2, 2), lib, 'a',
+    )
+    self.assertEqual(by_band.shape, (n, 2, 2))
+    np.testing.assert_array_equal(by_band[:, 1, 0], np.arange(n))
+    # A band vector that cannot be per column is one spectrum for every
+    # column; on a single-column plane that is the column-`vmap` case.
+    for plane in ((1, 1), (2, 2)):
+      self.assertEqual(
+          resolve(jnp.zeros((n,)), plane, lib, 'a').shape, (n,) + plane
+      )
+    for shape in ((3,), (2, 2, n + 1), (3, 2, n), (2, 2, n, 1)):
+      with self.assertRaises(ValueError, msg=f'{shape}'):
+        resolve(jnp.zeros(shape), (2, 2), lib, 'a')
+    gray = optics.GrayAtmosphereOptics(
+        radiative_transfer.OpticsParameters(
+            optics=radiative_transfer.GrayAtmosphereOptics()
+        )
+    )
+    with self.assertRaises(ValueError):
+      resolve(jnp.zeros((2, 2, n)), (2, 2), gray, 'a')
+
+
 if __name__ == '__main__':
   unittest.main()
