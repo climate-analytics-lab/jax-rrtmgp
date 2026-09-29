@@ -189,6 +189,59 @@ def _air_molecules_per_area(p_bottom: Array, vmr_h2o: Array) -> Array:
   return -(dp / constants.G) * constants.AVOGADRO / mol_m_air
 
 
+def _compact_cloudy_setup(n_horiz: int = 2):
+  """Cloudy single-profile column batch with the compact lookup tables."""
+  site = 0
+  (
+      pressure_allsites,
+      pressure_level_allsites,
+      temperature_allsites,
+      temperature_level_allsites,
+      vmr_profiles_allsites,
+      _,
+  ) = _setup_atmospheric_profiles()
+  # Compact tables (g128 / g112) keep compile time down; they have the same
+  # band/g-point structure as the full ones.
+  radiation_params = _setup_radiation_params(use_compact_lookup=True)
+  atmos_state = atmospheric_state.from_config(
+      radiation_params.atmospheric_state_cfg
+  )
+  optics_lib = optics.optics_factory(radiation_params.optics, atmos_state.vmr)
+
+  convert_to_3d = functools.partial(
+      test_util.convert_to_3d_array_and_tile, dim=2, num_repeats=n_horiz
+  )
+  sfc_temperature = temperature_level_allsites[site, 1] * jnp.ones(
+      (n_horiz, n_horiz), dtype=jnp.float_
+  )
+  vmr_fields = {
+      k: convert_to_3d(v[site, :]) for k, v in vmr_profiles_allsites.items()
+  }
+  p = convert_to_3d(pressure_allsites[site, :])
+  pressure_level = convert_to_3d(pressure_level_allsites[site, :])
+  temperature = convert_to_3d(temperature_allsites[site, :])
+  molecules = _air_molecules_per_area(pressure_level, vmr_fields['h2o'])
+
+  ones = jnp.ones_like(p)
+  in_cloud = jnp.logical_and(p > 10000, p < 90000)
+  cloud = {
+      'cloud_r_eff_liq': jnp.where(
+          jnp.logical_and(in_cloud, temperature > 263), 1.2e-5 * ones, 0.0
+      ),
+      'cloud_path_liq': jnp.where(
+          jnp.logical_and(in_cloud, temperature > 263), 1e-2 * ones, 0.0
+      ),
+      'cloud_r_eff_ice': jnp.where(
+          jnp.logical_and(in_cloud, temperature < 273), 4.75e-5 * ones, 0.0
+      ),
+      'cloud_path_ice': jnp.where(
+          jnp.logical_and(in_cloud, temperature < 273), 1e-2 * ones, 0.0
+      ),
+  }
+  return (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+          sfc_temperature, cloud)
+
+
 class AllSkyTest(unittest.TestCase):
 
   @parameterized.expand([
@@ -555,56 +608,7 @@ class GPointChunkingTest(unittest.TestCase):
   """
 
   def _setup(self, n_horiz=2):
-    """Cloudy single-profile column batch with the compact lookup tables."""
-    site = 0
-    (
-        pressure_allsites,
-        pressure_level_allsites,
-        temperature_allsites,
-        temperature_level_allsites,
-        vmr_profiles_allsites,
-        _,
-    ) = _setup_atmospheric_profiles()
-    # Compact tables (g128 / g112) keep compile time down; they have the same
-    # band/g-point structure as the full ones.
-    radiation_params = _setup_radiation_params(use_compact_lookup=True)
-    atmos_state = atmospheric_state.from_config(
-        radiation_params.atmospheric_state_cfg
-    )
-    optics_lib = optics.optics_factory(radiation_params.optics, atmos_state.vmr)
-
-    convert_to_3d = functools.partial(
-        test_util.convert_to_3d_array_and_tile, dim=2, num_repeats=n_horiz
-    )
-    sfc_temperature = temperature_level_allsites[site, 1] * jnp.ones(
-        (n_horiz, n_horiz), dtype=jnp.float_
-    )
-    vmr_fields = {
-        k: convert_to_3d(v[site, :]) for k, v in vmr_profiles_allsites.items()
-    }
-    p = convert_to_3d(pressure_allsites[site, :])
-    pressure_level = convert_to_3d(pressure_level_allsites[site, :])
-    temperature = convert_to_3d(temperature_allsites[site, :])
-    molecules = _air_molecules_per_area(pressure_level, vmr_fields['h2o'])
-
-    ones = jnp.ones_like(p)
-    in_cloud = jnp.logical_and(p > 10000, p < 90000)
-    cloud = {
-        'cloud_r_eff_liq': jnp.where(
-            jnp.logical_and(in_cloud, temperature > 263), 1.2e-5 * ones, 0.0
-        ),
-        'cloud_path_liq': jnp.where(
-            jnp.logical_and(in_cloud, temperature > 263), 1e-2 * ones, 0.0
-        ),
-        'cloud_r_eff_ice': jnp.where(
-            jnp.logical_and(in_cloud, temperature < 273), 4.75e-5 * ones, 0.0
-        ),
-        'cloud_path_ice': jnp.where(
-            jnp.logical_and(in_cloud, temperature < 273), 1e-2 * ones, 0.0
-        ),
-    }
-    return (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
-            sfc_temperature, cloud)
+    return _compact_cloudy_setup(n_horiz)
 
   def _mcica_and_aerosol(self, optics_lib, band, cloud, shape):
     """McICA sub-columns and a band-dependent aerosol bundle for `band`."""
@@ -889,6 +893,116 @@ class GPointChunkingTest(unittest.TestCase):
           msg=(f'{band} temperature gradient has non-finite values with '
                f'aerosol optical_depth={od}, ssa={ssa}, asymmetry={g}'),
       )
+
+
+class CloudTauScaleTest(unittest.TestCase):
+  """`cloud_tau_scale_{liq,ice}` through the full solves (issue #37)."""
+
+  _fixture = None
+
+  def setUp(self):
+    super().setUp()
+    if CloudTauScaleTest._fixture is None:
+      CloudTauScaleTest._fixture = _compact_cloudy_setup()
+    (self.optics_lib, self.atmos_state, self.p, self.temperature,
+     self.molecules, self.vmr_fields, self.sfc_temperature,
+     self.cloud) = CloudTauScaleTest._fixture
+
+  def tearDown(self):
+    # Each eager solve compiles and caches its own executable, tens of MB
+    # apiece, and the whole suite runs in one process. Drop them so this
+    # class does not add its solves to the suite's peak memory.
+    jax.clear_caches()
+    super().tearDown()
+
+  def _solve(self, band, cloud=None, **kwargs):
+    cloud = self.cloud if cloud is None else cloud
+    if band == 'lw':
+      return two_stream.solve_lw(
+          self.p, self.temperature, self.molecules, self.optics_lib,
+          self.atmos_state, self.vmr_fields, self.sfc_temperature,
+          **cloud, **kwargs
+      )
+    return two_stream.solve_sw(
+        self.p, self.temperature, self.molecules, self.optics_lib,
+        self.atmos_state, self.vmr_fields, **cloud, **kwargs
+    )
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_unit_factors_are_bit_for_bit(self, band):
+    default = self._solve(band)
+    unit = self._solve(band, cloud_tau_scale_liq=1.0, cloud_tau_scale_ice=1.0)
+    for key in ('flux_up', 'flux_down', 'flux_net'):
+      np.testing.assert_array_equal(
+          np.asarray(unit[key]), np.asarray(default[key]), err_msg=key
+      )
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_equal_factors_match_scaled_cloud_paths(self, band):
+    factor = 0.6
+    scaled_tau = self._solve(
+        band, cloud_tau_scale_liq=factor, cloud_tau_scale_ice=factor
+    )
+    cloud = dict(self.cloud)
+    cloud['cloud_path_liq'] = factor * cloud['cloud_path_liq']
+    cloud['cloud_path_ice'] = factor * cloud['cloud_path_ice']
+    scaled_path = self._solve(band, cloud=cloud)
+    unscaled = self._solve(band)
+    for key in ('flux_up', 'flux_down', 'flux_net'):
+      np.testing.assert_allclose(
+          np.asarray(scaled_tau[key]), np.asarray(scaled_path[key]),
+          rtol=1e-5, atol=1e-4, err_msg=key,
+      )
+    # And the factor is not a no-op.
+    self.assertGreater(
+        np.max(np.abs(np.asarray(scaled_tau['flux_net'] - unscaled['flux_net']))),
+        1.0,
+    )
+
+  def test_unequal_factors_differ_from_scaled_cloud_paths(self):
+    """With unequal factors the two are different physics, as intended.
+
+    Scaling the paths re-weights the combined single-scattering albedo and
+    asymmetry factor of the mixed-phase layers; scaling the optical depths does
+    not. The optical depths agree, so the difference is purely the weighting.
+    """
+    f_liq, f_ice = 0.4, 0.85
+    scaled_tau = self._solve(
+        'sw', cloud_tau_scale_liq=f_liq, cloud_tau_scale_ice=f_ice
+    )
+    cloud = dict(self.cloud)
+    cloud['cloud_path_liq'] = f_liq * cloud['cloud_path_liq']
+    cloud['cloud_path_ice'] = f_ice * cloud['cloud_path_ice']
+    scaled_path = self._solve('sw', cloud=cloud)
+    self.assertGreater(
+        np.max(np.abs(np.asarray(scaled_tau['flux_up'] - scaled_path['flux_up']))),
+        1e-2,
+    )
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_gradients_are_finite(self, band):
+    """Reverse mode w.r.t. per-cell factors, zero in some cells, is finite."""
+    shape = self.temperature.shape
+    f_liq = jnp.full(shape, 0.7, jnp.float_).at[:, :, ::3].set(0.0)
+    f_ice = jnp.full(shape, 0.85, jnp.float_).at[:, :, 1::4].set(0.0)
+
+    def loss(f_liq, f_ice):
+      fluxes = self._solve(
+          band, cloud_tau_scale_liq=f_liq, cloud_tau_scale_ice=f_ice
+      )
+      return jnp.sum(fluxes['flux_net'] ** 2)
+
+    grads = jax.grad(loss, argnums=(0, 1))(f_liq, f_ice)
+    for name, grad in zip(('liq', 'ice'), grads):
+      grad = np.asarray(grad)
+      self.assertTrue(
+          np.all(np.isfinite(grad)), msg=f'{band} d/d(f_{name}) not finite'
+      )
+      # Cloudy layers respond; cloud-free layers have no optical depth to
+      # scale, so their factor has no effect at all.
+      self.assertGreater(np.max(np.abs(grad)), 0.0)
+      path = np.asarray(self.cloud[f'cloud_path_{name}'])
+      np.testing.assert_array_equal(grad[path == 0], 0.0)
 
 
 if __name__ == '__main__':

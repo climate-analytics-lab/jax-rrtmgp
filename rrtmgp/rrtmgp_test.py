@@ -237,6 +237,66 @@ class RRTMGPVMROverrideTest(unittest.TestCase):
     )
 
 
+class RRTMGPCloudTauScaleTest(unittest.TestCase):
+  """The `cloud_tau_scale_{liq,ice}` kwargs reach both streams (#37)."""
+
+  def tearDown(self):
+    # Each eager solve compiles and caches its own executable, tens of MB
+    # apiece, and the whole suite runs in one process. Drop them so this
+    # class does not add its solves to the suite's peak memory.
+    jax.clear_caches()
+    super().tearDown()
+
+  def _cloudy_inputs(self):
+    inputs = _build_inputs()
+    p = inputs['p_ref_xxc']
+    t = inputs['temperature']
+    in_cloud = jnp.logical_and(p > 30000, p < 90000)
+    ones = jnp.ones_like(p)
+    # Mixed-phase layers between 263 K and 273 K. `q_c` is left at zero so the
+    # radiative water vapour is identical when the condensate is rescaled.
+    inputs['q_liq'] = jnp.where(in_cloud & (t > 263), 1e-4 * ones, 0.0)
+    inputs['q_ice'] = jnp.where(in_cloud & (t < 273), 5e-5 * ones, 0.0)
+    inputs['cloud_r_eff_liq'] = 1.2e-5 * ones
+    inputs['cloud_r_eff_ice'] = 4e-5 * ones
+    return inputs
+
+  def test_equal_factors_match_scaled_condensate(self):
+    cfg = _build_radiative_transfer_cfg()
+    rt = rrtmgp.RRTMGP(cfg, dz=500.0)
+    inputs = self._cloudy_inputs()
+    factor = 0.5
+
+    baseline = rt.compute_heating_rate(**inputs)
+    unit = rt.compute_heating_rate(
+        **inputs, cloud_tau_scale_liq=1.0, cloud_tau_scale_ice=1.0
+    )
+    scaled_tau = rt.compute_heating_rate(
+        **inputs, cloud_tau_scale_liq=factor, cloud_tau_scale_ice=factor
+    )
+    scaled_q = dict(inputs)
+    scaled_q['q_liq'] = factor * inputs['q_liq']
+    scaled_q['q_ice'] = factor * inputs['q_ice']
+    scaled_q = rt.compute_heating_rate(**scaled_q)
+
+    for key in ('sw_flux_up_full', 'lw_flux_up_full',
+                rrtmgp_common.KEY_STORED_RADIATION):
+      np.testing.assert_array_equal(
+          np.asarray(unit[key]), np.asarray(baseline[key]), err_msg=key
+      )
+      np.testing.assert_allclose(
+          np.asarray(scaled_tau[key]),
+          np.asarray(scaled_q[key]),
+          rtol=1e-5,
+          atol=1e-6 if key == rrtmgp_common.KEY_STORED_RADIATION else 1e-3,
+          err_msg=key,
+      )
+    # Both streams respond to the factors.
+    for key in ('sw_flux_up_full', 'lw_flux_up_full'):
+      diff = np.abs(np.asarray(scaled_tau[key] - baseline[key]))
+      self.assertGreater(np.max(diff), 0.1, msg=key)
+
+
 class RRTMGPAerosolTest(unittest.TestCase):
   """Regression tests for the per-band aerosol_optics_{lw,sw} kwargs."""
 

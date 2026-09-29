@@ -155,6 +155,24 @@ def _solve_over_gpoints(
   return jax.lax.fori_loop(0, n_chunks, step_fn, init_val)
 
 
+def _cloud_tau_scale_kwargs(
+    cloud_tau_scale_liq: Array | float | None,
+    cloud_tau_scale_ice: Array | float | None,
+) -> dict[str, Array | float]:
+  """Optics keyword arguments for the per-phase cloud optical-depth scaling.
+
+  Only the factors that were supplied are forwarded, so an `OpticsScheme`
+  written against the interface without them keeps working when they are not
+  used.
+  """
+  kwargs = {}
+  if cloud_tau_scale_liq is not None:
+    kwargs['cloud_tau_scale_liq'] = cloud_tau_scale_liq
+  if cloud_tau_scale_ice is not None:
+    kwargs['cloud_tau_scale_ice'] = cloud_tau_scale_ice
+  return kwargs
+
+
 def _compute_local_properties_lw(
     pressure: Array,
     temperature: Array,
@@ -168,6 +186,8 @@ def _compute_local_properties_lw(
     cloud_r_eff_ice: Array | None = None,
     cloud_path_ice: Array | None = None,
     aerosol_optics_slice: dict[str, Array] | None = None,
+    cloud_tau_scale_liq: Array | float | None = None,
+    cloud_tau_scale_ice: Array | float | None = None,
 ) -> dict[str, Array]:
   """Compute local optical properties for longwave radiative transfer."""
   if isinstance(sfc_temperature, float):
@@ -188,6 +208,7 @@ def _compute_local_properties_lw(
       cloud_path_liq,
       cloud_r_eff_ice,
       cloud_path_ice,
+      **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
   )
 
   # Mix in aerosol contributions for this band, if supplied. Aerosol tau/ssa/g
@@ -250,6 +271,8 @@ def solve_lw(
     cloud_path_ice_per_gpt: Array | None = None,
     aerosol_optics: dict[str, Array] | None = None,
     gpt_chunk: int = DEFAULT_GPT_CHUNK,
+    cloud_tau_scale_liq: Array | float | None = None,
+    cloud_tau_scale_ice: Array | float | None = None,
 ) -> dict[str, Array]:
   """Solves two-stream radiative transfer equation over the longwave spectrum.
 
@@ -299,6 +322,15 @@ def solve_lw(
       Purely a performance knob -- g-points are independent problems, so the
       only thing it changes is the order in which their fluxes are summed. See
       `_solve_over_gpoints` for why it exists and what it trades.
+    cloud_tau_scale_liq: Optional multiplier of the liquid cloud optical depth,
+      e.g. a sub-grid inhomogeneity factor: a scalar or an array broadcastable
+      against the cloud path. It scales the optical depth after the table
+      lookup while the single-scattering albedo and asymmetry factor keep the
+      physical per-phase weighting (see
+      `cloud_optics.compute_optical_properties`). It applies to the per-g-point
+      cloud paths too. Has no effect in the gray atmosphere, which has no cloud
+      optics.
+    cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -347,6 +379,8 @@ def solve_lw(
         cloud_r_eff_ice,
         cpi,
         aerosol_optics_slice=aer_slice,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
     )
 
     # Boundary conditions. `toa_flux_lw` prescribes the *broadband* downwelling
@@ -410,6 +444,8 @@ def solve_sw(
     cloud_path_ice_per_gpt: Array | None = None,
     aerosol_optics: dict[str, Array] | None = None,
     gpt_chunk: int = DEFAULT_GPT_CHUNK,
+    cloud_tau_scale_liq: Array | float | None = None,
+    cloud_tau_scale_ice: Array | float | None = None,
 ) -> dict[str, Array]:
   """Solves the two-stream radiative transfer equation for shortwave.
 
@@ -455,6 +491,15 @@ def solve_sw(
       Purely a performance knob -- g-points are independent problems, so the
       only thing it changes is the order in which their fluxes are summed. See
       `_solve_over_gpoints` for why it exists and what it trades.
+    cloud_tau_scale_liq: Optional multiplier of the liquid cloud optical depth,
+      e.g. a sub-grid inhomogeneity factor: a scalar or an array broadcastable
+      against the cloud path. It scales the optical depth after the table
+      lookup while the single-scattering albedo and asymmetry factor keep the
+      physical per-phase weighting (see
+      `cloud_optics.compute_optical_properties`). It applies to the per-g-point
+      cloud paths too. Has no effect in the gray atmosphere, which has no cloud
+      optics.
+    cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -514,6 +559,7 @@ def solve_sw(
         cpl,
         cloud_r_eff_ice,
         cpi,
+        **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
     )
     # Mix in aerosol contributions for this band, if supplied. Done after the
     # gas+cloud combination (where cloud has already been delta-scaled in SW),

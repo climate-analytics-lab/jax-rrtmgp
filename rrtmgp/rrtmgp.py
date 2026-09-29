@@ -135,6 +135,8 @@ class RRTMGP:
       sfc_alb: float | Array | None = None,
       sfc_emis: float | Array | None = None,
       gpt_chunk: int = two_stream.DEFAULT_GPT_CHUNK,
+      cloud_tau_scale_liq: float | Array | None = None,
+      cloud_tau_scale_ice: float | Array | None = None,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -176,6 +178,17 @@ class RRTMGP:
     passed through unmodified (no delta-scaling). LW and SW are independent —
     pass one or both. Aerosols are also applied to the clear-sky diagnostic
     (CMIP convention: "clear-sky" = cloud-free, aerosols included).
+
+    Sub-grid cloud inhomogeneity can be represented with
+    `cloud_tau_scale_{liq,ice}`, multipliers of the liquid and ice cloud
+    optical depths (e.g. ECHAM's `zinhoml` / `zinhomi`), each a scalar or an
+    array broadcastable against the `[nx, ny, nz]` cloud path. Unlike scaling
+    `q_liq` / `q_ice`, they leave the single-scattering albedo and asymmetry
+    factor weighted by the physical per-phase optical depths, which is what
+    ECHAM does and is not the same thing once the two factors differ. They
+    apply to both the longwave and the shortwave cloud optics, and to the McICA
+    per-g-point cloud paths when those are given; the clear-sky diagnostic has
+    no clouds and is unaffected. When omitted, the optical depths are unscaled.
 
     `gpt_chunk` sets how many g-points the spectral loop solves per iteration.
     It changes no physics -- only the order in which independent g-point fluxes
@@ -280,6 +293,8 @@ class RRTMGP:
         cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
         aerosol_optics=aerosol_optics_lw,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
     )
     sw_fluxes = two_stream.solve_sw(
         p_ref_xxc,
@@ -297,6 +312,8 @@ class RRTMGP:
         cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
         aerosol_optics=aerosol_optics_sw,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
     )
 
     # Compute the heating rate in K/s.

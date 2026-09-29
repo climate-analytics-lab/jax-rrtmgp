@@ -49,6 +49,8 @@ def compute_optical_properties(
     radius_eff_liq: Array,
     radius_eff_ice: Array,
     ibnd: Array,
+    tau_scale_liq: Array | float | None = None,
+    tau_scale_ice: Array | float | None = None,
 ) -> dict[str, Array]:
   """Computes the optical properties of clouds from lookup tables.
 
@@ -58,6 +60,15 @@ def compute_optical_properties(
   a weighted sum (weighted by optical depth) of the ssa of both phases. The
   final asymmetry factor is also a weighted sum (weighted by ssa) of the
   asymmetry factors of both phases.
+
+  `tau_scale_liq` and `tau_scale_ice` scale the optical depth of each phase
+  after the table lookup, e.g. by a sub-grid inhomogeneity factor. As in
+  ECHAM's `mo_cloud_optics.f90` (`ztau = ztol*zinhoml + ztoi*zinhomi`), only
+  the optical depth is scaled: the ssa and asymmetry factor are still weighted
+  by the physical, unscaled optical depth of each phase. Scaling the condensate
+  paths instead is equivalent only when the two factors are equal; with
+  unequal factors it would also re-weight the combined ssa and asymmetry
+  factor towards the less-reduced phase.
 
   Args:
     lookup: A `LookupCloudOptics` instance containing lookup tables for the
@@ -73,6 +84,10 @@ def compute_optical_properties(
     radius_eff_ice: The effective radius of cloud ice particles in each
       atmospheric grid cell [m].
     ibnd: The spectral band index.
+    tau_scale_liq: Optional multiplier of the liquid cloud optical depth, a
+      scalar or an array broadcastable against the cloud path. When omitted
+      the optical depth is left unscaled, bit for bit.
+    tau_scale_ice: Same as above, for the ice cloud optical depth.
 
   Returns:
   A dictionary containing:
@@ -166,8 +181,22 @@ def compute_optical_properties(
   tau_ssa_is_nonzero = tau_ssa != 0
   safe_tau = jnp.where(tau_is_nonzero, tau, 1.0)
   safe_tau_ssa = jnp.where(tau_ssa_is_nonzero, tau_ssa, 1.0)
+
+  # Per-phase optical-depth scaling. The weights above stay the physical
+  # per-phase optical depths, so only the extinction is scaled; this adds no
+  # division, and hence no new reverse-mode hazard. Without either factor the
+  # optical depth is the unscaled sum, bit for bit.
+  optical_depth = tau
+  if tau_scale_liq is not None or tau_scale_ice is not None:
+    tau_liq, tau_ice = (props['tau'] for props in optical_props)
+    if tau_scale_liq is not None:
+      tau_liq = tau_scale_liq * tau_liq
+    if tau_scale_ice is not None:
+      tau_ice = tau_scale_ice * tau_ice
+    optical_depth = tau_liq + tau_ice
+
   return {
-      'optical_depth': tau,
+      'optical_depth': optical_depth,
       'ssa': jnp.where(
           tau_is_nonzero,
           tau_ssa / safe_tau,

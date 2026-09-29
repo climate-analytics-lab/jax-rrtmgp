@@ -103,6 +103,8 @@ class OpticsScheme(abc.ABC):
       cloud_path_liq: Array | None = None,
       cloud_r_eff_ice: Array | None = None,
       cloud_path_ice: Array | None = None,
+      cloud_tau_scale_liq: Array | float | None = None,
+      cloud_tau_scale_ice: Array | float | None = None,
   ) -> dict[str, Array]:
     """Computes the monochromatic longwave optical properties.
 
@@ -120,6 +122,10 @@ class OpticsScheme(abc.ABC):
       cloud_r_eff_ice: The effective radius of cloud ice particles [m].
       cloud_path_ice: The cloud ice water path in each atmospheric grid cell
         [kg/m²].
+      cloud_tau_scale_liq: Optional multiplier of the liquid cloud optical
+        depth, applied after the table lookup; the single-scattering albedo
+        and asymmetry factor keep the unscaled per-phase weighting.
+      cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
 
     Returns:
       A dictionary containing (for a single g-point):
@@ -140,6 +146,8 @@ class OpticsScheme(abc.ABC):
       cloud_path_liq: Array | None = None,
       cloud_r_eff_ice: Array | None = None,
       cloud_path_ice: Array | None = None,
+      cloud_tau_scale_liq: Array | float | None = None,
+      cloud_tau_scale_ice: Array | float | None = None,
   ) -> dict[str, Array]:
     """Computes the monochromatic shortwave optical properties.
 
@@ -157,6 +165,10 @@ class OpticsScheme(abc.ABC):
       cloud_r_eff_ice: The effective radius of cloud ice particles [m].
       cloud_path_ice: The cloud ice water path in each atmospheric grid cell
         [kg/m²].
+      cloud_tau_scale_liq: Optional multiplier of the liquid cloud optical
+        depth, applied after the table lookup; the single-scattering albedo
+        and asymmetry factor keep the unscaled per-phase weighting.
+      cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
 
     Returns:
       A dictionary containing (for a single g-point):
