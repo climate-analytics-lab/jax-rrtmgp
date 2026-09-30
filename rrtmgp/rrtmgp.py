@@ -135,6 +135,10 @@ class RRTMGP:
       sfc_alb: float | Array | None = None,
       sfc_emis: float | Array | None = None,
       gpt_chunk: int = two_stream.DEFAULT_GPT_CHUNK,
+      cloud_tau_scale_liq: float | Array | None = None,
+      cloud_tau_scale_ice: float | Array | None = None,
+      sfc_alb_dir: float | Array | None = None,
+      sfc_alb_dif: float | Array | None = None,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -158,6 +162,19 @@ class RRTMGP:
     under vmap. Anything broadcastable against the `[nx, ny]` surface plane
     is accepted. When omitted, the configured scalars are used.
 
+    Separate direct-beam and diffuse SW surface albedos can be given via
+    `sfc_alb_dir` and `sfc_alb_dif`. Each is either a per-column field like
+    `sfc_alb` (broadcastable against the `[nx, ny]` surface plane) or a
+    per-band one with a trailing SW-band axis, `(..., n_bnd_sw)`, e.g.
+    `[nx, ny, n_bnd_sw]` or `[n_bnd_sw]` (one spectrum for every column, e.g.
+    a single column under a column vmap); each g-point then uses the albedo
+    of its band. An array that
+    broadcasts against the surface plane is read as per column, so the rank-3
+    form is the unambiguous per-band one. Either may be omitted and falls back
+    to `sfc_alb` (the argument or the configured value), which keeps its
+    meaning of a single broadband albedo for both. They apply to the clear-sky
+    diagnostic as well.
+
     Per-cell gas concentrations can be supplied via `vmr_fields`, a dict keyed
     by chemical formula (e.g. `'o3'`, `'co2'`, `'ch4'`, `'n2o'`) mapping to a
     3D `[nx, ny, nz]` volume mixing ratio array. These override both the
@@ -177,6 +194,17 @@ class RRTMGP:
     pass one or both. Aerosols are also applied to the clear-sky diagnostic
     (CMIP convention: "clear-sky" = cloud-free, aerosols included).
 
+    Sub-grid cloud inhomogeneity can be represented with
+    `cloud_tau_scale_{liq,ice}`, multipliers of the liquid and ice cloud
+    optical depths (e.g. ECHAM's `zinhoml` / `zinhomi`), each a scalar or an
+    array broadcastable against the `[nx, ny, nz]` cloud path. Unlike scaling
+    `q_liq` / `q_ice`, they leave the single-scattering albedo and asymmetry
+    factor weighted by the physical per-phase optical depths, which is what
+    ECHAM does and is not the same thing once the two factors differ. They
+    apply to both the longwave and the shortwave cloud optics, and to the McICA
+    per-g-point cloud paths when those are given; the clear-sky diagnostic has
+    no clouds and is unaffected. When omitted, the optical depths are unscaled.
+
     `gpt_chunk` sets how many g-points the spectral loop solves per iteration.
     It changes no physics -- only the order in which independent g-point fluxes
     are summed -- and exists to cut GPU kernel launches on a solve that is
@@ -192,6 +220,9 @@ class RRTMGP:
         'rad_heat_lw_3d': The net longwave radiative heating rate [K/s].
         'sw_flux_up_full': Full shortwave upward flux profile [W/m²]
         'sw_flux_down_full': Full shortwave downward flux profile [W/m²]
+        'sw_flux_down_dir_sfc': Direct-beam shortwave flux incident on the
+          surface, `[nx, ny]` [W/m²]. It is part of `sw_flux_down_full[:, :,
+          0]`; the diffuse surface flux is the difference.
         'lw_flux_up_full': Full longwave upward flux profile [W/m²]
         'lw_flux_down_full': Full longwave downward flux profile [W/m²]
     """
@@ -280,6 +311,8 @@ class RRTMGP:
         cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
         aerosol_optics=aerosol_optics_lw,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
     )
     sw_fluxes = two_stream.solve_sw(
         p_ref_xxc,
@@ -297,6 +330,10 @@ class RRTMGP:
         cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
         cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
         aerosol_optics=aerosol_optics_sw,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
+        sfc_alb_dir=sfc_alb_dir,
+        sfc_alb_dif=sfc_alb_dif,
     )
 
     # Compute the heating rate in K/s.
@@ -329,6 +366,8 @@ class RRTMGP:
     output['sw_flux_down_full'] = sw_flux_down[:, :, hw:]  # Full profile (..., nlev+1)
     output['lw_flux_up_full'] = lw_flux_up[:, :, hw:]  # Full profile (..., nlev+1)
     output['lw_flux_down_full'] = lw_flux_down[:, :, hw:]  # Full profile (..., nlev+1)
+    # Direct beam at the surface, for the host's direct / diffuse partition.
+    output['sw_flux_down_dir_sfc'] = sw_fluxes['flux_down_dir_sfc']
 
     # 2D diagnostics
     if (v := 'surf_lw_flux_down_2d_xy') in self._diagnostic_fields:
@@ -339,6 +378,8 @@ class RRTMGP:
       output[v] = sw_flux_down[:, :, hw]
     if (v:= 'surf_sw_flux_up_2d_xy') in self._diagnostic_fields:
       output[v] = sw_flux_up[:, :, hw]
+    if (v := 'surf_sw_flux_down_dir_2d_xy') in self._diagnostic_fields:
+      output[v] = sw_fluxes['flux_down_dir_sfc']
     # Add clear sky surf
 
     if (v := 'toa_sw_flux_incoming_2d_xy') in self._diagnostic_fields:
@@ -387,6 +428,8 @@ class RRTMGP:
           use_scan=use_scan,
           gpt_chunk=gpt_chunk,
           aerosol_optics=aerosol_optics_sw,
+          sfc_alb_dir=sfc_alb_dir,
+          sfc_alb_dif=sfc_alb_dif,
       )
       # Compute the heating rate in K/s.
       lw_heating_rate_clearsky = two_stream.compute_heating_rate(
@@ -410,6 +453,9 @@ class RRTMGP:
       output['sw_flux_down_clearsky_full'] = sw_flux_down_clearsky[:, :, hw:]  # Full profile (..., nlev+1)
       output['lw_flux_up_clearsky_full'] = lw_flux_up_clearsky[:, :, hw:]  # Full profile (..., nlev+1)
       output['lw_flux_down_clearsky_full'] = lw_flux_down_clearsky[:, :, hw:]  # Full profile (..., nlev+1)
+      output['sw_flux_down_dir_clearsky_sfc'] = (
+          sw_fluxes_clearsky['flux_down_dir_sfc']
+      )
 
       # 2D diagnostics
       if (v := 'surf_lw_flux_down_clearsky_2d_xy') in self._diagnostic_fields:
@@ -422,6 +468,8 @@ class RRTMGP:
         output[v] = sw_flux_up_clearsky[:, :, hw]
 
       df = self._diagnostic_fields
+      if (v := 'surf_sw_flux_down_dir_clearsky_2d_xy') in df:
+        output[v] = sw_fluxes_clearsky['flux_down_dir_sfc']
       if (v := 'toa_sw_flux_outgoing_clearsky_2d_xy') in df:
         output[v] = sw_flux_up_clearsky[:, :, -hw]
       if (v := 'toa_lw_flux_outgoing_clearsky_2d_xy') in df:

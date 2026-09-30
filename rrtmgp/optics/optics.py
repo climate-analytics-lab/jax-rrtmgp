@@ -254,7 +254,15 @@ class RRTMOptics(optics_base.OpticsScheme):
     return ps_fn
 
   def _cloud_props(
-      self, ibnd, is_lw, r_eff_liq, cloud_path_liq, r_eff_ice, cloud_path_ice
+      self,
+      ibnd,
+      is_lw,
+      r_eff_liq,
+      cloud_path_liq,
+      r_eff_ice,
+      cloud_path_ice,
+      tau_scale_liq=None,
+      tau_scale_ice=None,
   ) -> dict[str, Array]:
     """The actual cloud optical properties calculation."""
     logging.info('Calling cloud optical properties graph.')
@@ -266,6 +274,8 @@ class RRTMOptics(optics_base.OpticsScheme):
         r_eff_liq,
         r_eff_ice,
         ibnd=ibnd,
+        tau_scale_liq=tau_scale_liq,
+        tau_scale_ice=tau_scale_ice,
     )
 
   def cloud_properties_fn(
@@ -283,10 +293,19 @@ class RRTMOptics(optics_base.OpticsScheme):
 
     Returns:
       A callable that returns a dictionary containing the cloud optical depth,
-      single-scattering albedo, and asymmetry factor.
+      single-scattering albedo, and asymmetry factor. It optionally takes the
+      per-phase optical-depth multipliers `tau_scale_liq` and `tau_scale_ice`
+      (see `cloud_optics.compute_optical_properties`).
     """
 
-    def cloud_props_fn(r_eff_liq, cloud_path_liq, r_eff_ice, cloud_path_ice):
+    def cloud_props_fn(
+        r_eff_liq,
+        cloud_path_liq,
+        r_eff_ice,
+        cloud_path_ice,
+        tau_scale_liq=None,
+        tau_scale_ice=None,
+    ):
       return self._cloud_props(
           ibnd,
           is_lw,
@@ -294,6 +313,8 @@ class RRTMOptics(optics_base.OpticsScheme):
           cloud_path_liq,
           r_eff_ice,
           cloud_path_ice,
+          tau_scale_liq=tau_scale_liq,
+          tau_scale_ice=tau_scale_ice,
       )
 
     return cloud_props_fn
@@ -328,6 +349,8 @@ class RRTMOptics(optics_base.OpticsScheme):
       cloud_path_liq: Array | None = None,
       radius_eff_ice: Array | None = None,
       cloud_path_ice: Array | None = None,
+      cloud_tau_scale_liq: Array | float | None = None,
+      cloud_tau_scale_ice: Array | float | None = None,
   ) -> dict[str, Array]:
     """Combine the gas optical properties with the cloud optical properties."""
     gas_lookup = self.gas_optics_lw if is_lw else self.gas_optics_sw
@@ -347,7 +370,12 @@ class RRTMOptics(optics_base.OpticsScheme):
 
     compute_cloud_properties_fn = self.cloud_properties_fn(ibnd, is_lw)
     cloud_optical_props = compute_cloud_properties_fn(
-        radius_eff_liq, cloud_path_liq, radius_eff_ice, cloud_path_ice
+        radius_eff_liq,
+        cloud_path_liq,
+        radius_eff_ice,
+        cloud_path_ice,
+        tau_scale_liq=cloud_tau_scale_liq,
+        tau_scale_ice=cloud_tau_scale_ice,
     )
 
     if not is_lw:
@@ -368,6 +396,8 @@ class RRTMOptics(optics_base.OpticsScheme):
       cloud_path_liq: Array | None = None,
       cloud_r_eff_ice: Array | None = None,
       cloud_path_ice: Array | None = None,
+      cloud_tau_scale_liq: Array | float | None = None,
+      cloud_tau_scale_ice: Array | float | None = None,
   ) -> dict[str, Array]:
     """Compute the monochromatic longwave optical properties.
 
@@ -390,6 +420,12 @@ class RRTMOptics(optics_base.OpticsScheme):
       cloud_r_eff_ice: The effective radius of cloud ice particles [m].
       cloud_path_ice: The cloud ice water path in each atmospheric grid cell
         [kg/m²].
+      cloud_tau_scale_liq: Optional multiplier of the liquid cloud optical
+        depth (e.g. a sub-grid inhomogeneity factor), a scalar or an array
+        broadcastable against the cloud path. The single-scattering albedo and
+        asymmetry factor keep the unscaled per-phase weighting; see
+        `cloud_optics.compute_optical_properties`.
+      cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
 
     Returns:
       A dictionary containing (for a single g-point):
@@ -416,6 +452,8 @@ class RRTMOptics(optics_base.OpticsScheme):
           cloud_path_liq=cloud_path_liq,
           radius_eff_ice=cloud_r_eff_ice,
           cloud_path_ice=cloud_path_ice,
+          cloud_tau_scale_liq=cloud_tau_scale_liq,
+          cloud_tau_scale_ice=cloud_tau_scale_ice,
       )
     return optical_props
 
@@ -431,6 +469,8 @@ class RRTMOptics(optics_base.OpticsScheme):
       cloud_path_liq: Array | None = None,
       cloud_r_eff_ice: Array | None = None,
       cloud_path_ice: Array | None = None,
+      cloud_tau_scale_liq: Array | float | None = None,
+      cloud_tau_scale_ice: Array | float | None = None,
   ) -> dict[str, Array]:
     """Compute the monochromatic shortwave optical properties.
 
@@ -453,6 +493,12 @@ class RRTMOptics(optics_base.OpticsScheme):
       cloud_r_eff_ice: The effective radius of cloud ice particles [m].
       cloud_path_ice: The cloud ice water path in each atmospheric grid cell
         [kg/m²].
+      cloud_tau_scale_liq: Optional multiplier of the liquid cloud optical
+        depth (e.g. a sub-grid inhomogeneity factor), a scalar or an array
+        broadcastable against the cloud path. The single-scattering albedo and
+        asymmetry factor keep the unscaled per-phase weighting; see
+        `cloud_optics.compute_optical_properties`.
+      cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
 
     Returns:
       A dictionary containing (for a single g-point):
@@ -501,6 +547,8 @@ class RRTMOptics(optics_base.OpticsScheme):
           cloud_path_liq=cloud_path_liq,
           radius_eff_ice=cloud_r_eff_ice,
           cloud_path_ice=cloud_path_ice,
+          cloud_tau_scale_liq=cloud_tau_scale_liq,
+          cloud_tau_scale_ice=cloud_tau_scale_ice,
       )
     return gas_optical_props
 

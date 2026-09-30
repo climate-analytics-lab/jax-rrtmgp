@@ -237,6 +237,139 @@ class RRTMGPVMROverrideTest(unittest.TestCase):
     )
 
 
+class RRTMGPCloudTauScaleTest(unittest.TestCase):
+  """The `cloud_tau_scale_{liq,ice}` kwargs reach both streams (#37)."""
+
+  def tearDown(self):
+    # Each eager solve compiles and caches its own executable, tens of MB
+    # apiece, and the whole suite runs in one process. Drop them so this
+    # class does not add its solves to the suite's peak memory.
+    jax.clear_caches()
+    super().tearDown()
+
+  def _cloudy_inputs(self):
+    inputs = _build_inputs()
+    p = inputs['p_ref_xxc']
+    t = inputs['temperature']
+    in_cloud = jnp.logical_and(p > 30000, p < 90000)
+    ones = jnp.ones_like(p)
+    # Mixed-phase layers between 263 K and 273 K. `q_c` is left at zero so the
+    # radiative water vapour is identical when the condensate is rescaled.
+    inputs['q_liq'] = jnp.where(in_cloud & (t > 263), 1e-4 * ones, 0.0)
+    inputs['q_ice'] = jnp.where(in_cloud & (t < 273), 5e-5 * ones, 0.0)
+    inputs['cloud_r_eff_liq'] = 1.2e-5 * ones
+    inputs['cloud_r_eff_ice'] = 4e-5 * ones
+    return inputs
+
+  def test_equal_factors_match_scaled_condensate(self):
+    cfg = _build_radiative_transfer_cfg()
+    rt = rrtmgp.RRTMGP(cfg, dz=500.0)
+    inputs = self._cloudy_inputs()
+    factor = 0.5
+
+    baseline = rt.compute_heating_rate(**inputs)
+    unit = rt.compute_heating_rate(
+        **inputs, cloud_tau_scale_liq=1.0, cloud_tau_scale_ice=1.0
+    )
+    scaled_tau = rt.compute_heating_rate(
+        **inputs, cloud_tau_scale_liq=factor, cloud_tau_scale_ice=factor
+    )
+    scaled_q = dict(inputs)
+    scaled_q['q_liq'] = factor * inputs['q_liq']
+    scaled_q['q_ice'] = factor * inputs['q_ice']
+    scaled_q = rt.compute_heating_rate(**scaled_q)
+
+    for key in ('sw_flux_up_full', 'lw_flux_up_full',
+                rrtmgp_common.KEY_STORED_RADIATION):
+      np.testing.assert_array_equal(
+          np.asarray(unit[key]), np.asarray(baseline[key]), err_msg=key
+      )
+      np.testing.assert_allclose(
+          np.asarray(scaled_tau[key]),
+          np.asarray(scaled_q[key]),
+          rtol=1e-5,
+          atol=1e-6 if key == rrtmgp_common.KEY_STORED_RADIATION else 1e-3,
+          err_msg=key,
+      )
+    # Both streams respond to the factors.
+    for key in ('sw_flux_up_full', 'lw_flux_up_full'):
+      diff = np.abs(np.asarray(scaled_tau[key] - baseline[key]))
+      self.assertGreater(np.max(diff), 0.1, msg=key)
+
+
+class RRTMGPSurfaceAlbedoTest(unittest.TestCase):
+  """The `sfc_alb_{dir,dif}` kwargs and the direct surface flux output (#38)."""
+
+  def tearDown(self):
+    # Each eager solve compiles and caches its own executable, tens of MB
+    # apiece, and the whole suite runs in one process. Drop them so this
+    # class does not add its solves to the suite's peak memory.
+    jax.clear_caches()
+    super().tearDown()
+
+  def test_direct_and_diffuse_albedos(self):
+    cfg = dataclasses.replace(
+        _build_radiative_transfer_cfg(),
+        do_clear_sky=True,
+        save_lw_sw_heating_rates=True,
+    )
+    diagnostics = (
+        'surf_sw_flux_down_dir_2d_xy',
+        'surf_sw_flux_down_dir_clearsky_2d_xy',
+    )
+    rt = rrtmgp.RRTMGP(cfg, dz=500.0, diagnostic_fields=diagnostics)
+    inputs = _build_inputs()
+    sfc_alb = cfg.atmospheric_state_cfg.sfc_alb
+    n_bnd_sw = rt.optics_lib.gas_optics_sw.n_bnd
+
+    baseline = rt.compute_heating_rate(**inputs)
+    matching = rt.compute_heating_rate(
+        **inputs,
+        sfc_alb_dir=sfc_alb,
+        sfc_alb_dif=jnp.full((2, 2, n_bnd_sw), sfc_alb, jnp.float_),
+    )
+    for key, val in baseline.items():
+      np.testing.assert_array_equal(
+          np.asarray(matching[key]), np.asarray(val), err_msg=key
+      )
+
+    # The direct surface flux is always returned, and is part of the total.
+    direct = np.asarray(baseline['sw_flux_down_dir_sfc'])
+    down = np.asarray(baseline['sw_flux_down_full'][:, :, 0])
+    self.assertEqual(direct.shape, down.shape)
+    self.assertTrue(np.all(direct > 0.0) and np.all(direct <= down))
+    np.testing.assert_array_equal(
+        np.asarray(baseline['surf_sw_flux_down_dir_2d_xy']), direct
+    )
+    # This column is cloud free, so the clear-sky solve is the same one.
+    np.testing.assert_array_equal(
+        np.asarray(baseline['sw_flux_down_dir_clearsky_sfc']), direct
+    )
+    np.testing.assert_array_equal(
+        np.asarray(baseline['surf_sw_flux_down_dir_clearsky_2d_xy']), direct
+    )
+
+    # Distinct albedos: the surface reflects each part with its own albedo,
+    # in the all-sky and the clear-sky solve alike.
+    a_dir, a_dif = 0.3, 0.05
+    split = rt.compute_heating_rate(
+        **inputs, sfc_alb_dir=a_dir, sfc_alb_dif=a_dif
+    )
+    for suffix in ('', '_clearsky'):
+      up = np.asarray(split[f'sw_flux_up{suffix}_full'][:, :, 0])
+      down = np.asarray(split[f'sw_flux_down{suffix}_full'][:, :, 0])
+      direct = np.asarray(split[f'sw_flux_down_dir{suffix}_sfc'])
+      np.testing.assert_allclose(
+          up, a_dir * direct + a_dif * (down - direct), rtol=1e-5, err_msg=suffix
+      )
+    self.assertFalse(
+        np.allclose(
+            np.asarray(split[rrtmgp_common.KEY_STORED_RADIATION]),
+            np.asarray(baseline[rrtmgp_common.KEY_STORED_RADIATION]),
+        )
+    )
+
+
 class RRTMGPAerosolTest(unittest.TestCase):
   """Regression tests for the per-band aerosol_optics_{lw,sw} kwargs."""
 

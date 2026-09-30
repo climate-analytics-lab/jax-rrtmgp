@@ -348,6 +348,49 @@ class RRTMOpticsTest(unittest.TestCase):
     # The division by zero should make the ssa default to 0.
     np.testing.assert_allclose(output['ssa'], jnp.zeros_like(pressure))
 
+  def test_cloud_tau_scale_reaches_cloud_optics(self):
+    """The per-phase optical-depth factors are forwarded to the cloud optics."""
+    n = 4
+    ones = jnp.ones((n, n, n), dtype=jnp.float_)
+    self.mock_rayleigh_optical_depth_fn.return_value = 0.1 * ones
+    self.mock_major_optical_depth_fn.return_value = 0.6 * ones
+    self.mock_minor_optical_depth_fn.return_value = 0.24 * ones
+    self.mock_cloud_optical_props_fn.return_value = {
+        'optical_depth': 0.12 * ones,
+        'ssa': 0.15 * ones,
+        'asymmetry_factor': 0.1 * ones,
+    }
+    pressure = 1e5 * ones
+    cloud = {
+        'cloud_r_eff_liq': 1e-5 * ones,
+        'cloud_path_liq': 0.1 * ones,
+        'cloud_r_eff_ice': 1e-3 * ones,
+        'cloud_path_ice': 0.1 * ones,
+    }
+    f_ice = 0.85 * ones
+    for compute in (
+        self.rrtm_lib.compute_lw_optical_properties,
+        self.rrtm_lib.compute_sw_optical_properties,
+    ):
+      with self.subTest(compute.__name__):
+        compute(pressure, 290.0 * ones, 1e24 * ones, igpt=1, **cloud)
+        kwargs = self.mock_cloud_optical_props_fn.call_args.kwargs
+        self.assertIsNone(kwargs['tau_scale_liq'])
+        self.assertIsNone(kwargs['tau_scale_ice'])
+
+        compute(
+            pressure,
+            290.0 * ones,
+            1e24 * ones,
+            igpt=1,
+            cloud_tau_scale_liq=0.4,
+            cloud_tau_scale_ice=f_ice,
+            **cloud,
+        )
+        kwargs = self.mock_cloud_optical_props_fn.call_args.kwargs
+        self.assertEqual(kwargs['tau_scale_liq'], 0.4)
+        self.assertIs(kwargs['tau_scale_ice'], f_ice)
+
   def test_compute_planck_sources_rrtm(self):
     """Checks the computed Planck sources at cell center and face."""
     # SETUP
