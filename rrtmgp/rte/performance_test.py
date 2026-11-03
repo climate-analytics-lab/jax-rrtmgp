@@ -284,19 +284,23 @@ _MAX_LAUNCHES = {
 # build; the no-scattering one:
 #
 #                        flops          transcendentals   launches
-#   LW noscat use_scan=False  2,248,800,256     1,146,752    20,533
-#   LW noscat use_scan=True   2,018,525,312     1,146,752   143,157
+#   LW noscat use_scan=False  2,331,200,000     2,293,504    20,277
+#   LW noscat use_scan=True   2,135,493,888     2,293,504   143,925
 #
-# i.e. one `exp` per cell where the two-stream cell kernel has three
-# transcendentals and ~340 flops, and no albedo/emission recurrences -- two
-# first-order recurrences instead of three -- which is where the launch count
-# goes. The per-cell kernel (`lw_noscat_layer_sources`), in isolation: 35 flops
-# and 1 transcendental per element, against the two-stream kernel's 340 / 3.
+# i.e. per cell one `exp` for the layer transmittance and one `sqrt` for the
+# geometric-mean level source that the two-stream solver shares, where the
+# two-stream cell kernel has three transcendentals and ~340 flops, and no
+# albedo/emission recurrences -- two first-order recurrences instead of three --
+# which is where the launch count goes. The upward flux's one-level shift is a
+# slice and a pad rather than a `jnp.roll`, whose concatenate would be a launch
+# per g-point of its own. The per-cell kernel (`lw_noscat_layer_sources`), in
+# isolation: 35 flops and 1 transcendental per element, against the two-stream
+# kernel's 340 / 3.
 _MAX_NOSCAT_FLOPS = {True: 2_650_000_000, False: 2_950_000_000}
-_MAX_NOSCAT_TRANSCENDENTALS = {True: 1_500_000, False: 1_500_000}
+_MAX_NOSCAT_TRANSCENDENTALS = {True: 3_000_000, False: 3_000_000}
 _MAX_NOSCAT_LAUNCHES = {
-    ('cpu', False): 25_000,
-    ('cpu', True): 172_000,
+    ('cpu', False): 24_500,
+    ('cpu', True): 171_000,
 }
 _MAX_NOSCAT_KERNEL_FLOPS = 38_500_000
 _MAX_NOSCAT_KERNEL_TRANSCENDENTALS = 1_100_000
