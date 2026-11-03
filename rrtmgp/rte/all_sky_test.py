@@ -30,6 +30,7 @@ from rrtmgp import test_util
 from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import atmospheric_state
 from rrtmgp.optics import optics
+from rrtmgp.optics import optics_base
 from rrtmgp.rte import two_stream
 
 Array: TypeAlias = jax.Array
@@ -1234,6 +1235,226 @@ class SurfaceAlbedoTest(unittest.TestCase):
     )
     with self.assertRaises(ValueError):
       resolve(jnp.zeros((2, 2, n)), (2, 2), gray, 'a')
+
+
+class SharedClearSkyTest(unittest.TestCase):
+  """`with_clear_sky=True` solves the clear sky inside the all-sky g-point loop.
+
+  The clear-sky problem is the all-sky one with the cloud mix-in removed -- the
+  gas optics, the Planck sources, the aerosol mix-in, the albedos and the night
+  masking are the same -- so sharing the gas optics between the two must return
+  what a separate no-cloud call returns, and must leave the all-sky fluxes as
+  they were.
+
+  The comparisons are to float rounding, not bit for bit, in the shortwave. The
+  combined program lets XLA fuse and contract the arithmetic differently from
+  the two separate ones (the same differences appear between any two
+  structurally different programs), which moves the fluxes by an ulp or two:
+  repeating the comparison in float64 shrinks the differences to ~1e-13 W/m^2,
+  i.e. they are rounding, not a difference in the computation. The longwave
+  happens to agree exactly. `RTOL` is ~16 float32 ulp and `ATOL` ~1e-7 of a
+  typical shortwave flux.
+  """
+
+  RTOL = 2e-6
+  ATOL = 1e-4
+
+  _fixture = None
+  _helper = None
+
+  def setUp(self):
+    super().setUp()
+    if SharedClearSkyTest._fixture is None:
+      SharedClearSkyTest._fixture = _compact_cloudy_setup()
+      helper = GPointChunkingTest()
+      helper._cached = SharedClearSkyTest._fixture
+      SharedClearSkyTest._helper = helper
+    self._cached = SharedClearSkyTest._fixture
+    self._helper = SharedClearSkyTest._helper
+
+  def _solve(self, band, **kwargs):
+    (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+     sfc_temperature, _) = self._cached
+    temperature = kwargs.pop('temperature', temperature)
+    if band == 'lw':
+      return two_stream.solve_lw(
+          p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+          sfc_temperature, **kwargs
+      )
+    return two_stream.solve_sw(
+        p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+        **kwargs
+    )
+
+  def _inputs(self, band, with_mcica, with_aerosol):
+    """Cloud and aerosol arguments of one case, and the same minus cloud."""
+    optics_lib, _, _, temperature, _, _, _, cloud = self._cached
+    extra = self._helper._mcica_and_aerosol(
+        optics_lib, band, cloud, temperature.shape
+    )
+    kwargs = dict(cloud)
+    if with_mcica:
+      kwargs['cloud_path_liq_per_gpt'] = extra['cloud_path_liq_per_gpt']
+      kwargs['cloud_path_ice_per_gpt'] = extra['cloud_path_ice_per_gpt']
+    if with_aerosol:
+      kwargs['aerosol_optics'] = extra['aerosol_optics']
+    no_cloud = {k: v for k, v in kwargs.items() if 'cloud' not in k}
+    return kwargs, no_cloud
+
+  @parameterized.expand([
+      (band, chunk, with_mcica, with_aerosol)
+      for band, (chunk, with_mcica, with_aerosol) in product(
+          ('lw', 'sw'),
+          # Broadcast cloud paths, no aerosol; broadcast + aerosol on a wider
+          # chunk; McICA sub-columns + aerosol; McICA alone on a wider chunk.
+          ((1, False, False), (4, False, True), (1, True, True),
+           (4, True, False)),
+      )
+  ])
+  def test_matches_separate_solves(
+      self, band, chunk, with_mcica, with_aerosol
+  ):
+    kwargs, no_cloud = self._inputs(band, with_mcica, with_aerosol)
+    shared = self._solve(
+        band, gpt_chunk=chunk, with_clear_sky=True, **kwargs
+    )
+    all_sky_shared, clear_shared = two_stream.split_clear_sky_fluxes(shared)
+    all_sky = self._solve(band, gpt_chunk=chunk, **kwargs)
+    clear = self._solve(band, gpt_chunk=chunk, **no_cloud)
+
+    self.assertEqual(set(all_sky_shared), set(all_sky))
+    self.assertEqual(set(clear_shared), set(clear))
+    for name, got, want in (
+        ('all-sky', all_sky_shared, all_sky),
+        ('clear-sky', clear_shared, clear),
+    ):
+      for key in want:
+        np.testing.assert_allclose(
+            np.asarray(got[key]), np.asarray(want[key]),
+            rtol=self.RTOL, atol=self.ATOL,
+            err_msg=f'{band} {name} {key}',
+        )
+    # The cloud must matter, or this proves nothing about the clear branch.
+    diff = np.abs(
+        np.asarray(all_sky['flux_up']) - np.asarray(clear['flux_up'])
+    )
+    self.assertGreater(diff.max(), 1.0)
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_without_cloud_the_two_problems_are_one(self, band):
+    """No cloud to remove: the clear fluxes are the all-sky ones, exactly."""
+    _, no_cloud = self._inputs(band, False, True)
+    shared = self._solve(band, with_clear_sky=True, **no_cloud)
+    all_sky, clear = two_stream.split_clear_sky_fluxes(shared)
+    plain = self._solve(band, **no_cloud)
+    for key in plain:
+      np.testing.assert_array_equal(
+          np.asarray(clear[key]), np.asarray(all_sky[key]), err_msg=key
+      )
+      np.testing.assert_allclose(
+          np.asarray(all_sky[key]), np.asarray(plain[key]),
+          rtol=self.RTOL, atol=self.ATOL, err_msg=key,
+      )
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_gray_atmosphere_has_no_cloud_to_remove(self, band):
+    _, atmos_state, p, temperature, molecules, vmr_fields, sfc_t, cloud = (
+        self._cached
+    )
+    gray = optics.GrayAtmosphereOptics(
+        radiative_transfer.OpticsParameters(
+            optics=radiative_transfer.GrayAtmosphereOptics()
+        )
+    )
+    args = (p, temperature, molecules, gray, atmos_state)
+    if band == 'lw':
+      solve = lambda **kw: two_stream.solve_lw(
+          *args, sfc_temperature=sfc_t, **kw
+      )
+    else:
+      solve = lambda **kw: two_stream.solve_sw(*args, **kw)
+    plain = solve(**cloud)
+    shared = solve(with_clear_sky=True, **cloud)
+    all_sky, clear = two_stream.split_clear_sky_fluxes(shared)
+    for key in plain:
+      np.testing.assert_allclose(
+          np.asarray(all_sky[key]), np.asarray(plain[key]),
+          rtol=self.RTOL, atol=self.ATOL, err_msg=key,
+      )
+      np.testing.assert_array_equal(
+          np.asarray(clear[key]), np.asarray(all_sky[key]), err_msg=key
+      )
+
+  def test_night_columns_are_zero_in_the_clear_sky_too(self):
+    optics_lib, atmos_state, *_ = self._cached
+    night_state = dataclasses.replace(atmos_state, zenith=jnp.pi)
+    _, _, p, temperature, molecules, vmr_fields, _, cloud = self._cached
+    shared = two_stream.solve_sw(
+        p, temperature, molecules, optics_lib, night_state, vmr_fields,
+        with_clear_sky=True, **cloud
+    )
+    for key, val in shared.items():
+      np.testing.assert_array_equal(np.asarray(val), 0.0, err_msg=key)
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_clear_sky_gradients_are_finite(self, band):
+    """Reverse mode through the shared solve, w.r.t. temperature."""
+    kwargs, _ = self._inputs(band, False, True)
+    temperature = self._cached[3]
+
+    def loss(temp):
+      out = self._solve(
+          band, temperature=temp, gpt_chunk=4, with_clear_sky=True, **kwargs
+      )
+      return jnp.sum(out['clear_flux_net'][:, :, 1:]) + jnp.sum(
+          out['flux_up'][:, :, -2]
+      )
+
+    grad = np.asarray(jax.grad(loss)(temperature))
+    self.assertTrue(np.all(np.isfinite(grad)))
+    self.assertGreater(np.abs(grad).max(), 0.0)
+
+
+class OpticsGasCloudSplitTest(unittest.TestCase):
+  """`compute_gas_optical_properties` + `add_cloud_optical_properties`.
+
+  Together they are `compute_{lw,sw}_optical_properties` -- exactly, the
+  latter being built from them.
+  """
+
+  def test_split_reproduces_the_combined_properties(self):
+    (optics_lib, _, p, temperature, molecules, vmr_fields, _, cloud
+     ) = _compact_cloudy_setup()
+    vmr = {optics_lib.gas_optics_lw.idx_gases[k]: v
+           for k, v in vmr_fields.items()}
+    for is_lw, igpt in ((True, 5), (True, 97), (False, 3), (False, 80)):
+      compute = (optics_lib.compute_lw_optical_properties if is_lw
+                 else optics_lib.compute_sw_optical_properties)
+      want = compute(p, temperature, molecules, igpt, vmr, **cloud)
+      gas = optics_lib.compute_gas_optical_properties(
+          p, temperature, molecules, igpt, is_lw, vmr
+      )
+      got = optics_lib.add_cloud_optical_properties(
+          igpt, gas, is_lw, **cloud
+      )
+      for key in want:
+        np.testing.assert_array_equal(
+            np.asarray(got[key]), np.asarray(want[key]),
+            err_msg=f'is_lw={is_lw} igpt={igpt} {key}',
+        )
+      # No condensate: the gas properties are the whole answer.
+      clear = compute(p, temperature, molecules, igpt, vmr)
+      for key in clear:
+        np.testing.assert_array_equal(
+            np.asarray(gas[key]), np.asarray(clear[key]), err_msg=key
+        )
+
+  def test_scheme_without_a_split_says_so(self):
+    optics_lib = _compact_cloudy_setup()[0]
+    with self.assertRaises(NotImplementedError):
+      optics_base.OpticsScheme.add_cloud_optical_properties(
+          optics_lib, 0, {}, True
+      )
 
 
 if __name__ == '__main__':

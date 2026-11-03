@@ -370,6 +370,84 @@ class RRTMGPSurfaceAlbedoTest(unittest.TestCase):
     )
 
 
+class RRTMGPClearSkyTest(unittest.TestCase):
+  """The clear-sky diagnostics share the all-sky solve's gas optics."""
+
+  def tearDown(self):
+    jax.clear_caches()
+    super().tearDown()
+
+  def _cloudy_inputs(self):
+    return RRTMGPCloudTauScaleTest._cloudy_inputs(self)
+
+  def _rt(self, **cfg_kwargs):
+    cfg = dataclasses.replace(
+        _build_radiative_transfer_cfg(),
+        save_lw_sw_heating_rates=True,
+        **cfg_kwargs,
+    )
+    diagnostics = (
+        'toa_sw_flux_outgoing_2d_xy',
+        'toa_lw_flux_outgoing_2d_xy',
+        'toa_sw_flux_outgoing_clearsky_2d_xy',
+        'toa_lw_flux_outgoing_clearsky_2d_xy',
+        'surf_sw_flux_down_clearsky_2d_xy',
+        'surf_lw_flux_down_clearsky_2d_xy',
+        'rad_heat_lw_clearsky_1d_z',
+    )
+    return rrtmgp.RRTMGP(cfg, dz=500.0, diagnostic_fields=diagnostics)
+
+  def test_per_call_flag_is_the_config_flag(self):
+    """`clear_sky_fluxes=True` returns exactly what `do_clear_sky` does."""
+    inputs = self._cloudy_inputs()
+    per_call = self._rt().compute_heating_rate(**inputs, clear_sky_fluxes=True)
+    configured = self._rt(do_clear_sky=True).compute_heating_rate(**inputs)
+    self.assertEqual(set(per_call), set(configured))
+    for key, val in configured.items():
+      np.testing.assert_array_equal(
+          np.asarray(per_call[key]), np.asarray(val), err_msg=key
+      )
+
+  def test_all_sky_outputs_do_not_depend_on_the_flag(self):
+    inputs = self._cloudy_inputs()
+    rt = self._rt()
+    off = rt.compute_heating_rate(**inputs)
+    on = rt.compute_heating_rate(**inputs, clear_sky_fluxes=True)
+    self.assertFalse([k for k in off if 'clearsky' in k])
+    self.assertTrue(
+        {'sw_flux_up_clearsky_full', 'sw_flux_down_dir_clearsky_sfc',
+         'rad_heat_sw_clearsky_3d', 'toa_lw_flux_outgoing_clearsky_2d_xy',
+         'rad_heat_lw_clearsky_1d_z'} <= set(on)
+    )
+    for key, val in off.items():
+      # Rounding-level: the combined program is fused differently (see
+      # `all_sky_test.SharedClearSkyTest`).
+      np.testing.assert_allclose(
+          np.asarray(on[key]), np.asarray(val), rtol=2e-6, atol=1e-4,
+          err_msg=key,
+      )
+
+  def test_clear_sky_is_the_all_sky_solve_without_condensate(self):
+    """The clear-sky fluxes of a cloudy column are those of its cloud-free twin."""
+    cloudy = self._cloudy_inputs()
+    cloud_free = _build_inputs()
+    rt = self._rt()
+    got = rt.compute_heating_rate(**cloudy, clear_sky_fluxes=True)
+    want = rt.compute_heating_rate(**cloud_free, clear_sky_fluxes=True)
+    for stem in ('sw_flux_up', 'sw_flux_down', 'lw_flux_up', 'lw_flux_down'):
+      np.testing.assert_allclose(
+          np.asarray(got[f'{stem}_clearsky_full']),
+          np.asarray(want[f'{stem}_full']),
+          rtol=2e-6, atol=1e-4, err_msg=stem,
+      )
+    # ... and the cloud makes a difference to the all-sky ones.
+    self.assertGreater(
+        np.max(np.abs(np.asarray(got['sw_flux_up_full'])
+                      - np.asarray(got['sw_flux_up_clearsky_full']))),
+        1.0,
+    )
+
+
 class RRTMGPAerosolTest(unittest.TestCase):
   """Regression tests for the per-band aerosol_optics_{lw,sw} kwargs."""
 

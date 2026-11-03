@@ -177,6 +177,88 @@ class OpticsScheme(abc.ABC):
         'asymmetry_factor': The shortwave asymmetry factor.
     """
 
+  # The two methods below split `compute_{lw,sw}_optical_properties` into its
+  # cloud-independent part (the gas optics, which dominates the cost of a
+  # g-point) and the cloud mix-in, so a solver that needs both an all-sky and a
+  # clear-sky answer can evaluate the gas optics once and form both optical
+  # property sets from it (`two_stream.solve_{lw,sw}(with_clear_sky=True)`).
+  # They are not abstract: a scheme that does not provide them keeps working
+  # everywhere except under `with_clear_sky`.
+  def compute_gas_optical_properties(
+      self,
+      pressure: Array,
+      temperature: Array,
+      molecules: Array,
+      igpt: Array,
+      is_lw: bool,
+      vmr_fields: dict[int, Array] | None = None,
+  ) -> dict[str, Array]:
+    """Computes the cloud-free monochromatic optical properties of the gas.
+
+    This is exactly `compute_{lw,sw}_optical_properties` called without any
+    cloud condensate. The default implementation says just that, so it is
+    correct for any scheme; a scheme overrides it only to expose the cloud
+    mix-in separately through `add_cloud_optical_properties`.
+
+    Args:
+      pressure: The pressure field [Pa].
+      temperature: The temperature [K].
+      molecules: The number of molecules in an atmospheric grid cell per area
+        [molecules/m²].
+      igpt: The spectral interval index, or g-point.
+      is_lw: `True` for the longwave problem, `False` for the shortwave one.
+      vmr_fields: An optional dictionary containing precomputed volume mixing
+        ratio fields, keyed by gas index, that will overwrite the global means.
+
+    Returns:
+      A dictionary with `'optical_depth'`, `'ssa'` and `'asymmetry_factor'`.
+    """
+    compute = (
+        self.compute_lw_optical_properties
+        if is_lw
+        else self.compute_sw_optical_properties
+    )
+    return compute(pressure, temperature, molecules, igpt, vmr_fields)
+
+  def add_cloud_optical_properties(
+      self,
+      igpt: Array,
+      gas_optical_props: Mapping[str, Array],
+      is_lw: bool,
+      cloud_r_eff_liq: Array | None = None,
+      cloud_path_liq: Array | None = None,
+      cloud_r_eff_ice: Array | None = None,
+      cloud_path_ice: Array | None = None,
+      cloud_tau_scale_liq: Array | float | None = None,
+      cloud_tau_scale_ice: Array | float | None = None,
+  ) -> dict[str, Array]:
+    """Mixes cloud optics into already-computed gas optical properties.
+
+    Applied to the result of `compute_gas_optical_properties` it reproduces
+    `compute_{lw,sw}_optical_properties` with the same cloud arguments.
+
+    Args:
+      igpt: The spectral interval index, or g-point.
+      gas_optical_props: The output of `compute_gas_optical_properties`.
+      is_lw: `True` for the longwave problem, `False` for the shortwave one.
+      cloud_r_eff_liq: The effective radius of cloud droplets [m].
+      cloud_path_liq: The cloud liquid water path in each atmospheric grid cell
+        [kg/m²].
+      cloud_r_eff_ice: The effective radius of cloud ice particles [m].
+      cloud_path_ice: The cloud ice water path in each atmospheric grid cell
+        [kg/m²].
+      cloud_tau_scale_liq: Optional multiplier of the liquid cloud optical
+        depth; see `compute_lw_optical_properties`.
+      cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
+
+    Returns:
+      A dictionary with `'optical_depth'`, `'ssa'` and `'asymmetry_factor'`.
+    """
+    raise NotImplementedError(
+        f'{type(self).__name__} does not separate its cloud optics from its'
+        ' gas optics, which `with_clear_sky=True` needs.'
+    )
+
   @abc.abstractmethod
   def compute_planck_sources(
       self,

@@ -385,6 +385,127 @@ class RRTMOptics(optics_base.OpticsScheme):
     return self.combine_optical_properties(optical_props, cloud_optical_props)
 
   @override
+  def compute_gas_optical_properties(
+      self,
+      pressure: Array,
+      temperature: Array,
+      molecules: Array,
+      igpt: Array,
+      is_lw: bool,
+      vmr_fields: dict[int, Array] | None = None,
+  ) -> dict[str, Array]:
+    """Computes the gas optical properties (no cloud) of one g-point.
+
+    Longwave: the gas absorption optical depth, with zero single-scattering
+    albedo and asymmetry factor. Shortwave: the absorption plus Rayleigh optical
+    depth and the Rayleigh single-scattering albedo. `is_lw` is a Python bool
+    (static), so only one of the two branches is traced.
+
+    Args:
+      pressure: The pressure field [Pa].
+      temperature: The temperature [K].
+      molecules: The number of molecules in an atmospheric grid cell per area
+        [molecules / m^2].
+      igpt: The spectral interval index, or g-point.
+      is_lw: `True` for the longwave problem, `False` for the shortwave one.
+      vmr_fields: An optional dictionary containing precomputed volume mixing
+        ratio fields, keyed by gas index, that will overwrite the global means.
+
+    Returns:
+      A dictionary with `'optical_depth'`, `'ssa'` and `'asymmetry_factor'`.
+    """
+    if is_lw:
+      optical_depth_fn = self._optical_depth_fn(igpt, is_lw=True)
+      optical_depth_lw = optical_depth_fn(
+          molecules, temperature, pressure, vmr_fields
+      )
+      return {
+          'optical_depth': optical_depth_lw,
+          'ssa': jnp.zeros_like(optical_depth_lw),
+          'asymmetry_factor': jnp.zeros_like(optical_depth_lw),
+      }
+
+    optical_depth_fn = self._optical_depth_fn(igpt, is_lw=False)
+    optical_depth_sw = optical_depth_fn(
+        molecules, temperature, pressure, vmr_fields
+    )
+
+    rayl_fn = self.rayleigh_scattering_fn(igpt)
+    rayleigh_scattering = rayl_fn(molecules, temperature, pressure, vmr_fields)
+
+    optical_depth_sw = optical_depth_sw + rayleigh_scattering
+
+    # Single-scattering albedo. The division by the total optical depth is
+    # guarded with the standard double-`where`: where the optical depth is
+    # non-positive (e.g. a halo/edge cell) the forward value is defined to be
+    # zero, but the raw ``rayleigh_scattering / optical_depth_sw`` in the
+    # unselected branch would still divide by zero and leave a NaN cotangent in
+    # reverse mode. Feed the division a safe (unit) denominator on that branch so
+    # both passes stay finite while the forward result is unchanged.
+    optical_depth_is_positive = optical_depth_sw > 0
+    safe_optical_depth_sw = jnp.where(
+        optical_depth_is_positive, optical_depth_sw, 1.0
+    )
+    ssa = jnp.where(
+        optical_depth_is_positive,
+        rayleigh_scattering / safe_optical_depth_sw,
+        jnp.zeros_like(rayleigh_scattering),
+    )
+
+    return {
+        'optical_depth': optical_depth_sw,
+        'ssa': ssa,
+        'asymmetry_factor': jnp.zeros_like(ssa),
+    }
+
+  @override
+  def add_cloud_optical_properties(
+      self,
+      igpt: Array,
+      gas_optical_props: Mapping[str, Array],
+      is_lw: bool,
+      cloud_r_eff_liq: Array | None = None,
+      cloud_path_liq: Array | None = None,
+      cloud_r_eff_ice: Array | None = None,
+      cloud_path_ice: Array | None = None,
+      cloud_tau_scale_liq: Array | float | None = None,
+      cloud_tau_scale_ice: Array | float | None = None,
+  ) -> dict[str, Array]:
+    """Mixes cloud optics into the gas optical properties of one g-point.
+
+    The cloud half of `compute_{lw,sw}_optical_properties`; shortwave cloud
+    optics are delta-scaled before the mix, as there.
+
+    Args:
+      igpt: The spectral interval index, or g-point.
+      gas_optical_props: The output of `compute_gas_optical_properties`.
+      is_lw: `True` for the longwave problem, `False` for the shortwave one.
+      cloud_r_eff_liq: The effective radius of cloud droplets [m].
+      cloud_path_liq: The cloud liquid water path in each atmospheric grid cell
+        [kg/m²].
+      cloud_r_eff_ice: The effective radius of cloud ice particles [m].
+      cloud_path_ice: The cloud ice water path in each atmospheric grid cell
+        [kg/m²].
+      cloud_tau_scale_liq: Optional multiplier of the liquid cloud optical
+        depth; see `compute_lw_optical_properties`.
+      cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
+
+    Returns:
+      A dictionary with `'optical_depth'`, `'ssa'` and `'asymmetry_factor'`.
+    """
+    return self._combine_gas_and_cloud_properties(
+        igpt,
+        gas_optical_props,
+        is_lw=is_lw,
+        radius_eff_liq=cloud_r_eff_liq,
+        cloud_path_liq=cloud_path_liq,
+        radius_eff_ice=cloud_r_eff_ice,
+        cloud_path_ice=cloud_path_ice,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
+    )
+
+  @override
   def compute_lw_optical_properties(
       self,
       pressure: Array,
@@ -433,15 +554,9 @@ class RRTMOptics(optics_base.OpticsScheme):
         'ssa': The longwave single-scattering albedo.
         'asymmetry_factor': The longwave asymmetry factor.
     """
-    optical_depth_fn = self._optical_depth_fn(igpt, is_lw=True)
-    optical_depth_lw = optical_depth_fn(
-        molecules, temperature, pressure, vmr_fields
+    optical_props = self.compute_gas_optical_properties(
+        pressure, temperature, molecules, igpt, True, vmr_fields
     )
-    optical_props = {
-        'optical_depth': optical_depth_lw,
-        'ssa': jnp.zeros_like(optical_depth_lw),
-        'asymmetry_factor': jnp.zeros_like(optical_depth_lw),
-    }
 
     if cloud_path_liq is not None or cloud_path_ice is not None:
       return self._combine_gas_and_cloud_properties(
@@ -506,38 +621,9 @@ class RRTMOptics(optics_base.OpticsScheme):
         'ssa': The shortwave single-scattering albedo.
         'asymmetry_factor': The shortwave asymmetry factor.
     """
-    optical_depth_fn = self._optical_depth_fn(igpt, is_lw=False)
-    optical_depth_sw = optical_depth_fn(
-        molecules, temperature, pressure, vmr_fields
+    gas_optical_props = self.compute_gas_optical_properties(
+        pressure, temperature, molecules, igpt, False, vmr_fields
     )
-
-    rayl_fn = self.rayleigh_scattering_fn(igpt)
-    rayleigh_scattering = rayl_fn(molecules, temperature, pressure, vmr_fields)
-
-    optical_depth_sw = optical_depth_sw + rayleigh_scattering
-
-    # Single-scattering albedo. The division by the total optical depth is
-    # guarded with the standard double-`where`: where the optical depth is
-    # non-positive (e.g. a halo/edge cell) the forward value is defined to be
-    # zero, but the raw ``rayleigh_scattering / optical_depth_sw`` in the
-    # unselected branch would still divide by zero and leave a NaN cotangent in
-    # reverse mode. Feed the division a safe (unit) denominator on that branch so
-    # both passes stay finite while the forward result is unchanged.
-    optical_depth_is_positive = optical_depth_sw > 0
-    safe_optical_depth_sw = jnp.where(
-        optical_depth_is_positive, optical_depth_sw, 1.0
-    )
-    ssa = jnp.where(
-        optical_depth_is_positive,
-        rayleigh_scattering / safe_optical_depth_sw,
-        jnp.zeros_like(rayleigh_scattering),
-    )
-
-    gas_optical_props = {
-        'optical_depth': optical_depth_sw,
-        'ssa': ssa,
-        'asymmetry_factor': jnp.zeros_like(ssa),
-    }
     if cloud_path_liq is not None or cloud_path_ice is not None:
       return self._combine_gas_and_cloud_properties(
           igpt,
@@ -723,6 +809,24 @@ class GrayAtmosphereOptics(optics_base.OpticsScheme):
         'ssa': jnp.zeros_like(pressure),
         'asymmetry_factor': jnp.zeros_like(pressure),
     }
+
+  @override
+  def add_cloud_optical_properties(
+      self,
+      igpt: Array,
+      gas_optical_props: Mapping[str, Array],
+      is_lw: bool,
+      *args,
+      **kwargs,
+  ) -> dict[str, Array]:
+    """Returns the gas optical properties: a gray atmosphere has no clouds.
+
+    The input mapping itself is returned (not a copy), which is how a solver
+    asked for both an all-sky and a clear-sky answer recognises that the two
+    are the same problem and solves it once.
+    """
+    del igpt, is_lw, args, kwargs
+    return gas_optical_props  # pytype: disable=bad-return-type
 
   @override
   def compute_planck_sources(
