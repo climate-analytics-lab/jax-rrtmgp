@@ -28,6 +28,7 @@ from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import atmospheric_state
 from rrtmgp.optics import lookup_volume_mixing_ratio
 from rrtmgp.optics import optics
+from rrtmgp.rte import longwave_noscat
 from rrtmgp.rte import two_stream
 
 Array: TypeAlias = jax.Array
@@ -140,6 +141,8 @@ class RRTMGP:
       sfc_alb_dir: float | Array | None = None,
       sfc_alb_dif: float | Array | None = None,
       clear_sky_fluxes: bool = False,
+      lw_solver: str = two_stream.LW_SOLVER_TWO_STREAM,
+      lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -223,6 +226,12 @@ class RRTMGP:
     solve, and returns the same fluxes as one (see
     `two_stream.solve_lw(with_clear_sky=True)`). Whether they are requested
     changes nothing in the all-sky outputs.
+
+    `lw_solver` selects the longwave transport: `'two_stream'` (the default) or
+    `'noscat'`, RTE's absorption-only solver (one angle with secant
+    `lw_secant`, default `1 / 0.6096748751`; cloud and aerosol scattering
+    dropped, as in ECHAM6). It applies to the clear-sky diagnostic as well. The
+    shortwave is always two-stream. See `two_stream.solve_lw`.
 
     Returns:
       A dictionary containing the following keys:
@@ -335,6 +344,8 @@ class RRTMGP:
         cloud_tau_scale_liq=cloud_tau_scale_liq,
         cloud_tau_scale_ice=cloud_tau_scale_ice,
         with_clear_sky=with_clear_sky,
+        lw_solver=lw_solver,
+        lw_secant=lw_secant,
     )
     sw_fluxes = two_stream.solve_sw(
         p_ref_xxc,
