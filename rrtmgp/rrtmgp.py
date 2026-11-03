@@ -143,6 +143,7 @@ class RRTMGP:
       clear_sky_fluxes: bool = False,
       lw_solver: str = two_stream.LW_SOLVER_TWO_STREAM,
       lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
+      gas_optics_mode: str = two_stream.GAS_OPTICS_MODE_PER_GPT,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -215,6 +216,11 @@ class RRTMGP:
     launch bound rather than flop bound. See
     `two_stream._solve_over_gpoints`, which also records the two alternative
     fixes that were measured and failed.
+
+    `gas_optics_mode` selects where the gas optics is evaluated:
+    `'per_gpt'` (default) inside the spectral loop, `'all_gpts'` for every
+    g-point ahead of it, with each table read a row gather over the g-points.
+    It changes no physics. See `two_stream.solve_lw`.
 
     The clear-sky diagnostics (`do_clear_sky` in the config, or
     `clear_sky_fluxes=True` for this call) are the cloud-free atmosphere --
@@ -347,6 +353,7 @@ class RRTMGP:
           with_clear_sky=with_clear_sky,
           lw_solver=lw_solver,
           lw_secant=lw_secant,
+          gas_optics_mode=gas_optics_mode,
       )
     with jax.named_scope('sw'):
       sw_fluxes = two_stream.solve_sw(
@@ -370,6 +377,7 @@ class RRTMGP:
           sfc_alb_dir=sfc_alb_dir,
           sfc_alb_dif=sfc_alb_dif,
           with_clear_sky=with_clear_sky,
+          gas_optics_mode=gas_optics_mode,
       )
     if with_clear_sky:
       lw_fluxes, lw_fluxes_clearsky = two_stream.split_clear_sky_fluxes(

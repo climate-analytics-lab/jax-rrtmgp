@@ -48,6 +48,14 @@ DEFAULT_GPT_CHUNK = 1
 LW_SOLVER_TWO_STREAM = 'two_stream'
 LW_SOLVER_NOSCAT = 'noscat'
 LW_SOLVERS = (LW_SOLVER_TWO_STREAM, LW_SOLVER_NOSCAT)
+# How the spectral loop obtains the gas optics (see `solve_lw`):
+#   'per_gpt'  -- evaluated inside the loop, one g-point (or chunk) at a time.
+#   'all_gpts' -- evaluated for every g-point before the loop, with the
+#                 g-point innermost and every table read a row gather, and read
+#                 back inside the loop.
+GAS_OPTICS_MODE_PER_GPT = 'per_gpt'
+GAS_OPTICS_MODE_ALL_GPTS = 'all_gpts'
+GAS_OPTICS_MODES = (GAS_OPTICS_MODE_PER_GPT, GAS_OPTICS_MODE_ALL_GPTS)
 
 # Prefix of the clear-sky entries `solve_{lw,sw}(with_clear_sky=True)` add to
 # their result.
@@ -74,6 +82,25 @@ def split_clear_sky_fluxes(
       if k.startswith(_CLEAR_PREFIX)
   }
   return all_sky, clear
+
+
+def _check_gas_optics_mode(
+    gas_optics_mode: str, optics_lib: optics_base.OpticsScheme
+) -> bool:
+  """Validates `gas_optics_mode`; returns whether the gas optics is hoisted."""
+  if gas_optics_mode not in GAS_OPTICS_MODES:
+    raise ValueError(
+        f'gas_optics_mode must be one of {GAS_OPTICS_MODES}, got'
+        f' {gas_optics_mode!r}.'
+    )
+  if gas_optics_mode == GAS_OPTICS_MODE_PER_GPT:
+    return False
+  if not isinstance(optics_lib, optics.RRTMOptics):
+    raise ValueError(
+        f"gas_optics_mode={GAS_OPTICS_MODE_ALL_GPTS!r} requires the RRTMOptics"
+        ' scheme (it reads the correlated-k gas-optics tables).'
+    )
+  return True
 
 
 def _gpt_chunk_plan(n_gpt: int, gpt_chunk: int) -> tuple[int, int, bool]:
@@ -218,6 +245,7 @@ def _lw_planck_sources(
     vmr_fields: dict[int, Array] | None,
     sfc_temperature: Array | float | None,
     lw_solver: str = LW_SOLVER_TWO_STREAM,
+    planck_fraction: Array | None = None,
 ) -> tuple[dict[str, Array], Array]:
   """Planck sources and the surface source of one g-point.
 
@@ -241,8 +269,14 @@ def _lw_planck_sources(
 
   # Compute Planck sources: `planck_src`, `planck_src_bottom`, `planck_src_top`,
   # and `planck_src_sfc`.
+  extra = {} if planck_fraction is None else {'planck_fraction': planck_fraction}
   planck_srcs = optics_lib.compute_planck_sources(
-      pressure, temperature, igpt, vmr_fields, sfc_temperature=sfc_temperature
+      pressure,
+      temperature,
+      igpt,
+      vmr_fields,
+      sfc_temperature=sfc_temperature,
+      **extra,
   )
 
   halo_width = 1
@@ -333,6 +367,7 @@ def solve_lw(
     with_clear_sky: bool = False,
     lw_solver: str = LW_SOLVER_TWO_STREAM,
     lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
+    gas_optics_mode: str = GAS_OPTICS_MODE_PER_GPT,
 ) -> dict[str, Array]:
   """Solves the radiative transfer equation over the longwave spectrum.
 
@@ -394,6 +429,18 @@ def solve_lw(
       cloud paths too. Has no effect in the gray atmosphere, which has no cloud
       optics.
     cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
+    gas_optics_mode: `'per_gpt'` (default) evaluates the gas optics inside
+      the spectral loop, a g-point (or `gpt_chunk` of them) at a time, as every
+      earlier version did. `'all_gpts'` evaluates it for every g-point before
+      the loop, with the g-point innermost and each table read a row gather over
+      the g-points, and the loop takes its g-points' slices from the result
+      (`RRTMOptics.compute_gas_optics_all_gpts`). The fluxes are the same; the
+      cost moves from per-g-point gather throughput to the memory of the
+      precomputed arrays (`n_gpt` fields each of the optical depth and of the
+      Planck fraction -- the Rayleigh optical depth in the shortwave).
+      Requires the `RRTMOptics` scheme. The precomputed stage reads the tables
+      by direct indexing (a gather), whatever `RRTMGP_LOOKUP_IMPL` selects for
+      the per-g-point path.
     with_clear_sky: Also solve the cloud-free problem (gas + aerosol, the same
       aerosol mix-in as the all-sky problem) and return it under `clear_`
       prefixed keys. The gas optics and the Planck sources, which dominate the
@@ -433,10 +480,19 @@ def solve_lw(
         f'lw_solver must be one of {LW_SOLVERS}, got {lw_solver!r}.'
     )
   optics_lib = cast(optics.RRTMOptics | optics.GrayAtmosphereOptics, optics_lib)
+  hoist_gas_optics = _check_gas_optics_mode(gas_optics_mode, optics_lib)
   if vmr_fields is not None:
     # Convert the chemical formulas of the gas species to RRTM-consistent
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_lw)
+
+  # The gas optics of every g-point, ahead of the spectral loop. Everything in
+  # it is independent of the cloud, the aerosol and the g-point loop's order.
+  gas_all_gpts = None
+  if hoist_gas_optics:
+    gas_all_gpts = optics_lib.compute_gas_optics_all_gpts(
+        pressure, temperature, molecules, vmr_fields, is_lw=True
+    )
 
   if aerosol_optics is not None:
     assert isinstance(optics_lib, optics.RRTMOptics), (
@@ -524,28 +580,56 @@ def solve_lw(
         vmr_fields,
         sfc_temperature,
         lw_solver,
+        planck_fraction=(
+            None if gas_all_gpts is None else gas_all_gpts['planck_fraction'][igpt]
+        ),
     )
 
-    if not with_clear_sky:
-      lw_optical_props = optics_lib.compute_lw_optical_properties(
-          pressure,
-          temperature,
-          molecules,
-          igpt,
-          vmr_fields,
-          cloud_r_eff_liq,
-          cpl,
-          cloud_r_eff_ice,
-          cpi,
-          **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
+    def gas_properties():
+      if gas_all_gpts is not None:
+        return optics_lib.gas_optical_properties_from_all_gpts(
+            gas_all_gpts, igpt, True
+        )
+      return optics_lib.compute_gas_optical_properties(
+          pressure, temperature, molecules, igpt, True, vmr_fields
       )
+
+    if not with_clear_sky:
+      if gas_all_gpts is None:
+        lw_optical_props = optics_lib.compute_lw_optical_properties(
+            pressure,
+            temperature,
+            molecules,
+            igpt,
+            vmr_fields,
+            cloud_r_eff_liq,
+            cpl,
+            cloud_r_eff_ice,
+            cpi,
+            **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
+        )
+      else:
+        # The same composition `compute_lw_optical_properties` makes: the gas
+        # properties, with the cloud mixed in when there is cloud.
+        lw_optical_props = gas_properties()
+        if cpl is not None or cpi is not None:
+          lw_optical_props = optics_lib.add_cloud_optical_properties(
+              igpt,
+              lw_optical_props,
+              True,
+              cloud_r_eff_liq,
+              cpl,
+              cloud_r_eff_ice,
+              cpi,
+              **_cloud_tau_scale_kwargs(
+                  cloud_tau_scale_liq, cloud_tau_scale_ice
+              ),
+          )
       return transport(lw_optical_props, srcs, sfc_src, aer_slice)
 
     # The gas optics is the expensive, cloud-independent part: do it once and
     # form the clear-sky and all-sky optical properties from it.
-    gas_props = optics_lib.compute_gas_optical_properties(
-        pressure, temperature, molecules, igpt, True, vmr_fields
-    )
+    gas_props = gas_properties()
     has_cloud = cpl is not None or cpi is not None
     all_sky_props = gas_props
     if has_cloud:
@@ -660,6 +744,7 @@ def solve_sw(
     sfc_alb_dir: Array | float | None = None,
     sfc_alb_dif: Array | float | None = None,
     with_clear_sky: bool = False,
+    gas_optics_mode: str = GAS_OPTICS_MODE_PER_GPT,
 ) -> dict[str, Array]:
   """Solves the two-stream radiative transfer equation for shortwave.
 
@@ -725,6 +810,18 @@ def solve_sw(
       `RRTMOptics` scheme.
     sfc_alb_dif: Same as above, for diffuse light (the surface reflection of
       the downwelling diffuse flux).
+    gas_optics_mode: `'per_gpt'` (default) evaluates the gas optics inside
+      the spectral loop, a g-point (or `gpt_chunk` of them) at a time, as every
+      earlier version did. `'all_gpts'` evaluates it for every g-point before
+      the loop, with the g-point innermost and each table read a row gather over
+      the g-points, and the loop takes its g-points' slices from the result
+      (`RRTMOptics.compute_gas_optics_all_gpts`). The fluxes are the same; the
+      cost moves from per-g-point gather throughput to the memory of the
+      precomputed arrays (`n_gpt` fields each of the optical depth and of the
+      Planck fraction -- the Rayleigh optical depth in the shortwave).
+      Requires the `RRTMOptics` scheme. The precomputed stage reads the tables
+      by direct indexing (a gather), whatever `RRTMGP_LOOKUP_IMPL` selects for
+      the per-g-point path.
     with_clear_sky: Also solve the cloud-free problem (gas + aerosol, the same
       aerosol mix-in, surface albedos and night masking as the all-sky problem)
       and return it under `clear_` prefixed keys. The gas optics, which
@@ -753,10 +850,18 @@ def solve_sw(
   """
   zenith = atmos_state.zenith
   optics_lib = cast(optics.RRTMOptics | optics.GrayAtmosphereOptics, optics_lib)
+  hoist_gas_optics = _check_gas_optics_mode(gas_optics_mode, optics_lib)
   if vmr_fields is not None:
     # Convert the chemical formulas of the gas species to RRTM-consistent
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_sw)
+
+  # The gas optics of every g-point, ahead of the spectral loop (see `solve_lw`).
+  gas_all_gpts = None
+  if hoist_gas_optics:
+    gas_all_gpts = optics_lib.compute_gas_optics_all_gpts(
+        pressure, temperature, molecules, vmr_fields, is_lw=False
+    )
 
   if aerosol_optics is not None:
     assert isinstance(optics_lib, optics.RRTMOptics), (
@@ -883,30 +988,51 @@ def solve_sw(
       ]
       return sw_fluxes
 
-    if not with_clear_sky:
-      return solve_optical_props(
-          optics_lib.compute_sw_optical_properties(
-              pressure,
-              temperature,
-              molecules,
-              igpt,
-              vmr_fields,
-              cloud_r_eff_liq,
-              cpl,
-              cloud_r_eff_ice,
-              cpi,
-              **_cloud_tau_scale_kwargs(
-                  cloud_tau_scale_liq, cloud_tau_scale_ice
-              ),
-          )
+    def gas_properties():
+      if gas_all_gpts is not None:
+        return optics_lib.gas_optical_properties_from_all_gpts(
+            gas_all_gpts, igpt, False
+        )
+      return optics_lib.compute_gas_optical_properties(
+          pressure, temperature, molecules, igpt, False, vmr_fields
       )
+
+    if not with_clear_sky:
+      if gas_all_gpts is None:
+        return solve_optical_props(
+            optics_lib.compute_sw_optical_properties(
+                pressure,
+                temperature,
+                molecules,
+                igpt,
+                vmr_fields,
+                cloud_r_eff_liq,
+                cpl,
+                cloud_r_eff_ice,
+                cpi,
+                **_cloud_tau_scale_kwargs(
+                    cloud_tau_scale_liq, cloud_tau_scale_ice
+                ),
+            )
+        )
+      sw_optical_props = gas_properties()
+      if cpl is not None or cpi is not None:
+        sw_optical_props = optics_lib.add_cloud_optical_properties(
+            igpt,
+            sw_optical_props,
+            False,
+            cloud_r_eff_liq,
+            cpl,
+            cloud_r_eff_ice,
+            cpi,
+            **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
+        )
+      return solve_optical_props(sw_optical_props)
 
     # The gas optics (absorption + Rayleigh) is the expensive, cloud-independent
     # part: do it once and form the clear-sky and all-sky optical properties
     # from it.
-    gas_props = optics_lib.compute_gas_optical_properties(
-        pressure, temperature, molecules, igpt, False, vmr_fields
-    )
+    gas_props = gas_properties()
     has_cloud = cpl is not None or cpi is not None
     all_sky_props = gas_props
     if has_cloud:

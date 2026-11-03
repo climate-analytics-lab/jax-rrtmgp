@@ -437,8 +437,14 @@ class RRTMOptics(optics_base.OpticsScheme):
       rayleigh_scattering = rayl_fn(
           molecules, temperature, pressure, vmr_fields
       )
+    return self._sw_gas_properties(optical_depth_sw, rayleigh_scattering)
 
-    optical_depth_sw = optical_depth_sw + rayleigh_scattering
+  @staticmethod
+  def _sw_gas_properties(
+      absorption_optical_depth: Array, rayleigh_scattering: Array
+  ) -> dict[str, Array]:
+    """Shortwave gas optical properties from absorption and Rayleigh depths."""
+    optical_depth_sw = absorption_optical_depth + rayleigh_scattering
 
     # Single-scattering albedo. The division by the total optical depth is
     # guarded with the standard double-`where`: where the optical depth is
@@ -462,6 +468,97 @@ class RRTMOptics(optics_base.OpticsScheme):
         'ssa': ssa,
         'asymmetry_factor': jnp.zeros_like(ssa),
     }
+
+  def compute_gas_optics_all_gpts(
+      self,
+      pressure: Array,
+      temperature: Array,
+      molecules: Array,
+      vmr_fields: dict[int, Array] | None = None,
+      *,
+      is_lw: bool,
+  ) -> dict[str, Array]:
+    """Gas optics of every g-point of the spectrum, in one pass.
+
+    The same quantities `compute_gas_optical_properties` and
+    `compute_planck_sources` evaluate for one g-point at a time -- the gas
+    absorption optical depth, the shortwave Rayleigh optical depth and the
+    longwave Planck fraction -- for all g-points together, with the g-point
+    axis leading (`(n_gpt, nx, ny, nz)`) so a spectral loop takes a g-point, or
+    a chunk of them, as one contiguous slab. The g-independent interpolation
+    work is done once and every table read is a row gather over the g-point
+    axis; see `gas_optics.compute_optical_depth_all_gpts`. The values equal the
+    per-g-point ones.
+
+    The arrays are `n_gpt` times the size of a field: at T63L47 about 460 MB
+    for each longwave array and 400 MB for each shortwave array.
+
+    Args:
+      pressure: The pressure field [Pa].
+      temperature: The temperature [K].
+      molecules: The number of molecules in an atmospheric grid cell per area
+        [molecules / m^2].
+      vmr_fields: An optional dictionary containing precomputed volume mixing
+        ratio fields, keyed by gas index, that will overwrite the global means.
+      is_lw: `True` for the longwave problem, `False` for the shortwave one.
+
+    Returns:
+      Longwave: `{'optical_depth', 'planck_fraction'}`. Shortwave:
+      `{'optical_depth', 'rayleigh'}`, where `'optical_depth'` is the
+      absorption optical depth alone, as `compute_gas_optical_properties`
+      forms the Rayleigh sum itself.
+    """
+    lookup = self.gas_optics_lw if is_lw else self.gas_optics_sw
+    interp = gas_optics.CellInterpolation(
+        lookup, self.vmr_lib, temperature, pressure, vmr_fields
+    )
+    with jax.named_scope('gas_optics'):
+      out = {}
+      with jax.named_scope('tau'):
+        out['optical_depth'] = gas_optics.compute_optical_depth_all_gpts(
+            lookup, self.vmr_lib, molecules, temperature, pressure, vmr_fields,
+            interp=interp,
+        )
+      if is_lw:
+        with jax.named_scope('planck'):
+          out['planck_fraction'] = gas_optics.compute_planck_fraction_all_gpts(
+              lookup, self.vmr_lib, pressure, temperature, vmr_fields,
+              interp=interp,
+          )
+      else:
+        with jax.named_scope('rayleigh'):
+          out['rayleigh'] = gas_optics.compute_rayleigh_optical_depth_all_gpts(
+              lookup, self.vmr_lib, molecules, temperature, pressure,
+              vmr_fields, interp=interp,
+          )
+    return out
+
+  def gas_optical_properties_from_all_gpts(
+      self, gas_optics_all_gpts: Mapping[str, Array], igpt: Array, is_lw: bool
+  ) -> dict[str, Array]:
+    """The gas optical properties of one g-point, from precomputed arrays.
+
+    The same result as `compute_gas_optical_properties`, formed from the
+    arrays of `compute_gas_optics_all_gpts` instead of evaluated.
+
+    Args:
+      gas_optics_all_gpts: The output of `compute_gas_optics_all_gpts`.
+      igpt: The g-point, a scalar index (traced or not).
+      is_lw: `True` for the longwave problem, `False` for the shortwave one.
+
+    Returns:
+      A dictionary with `'optical_depth'`, `'ssa'` and `'asymmetry_factor'`.
+    """
+    optical_depth = gas_optics_all_gpts['optical_depth'][igpt]
+    if is_lw:
+      return {
+          'optical_depth': optical_depth,
+          'ssa': jnp.zeros_like(optical_depth),
+          'asymmetry_factor': jnp.zeros_like(optical_depth),
+      }
+    return self._sw_gas_properties(
+        optical_depth, gas_optics_all_gpts['rayleigh'][igpt]
+    )
 
   @override
   def add_cloud_optical_properties(
@@ -654,6 +751,7 @@ class RRTMOptics(optics_base.OpticsScheme):
       igpt: Array,
       vmr_fields: dict[int, Array] | None = None,
       sfc_temperature: Array | None = None,
+      planck_fraction: Array | None = None,
   ) -> dict[str, Array]:
     """Compute the monochromatic Planck sources given the atmospheric state.
 
@@ -666,6 +764,9 @@ class RRTMOptics(optics_base.OpticsScheme):
       vmr_fields: An optional dictionary containing precomputed volume mixing
         ratio fields, keyed by gas index, that will overwrite the global means.
       sfc_temperature: The optional surface temperature [K], 2D field.
+      planck_fraction: The g-point's Planck fraction, if the caller already has
+        it (a slice of `compute_gas_optics_all_gpts`'s `'planck_fraction'`);
+        evaluated from the tables when omitted.
 
     Returns:
       A dictionary containing the Planck source at the cell center
@@ -680,11 +781,13 @@ class RRTMOptics(optics_base.OpticsScheme):
     temperature_bottom, temperature_top = optics_base.reconstruct_face_values(
         temperature, f_lower_bc=sfc_temperature
     )
-    with jax.named_scope('gas_optics'), jax.named_scope('planck'):
-      planck_fraction_fn = self.planck_fraction_fn(igpt)
-      planck_fraction = planck_fraction_fn(pressure, temperature, vmr_fields)
+    if planck_fraction is None:
+      with jax.named_scope('gas_optics'), jax.named_scope('planck'):
+        planck_fraction_fn = self.planck_fraction_fn(igpt)
+        planck_fraction = planck_fraction_fn(pressure, temperature, vmr_fields)
 
-      planck_src_fn = self.planck_src_fn(igpt)
+    planck_src_fn = self.planck_src_fn(igpt)
+    with jax.named_scope('sources'):
       planck_src = planck_src_fn(planck_fraction, temperature)
       planck_src_top = planck_src_fn(planck_fraction, temperature_top)
       planck_src_bottom = planck_src_fn(planck_fraction, temperature_bottom)
@@ -699,9 +802,10 @@ class RRTMOptics(optics_base.OpticsScheme):
       # Extract the first interior node for surface calculations.
       planck_fraction_0 = planck_fraction[:, :, 1]
 
-      planck_srcs['planck_src_sfc'] = planck_src_fn(
-          planck_fraction_0, sfc_temperature
-      )
+      with jax.named_scope('sources'):
+        planck_srcs['planck_src_sfc'] = planck_src_fn(
+            planck_fraction_0, sfc_temperature
+        )
 
     return planck_srcs
 
