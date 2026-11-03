@@ -110,6 +110,7 @@ from rrtmgp.optics import gas_optics
 from rrtmgp.optics import lookup_gas_optics_longwave
 from rrtmgp.optics import lookup_gas_optics_shortwave
 from rrtmgp.optics import optics
+from rrtmgp.rte import longwave_noscat
 from rrtmgp.rte import monochromatic_two_stream
 from rrtmgp.rte import two_stream
 
@@ -272,6 +273,33 @@ _MAX_LAUNCHES = {
     ('cpu', 'sw', False): 59_000,
     ('cpu', 'sw', True): 288_000,
 }
+
+# The no-scattering longwave solver (`lw_solver='noscat'`) has its own budgets,
+# separate from the two-stream ones above: it is a different program, and the
+# ceilings of the two-stream solve would admit the no-scattering one growing
+# several-fold before tripping. Same shape and same conventions as above (CPU
+# backend, jax 0.10.2, `_N_HORIZ`, g256, ceilings ~30% over for arithmetic and
+# ~20% over for launches). The two-stream longwave solve measures 3.01 Gflop,
+# 3.44 M transcendentals and 51,504 launches (`use_scan=False`) on the same
+# build; the no-scattering one:
+#
+#                        flops          transcendentals   launches
+#   LW noscat use_scan=False  2,248,800,256     1,146,752    20,533
+#   LW noscat use_scan=True   2,018,525,312     1,146,752   143,157
+#
+# i.e. one `exp` per cell where the two-stream cell kernel has three
+# transcendentals and ~340 flops, and no albedo/emission recurrences -- two
+# first-order recurrences instead of three -- which is where the launch count
+# goes. The per-cell kernel (`lw_noscat_layer_sources`), in isolation: 35 flops
+# and 1 transcendental per element, against the two-stream kernel's 340 / 3.
+_MAX_NOSCAT_FLOPS = {True: 2_650_000_000, False: 2_950_000_000}
+_MAX_NOSCAT_TRANSCENDENTALS = {True: 1_500_000, False: 1_500_000}
+_MAX_NOSCAT_LAUNCHES = {
+    ('cpu', False): 25_000,
+    ('cpu', True): 172_000,
+}
+_MAX_NOSCAT_KERNEL_FLOPS = 38_500_000
+_MAX_NOSCAT_KERNEL_TRANSCENDENTALS = 1_100_000
 
 # HLO text parsing for the launch count. Instruction lines look like
 #   %name = f32[16,16,62]{2,1,0} fusion(%a, %b), kind=kLoop, calls=%fused.1
@@ -517,12 +545,13 @@ def _cost_of(fn, *args) -> dict[str, float]:
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled_solve(band: str, use_scan: bool):
+def _compiled_solve(band: str, use_scan: bool, lw_solver: str = 'two_stream'):
     """The compiled solve for `band`, cached.
 
     Compiling the solve at the production shape is the expensive part of this
     file, and the flops, transcendental and launch-count guards all want the
-    same four executables. Caching keeps the suite to one compile each.
+    same executables. Caching keeps the suite to one compile each. `lw_solver`
+    only means something for the longwave.
     """
     (optics_lib, atmos_state, p, t, molecules, vmr_fields,
      sfc_temperature) = _radiation_setup()
@@ -530,7 +559,7 @@ def _compiled_solve(band: str, use_scan: bool):
         if band == 'lw':
             return two_stream.solve_lw(
                 p, temp, molecules, optics_lib, atmos_state, vmr_fields,
-                sfc_temperature, use_scan=use_scan,
+                sfc_temperature, use_scan=use_scan, lw_solver=lw_solver,
             )['flux_net']
         return two_stream.solve_sw(
             p, temp, molecules, optics_lib, atmos_state, vmr_fields,
@@ -540,16 +569,20 @@ def _compiled_solve(band: str, use_scan: bool):
     return jax.jit(solve).lower(t).compile()
 
 
-def _compiled_cost(band: str, use_scan: bool) -> dict[str, float]:
+def _compiled_cost(
+    band: str, use_scan: bool, lw_solver: str = 'two_stream'
+) -> dict[str, float]:
     """Compile the solve for `band` and return XLA's cost analysis."""
-    cost = _compiled_solve(band, use_scan).cost_analysis()
+    cost = _compiled_solve(band, use_scan, lw_solver).cost_analysis()
     return cost[0] if isinstance(cost, list) else cost
 
 
-def _solve_launch_count(band: str, use_scan: bool):
+def _solve_launch_count(
+    band: str, use_scan: bool, lw_solver: str = 'two_stream'
+):
     """Kernel launches per solve, and a histogram of what issues them."""
     histogram = collections.Counter()
-    text = _compiled_solve(band, use_scan).as_text()
+    text = _compiled_solve(band, use_scan, lw_solver).as_text()
     return _count_launches(text, histogram), histogram
 
 
@@ -572,6 +605,18 @@ def _kernel_cost(band: str) -> dict[str, float]:
             return monochromatic_two_stream.sw_cell_properties(0.5, tau, ssa, g)
 
         return _cost_of(sw_kernel, tau, ssa, asymmetry)
+
+    if band == 'lw_noscat':
+        # Optical path out to a few units, as above, and Planck sources whose
+        # centre value differs from its faces, so no term is optimised away.
+        def noscat_kernel(path, centre, top, bottom):
+            return longwave_noscat.lw_noscat_layer_sources(
+                path, centre, top, bottom
+            )
+
+        planck = [jnp.asarray(rng.uniform(0.0, 10.0, shape), f32)
+                  for _ in range(3)]
+        return _cost_of(noscat_kernel, tau, *planck)
 
     def lw_kernel(tau, ssa, s, g):
         return monochromatic_two_stream.lw_cell_source_and_properties(
@@ -721,6 +766,64 @@ class PerformanceTest(unittest.TestCase):
         for use_scan in (True, False):
             with self.subTest(use_scan=use_scan):
                 self._assert_launches_within_budget('sw', use_scan)
+
+    def test_noscat_longwave_solve_arithmetic_within_budget(self):
+        """The no-scattering solver, both `use_scan` settings (see above)."""
+        for use_scan in (True, False):
+            with self.subTest(use_scan=use_scan):
+                label = f'LW noscat solve (use_scan={use_scan})'
+                cost = _compiled_cost('lw', use_scan, 'noscat')
+                self._assert_metrics_present(cost, label)
+                self.assertLessEqual(
+                    cost['flops'], _MAX_NOSCAT_FLOPS[use_scan],
+                    msg=(f'{label} costs {cost["flops"]:,.0f} flops per g-point '
+                         f'body, over the {_MAX_NOSCAT_FLOPS[use_scan]:,} '
+                         f'budget.'),
+                )
+                self.assertLessEqual(
+                    cost['transcendentals'],
+                    _MAX_NOSCAT_TRANSCENDENTALS[use_scan],
+                    msg=(f'{label} costs {cost["transcendentals"]:,.0f} '
+                         f'transcendentals per g-point body, over the '
+                         f'{_MAX_NOSCAT_TRANSCENDENTALS[use_scan]:,} budget.'),
+                )
+
+    def test_noscat_longwave_solve_launch_count_within_budget(self):
+        for use_scan in (True, False):
+            with self.subTest(use_scan=use_scan):
+                platform = jax.devices()[0].platform
+                key = (platform, use_scan)
+                if key not in _MAX_NOSCAT_LAUNCHES:
+                    self.skipTest(
+                        f'no no-scattering launch budget calibrated for '
+                        f'platform {platform!r}; see '
+                        f'`_assert_launches_within_budget`.'
+                    )
+                label = f'LW noscat solve (use_scan={use_scan}) on {platform}'
+                launches, histogram = _solve_launch_count(
+                    'lw', use_scan, 'noscat'
+                )
+                self.assertGreater(launches, 0, msg=f'{label}: nothing counted')
+                self.assertLessEqual(
+                    launches, _MAX_NOSCAT_LAUNCHES[key],
+                    msg=(f'{label} issues {launches:,} kernel launches, over '
+                         f'the {_MAX_NOSCAT_LAUNCHES[key]:,} budget. Biggest '
+                         f'contributors: {histogram.most_common(5)}.'),
+                )
+
+    def test_noscat_cell_kernel_within_budget(self):
+        cost = _kernel_cost('lw_noscat')
+        self._assert_metrics_present(cost, 'LW noscat cell kernel')
+        self.assertLessEqual(
+            cost['flops'], _MAX_NOSCAT_KERNEL_FLOPS,
+            msg=f'LW noscat cell kernel costs {cost["flops"]:,.0f} flops.',
+        )
+        self.assertLessEqual(
+            cost['transcendentals'], _MAX_NOSCAT_KERNEL_TRANSCENDENTALS,
+            msg=(f'LW noscat cell kernel costs '
+                 f'{cost["transcendentals"]:,.0f} transcendentals; it should '
+                 f'be one `exp` per element.'),
+        )
 
     def test_launch_count_sees_loop_trip_counts(self):
         """The counter must multiply a loop body by its trip count.
