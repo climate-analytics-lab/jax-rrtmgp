@@ -415,23 +415,28 @@ class RRTMOptics(optics_base.OpticsScheme):
       A dictionary with `'optical_depth'`, `'ssa'` and `'asymmetry_factor'`.
     """
     if is_lw:
-      optical_depth_fn = self._optical_depth_fn(igpt, is_lw=True)
-      optical_depth_lw = optical_depth_fn(
-          molecules, temperature, pressure, vmr_fields
-      )
+      with jax.named_scope('gas_optics'), jax.named_scope('tau'):
+        optical_depth_fn = self._optical_depth_fn(igpt, is_lw=True)
+        optical_depth_lw = optical_depth_fn(
+            molecules, temperature, pressure, vmr_fields
+        )
       return {
           'optical_depth': optical_depth_lw,
           'ssa': jnp.zeros_like(optical_depth_lw),
           'asymmetry_factor': jnp.zeros_like(optical_depth_lw),
       }
 
-    optical_depth_fn = self._optical_depth_fn(igpt, is_lw=False)
-    optical_depth_sw = optical_depth_fn(
-        molecules, temperature, pressure, vmr_fields
-    )
+    with jax.named_scope('gas_optics'), jax.named_scope('tau'):
+      optical_depth_fn = self._optical_depth_fn(igpt, is_lw=False)
+      optical_depth_sw = optical_depth_fn(
+          molecules, temperature, pressure, vmr_fields
+      )
 
-    rayl_fn = self.rayleigh_scattering_fn(igpt)
-    rayleigh_scattering = rayl_fn(molecules, temperature, pressure, vmr_fields)
+    with jax.named_scope('gas_optics'), jax.named_scope('rayleigh'):
+      rayl_fn = self.rayleigh_scattering_fn(igpt)
+      rayleigh_scattering = rayl_fn(
+          molecules, temperature, pressure, vmr_fields
+      )
 
     optical_depth_sw = optical_depth_sw + rayleigh_scattering
 
@@ -493,17 +498,18 @@ class RRTMOptics(optics_base.OpticsScheme):
     Returns:
       A dictionary with `'optical_depth'`, `'ssa'` and `'asymmetry_factor'`.
     """
-    return self._combine_gas_and_cloud_properties(
-        igpt,
-        gas_optical_props,
-        is_lw=is_lw,
-        radius_eff_liq=cloud_r_eff_liq,
-        cloud_path_liq=cloud_path_liq,
-        radius_eff_ice=cloud_r_eff_ice,
-        cloud_path_ice=cloud_path_ice,
-        cloud_tau_scale_liq=cloud_tau_scale_liq,
-        cloud_tau_scale_ice=cloud_tau_scale_ice,
-    )
+    with jax.named_scope('cloud_optics'):
+      return self._combine_gas_and_cloud_properties(
+          igpt,
+          gas_optical_props,
+          is_lw=is_lw,
+          radius_eff_liq=cloud_r_eff_liq,
+          cloud_path_liq=cloud_path_liq,
+          radius_eff_ice=cloud_r_eff_ice,
+          cloud_path_ice=cloud_path_ice,
+          cloud_tau_scale_liq=cloud_tau_scale_liq,
+          cloud_tau_scale_ice=cloud_tau_scale_ice,
+      )
 
   @override
   def compute_lw_optical_properties(
@@ -559,17 +565,18 @@ class RRTMOptics(optics_base.OpticsScheme):
     )
 
     if cloud_path_liq is not None or cloud_path_ice is not None:
-      return self._combine_gas_and_cloud_properties(
-          igpt,
-          optical_props,
-          is_lw=True,
-          radius_eff_liq=cloud_r_eff_liq,
-          cloud_path_liq=cloud_path_liq,
-          radius_eff_ice=cloud_r_eff_ice,
-          cloud_path_ice=cloud_path_ice,
-          cloud_tau_scale_liq=cloud_tau_scale_liq,
-          cloud_tau_scale_ice=cloud_tau_scale_ice,
-      )
+      with jax.named_scope('cloud_optics'):
+        return self._combine_gas_and_cloud_properties(
+            igpt,
+            optical_props,
+            is_lw=True,
+            radius_eff_liq=cloud_r_eff_liq,
+            cloud_path_liq=cloud_path_liq,
+            radius_eff_ice=cloud_r_eff_ice,
+            cloud_path_ice=cloud_path_ice,
+            cloud_tau_scale_liq=cloud_tau_scale_liq,
+            cloud_tau_scale_ice=cloud_tau_scale_ice,
+        )
     return optical_props
 
   @override
@@ -625,17 +632,18 @@ class RRTMOptics(optics_base.OpticsScheme):
         pressure, temperature, molecules, igpt, False, vmr_fields
     )
     if cloud_path_liq is not None or cloud_path_ice is not None:
-      return self._combine_gas_and_cloud_properties(
-          igpt,
-          gas_optical_props,
-          is_lw=False,
-          radius_eff_liq=cloud_r_eff_liq,
-          cloud_path_liq=cloud_path_liq,
-          radius_eff_ice=cloud_r_eff_ice,
-          cloud_path_ice=cloud_path_ice,
-          cloud_tau_scale_liq=cloud_tau_scale_liq,
-          cloud_tau_scale_ice=cloud_tau_scale_ice,
-      )
+      with jax.named_scope('cloud_optics'):
+        return self._combine_gas_and_cloud_properties(
+            igpt,
+            gas_optical_props,
+            is_lw=False,
+            radius_eff_liq=cloud_r_eff_liq,
+            cloud_path_liq=cloud_path_liq,
+            radius_eff_ice=cloud_r_eff_ice,
+            cloud_path_ice=cloud_path_ice,
+            cloud_tau_scale_liq=cloud_tau_scale_liq,
+            cloud_tau_scale_ice=cloud_tau_scale_ice,
+        )
     return gas_optical_props
 
   @override
@@ -672,13 +680,14 @@ class RRTMOptics(optics_base.OpticsScheme):
     temperature_bottom, temperature_top = optics_base.reconstruct_face_values(
         temperature, f_lower_bc=sfc_temperature
     )
-    planck_fraction_fn = self.planck_fraction_fn(igpt)
-    planck_fraction = planck_fraction_fn(pressure, temperature, vmr_fields)
+    with jax.named_scope('gas_optics'), jax.named_scope('planck'):
+      planck_fraction_fn = self.planck_fraction_fn(igpt)
+      planck_fraction = planck_fraction_fn(pressure, temperature, vmr_fields)
 
-    planck_src_fn = self.planck_src_fn(igpt)
-    planck_src = planck_src_fn(planck_fraction, temperature)
-    planck_src_top = planck_src_fn(planck_fraction, temperature_top)
-    planck_src_bottom = planck_src_fn(planck_fraction, temperature_bottom)
+      planck_src_fn = self.planck_src_fn(igpt)
+      planck_src = planck_src_fn(planck_fraction, temperature)
+      planck_src_top = planck_src_fn(planck_fraction, temperature_top)
+      planck_src_bottom = planck_src_fn(planck_fraction, temperature_bottom)
 
     planck_srcs = {
         'planck_src': planck_src,

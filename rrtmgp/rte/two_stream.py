@@ -153,7 +153,9 @@ def _solve_over_gpoints(
     # leading axis is introduced and the spectral sum is accumulated in the same
     # order, so this path is bit-for-bit the historical result.
     def step_fn(igpt, cumulative):
-      return jax.tree.map(jnp.add, one_gpt(igpt), cumulative)
+      per_gpt = one_gpt(igpt)
+      with jax.named_scope('spectral_sum'):
+        return jax.tree.map(jnp.add, per_gpt, cumulative)
 
     return jax.lax.fori_loop(0, n_gpt, step_fn, init_val)
 
@@ -184,7 +186,8 @@ def _solve_over_gpoints(
         chunked = jnp.where(mask, chunked, jnp.zeros_like(chunked))
       return jnp.sum(chunked, axis=0) + cumulative
 
-    return jax.tree.map(reduce_and_add, per_gpt, cumulative)
+    with jax.named_scope('spectral_sum'):
+      return jax.tree.map(reduce_and_add, per_gpt, cumulative)
 
   return jax.lax.fori_loop(0, n_chunks, step_fn, init_val)
 
@@ -249,7 +252,8 @@ def _lw_planck_sources(
 
   # Compute combined Planck sources.  Output keys are `planck_src_bottom` and
   # `planck_src_top`.
-  combined_srcs = monochromatic_two_stream.lw_combine_sources(planck_srcs)
+  with jax.named_scope('cell'):
+    combined_srcs = monochromatic_two_stream.lw_combine_sources(planck_srcs)
   if lw_solver == LW_SOLVER_NOSCAT:
     # One source per level, shared by the two layers that meet there: current
     # upstream RTE feeds `lw_solver_noscat_oneangle` the same geometric-mean
@@ -281,18 +285,20 @@ def _lw_cell_properties(
   # are passed through as-is (no delta-scaling applied), matching the convention
   # of simple aerosol parameterisations.
   if aerosol_optics_slice is not None:
-    lw_optical_props = optics_lib.combine_optical_properties(
-        lw_optical_props, aerosol_optics_slice
-    )
+    with jax.named_scope('aerosol_optics'):
+      lw_optical_props = optics_lib.combine_optical_properties(
+          lw_optical_props, aerosol_optics_slice
+      )
 
   # Compute `t_diff`, `r_diff`, `src_up`, and `src_down`.
-  src_and_properties = monochromatic_two_stream.lw_cell_source_and_properties(
-      lw_optical_props['optical_depth'],
-      lw_optical_props['ssa'],
-      combined_srcs['planck_src_bottom'],
-      combined_srcs['planck_src_top'],
-      lw_optical_props['asymmetry_factor'],
-  )
+  with jax.named_scope('cell'):
+    src_and_properties = monochromatic_two_stream.lw_cell_source_and_properties(
+        lw_optical_props['optical_depth'],
+        lw_optical_props['ssa'],
+        combined_srcs['planck_src_bottom'],
+        combined_srcs['planck_src_top'],
+        lw_optical_props['asymmetry_factor'],
+    )
   src_and_properties['sfc_src'] = sfc_src
 
   return src_and_properties
@@ -459,35 +465,38 @@ def solve_lw(
       # two-stream path does (`_lw_cell_properties`); the solver then keeps only
       # the absorption part of the combined optical depth.
       if aer_slice is not None:
-        lw_optical_props = optics_lib.combine_optical_properties(
-            lw_optical_props, aer_slice
+        with jax.named_scope('aerosol_optics'):
+          lw_optical_props = optics_lib.combine_optical_properties(
+              lw_optical_props, aer_slice
+          )
+      with jax.named_scope('transport'):
+        return longwave_noscat.lw_noscat_transport(
+            lw_optical_props['optical_depth'],
+            lw_optical_props['ssa'],
+            srcs['planck_src'],
+            srcs['planck_src_top'],
+            srcs['planck_src_bottom'],
+            toa_flux_down_lw,
+            sfc_src,
+            sfc_emissivity_lw,
+            use_scan,
+            secant=lw_secant,
         )
-      return longwave_noscat.lw_noscat_transport(
-          lw_optical_props['optical_depth'],
-          lw_optical_props['ssa'],
-          srcs['planck_src'],
-          srcs['planck_src_top'],
-          srcs['planck_src_bottom'],
-          toa_flux_down_lw,
-          sfc_src,
-          sfc_emissivity_lw,
-          use_scan,
-          secant=lw_secant,
-      )
 
     optical_props_2stream = _lw_cell_properties(
         lw_optical_props, srcs, sfc_src, optics_lib, aer_slice
     )
-    fluxes = monochromatic_two_stream.lw_transport(
-        optical_props_2stream['t_diff'],
-        optical_props_2stream['r_diff'],
-        optical_props_2stream['src_up'],
-        optical_props_2stream['src_down'],
-        toa_flux_down_lw,
-        sfc_src,
-        sfc_emissivity_lw,
-        use_scan,
-    )
+    with jax.named_scope('transport'):
+      fluxes = monochromatic_two_stream.lw_transport(
+          optical_props_2stream['t_diff'],
+          optical_props_2stream['r_diff'],
+          optical_props_2stream['src_up'],
+          optical_props_2stream['src_down'],
+          toa_flux_down_lw,
+          sfc_src,
+          sfc_emissivity_lw,
+          use_scan,
+      )
     # keys: 'flux_up', 'flux_down', 'flux_net'
     return fluxes
 
@@ -831,36 +840,40 @@ def solve_sw(
       # gas+cloud combination (where cloud has already been delta-scaled in SW),
       # so the aerosol tau/ssa/g are passed through as-is.
       if aer_slice is not None:
-        sw_optical_props = optics_lib.combine_optical_properties(
-            sw_optical_props, aer_slice
+        with jax.named_scope('aerosol_optics'):
+          sw_optical_props = optics_lib.combine_optical_properties(
+              sw_optical_props, aer_slice
+          )
+      with jax.named_scope('cell'):
+        optical_props_2stream = monochromatic_two_stream.sw_cell_properties(
+            safe_zenith,
+            sw_optical_props['optical_depth'],
+            sw_optical_props['ssa'],
+            sw_optical_props['asymmetry_factor'],
         )
-      optical_props_2stream = monochromatic_two_stream.sw_cell_properties(
-          safe_zenith,
-          sw_optical_props['optical_depth'],
-          sw_optical_props['ssa'],
-          sw_optical_props['asymmetry_factor'],
-      )
 
-      sources_2stream = monochromatic_two_stream.sw_cell_source(
-          t_dir=optical_props_2stream['t_dir'],
-          r_dir=optical_props_2stream['r_dir'],
-          optical_depth=sw_optical_props['optical_depth'],
-          toa_flux=toa_flux,
-          sfc_albedo_direct=sfc_albedo_dir,
-          zenith=safe_zenith,
-          use_scan=use_scan,
-      )
+      with jax.named_scope('sources'):
+        sources_2stream = monochromatic_two_stream.sw_cell_source(
+            t_dir=optical_props_2stream['t_dir'],
+            r_dir=optical_props_2stream['r_dir'],
+            optical_depth=sw_optical_props['optical_depth'],
+            toa_flux=toa_flux,
+            sfc_albedo_direct=sfc_albedo_dir,
+            zenith=safe_zenith,
+            use_scan=use_scan,
+        )
 
-      sw_fluxes = monochromatic_two_stream.sw_transport(
-          t_diff=optical_props_2stream['t_diff'],
-          r_diff=optical_props_2stream['r_diff'],
-          src_up=sources_2stream['src_up'],
-          src_down=sources_2stream['src_down'],
-          sfc_src=sources_2stream['sfc_src'],
-          sfc_albedo=sfc_albedo_dif,
-          flux_down_dir=sources_2stream['flux_down_dir'],
-          use_scan=use_scan,
-      )
+      with jax.named_scope('transport'):
+        sw_fluxes = monochromatic_two_stream.sw_transport(
+            t_diff=optical_props_2stream['t_diff'],
+            r_diff=optical_props_2stream['r_diff'],
+            src_up=sources_2stream['src_up'],
+            src_down=sources_2stream['src_down'],
+            sfc_src=sources_2stream['sfc_src'],
+            sfc_albedo=sfc_albedo_dif,
+            flux_down_dir=sources_2stream['flux_down_dir'],
+            use_scan=use_scan,
+        )
       # The direct beam reaching the surface, for the host model's direct /
       # diffuse partition of the surface flux. Only the surface plane is kept,
       # so the spectral sum carries one extra 2D field rather than a 3D one.
