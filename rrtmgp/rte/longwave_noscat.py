@@ -54,7 +54,6 @@ from typing import TypeAlias
 import jax
 import jax.numpy as jnp
 import numpy as np
-from rrtmgp import kernel_ops
 from rrtmgp.rte import rte_utils
 
 Array: TypeAlias = jax.Array
@@ -65,6 +64,17 @@ StatesMap: TypeAlias = dict[str, Array]
 # is the default of upstream `rte_lw` (`gauss_Ds(1, 1)`). Its weight is 1.
 LW_NOSCAT_DEFAULT_SECANT = 1.0 / 0.6096748751
 LW_NOSCAT_DEFAULT_WEIGHT = 1.0
+
+
+def _shift_toward_toa(f: Array) -> Array:
+  """`output_k = f_{k-1}` along z, with `output_0 = 0`.
+
+  A slice and a zero pad, where `jnp.roll` would emit a concatenate that XLA
+  fuses into the recurrences feeding it. The wrapped-around entry `f_{-1}` is
+  the halo entry that `recurrent_op_with_halos` pads with zero, so the two
+  agree exactly.
+  """
+  return jnp.pad(f[:, :, :-1], ((0, 0), (0, 0), (1, 0)))
 
 
 def lw_noscat_layer_sources(
@@ -236,7 +246,7 @@ def lw_noscat_transport(
   # The recurrence stores each layer's *top*-face flux in that layer's slot (and
   # the surface flux in the bottom halo slot); face `k` of the output layout is
   # the bottom face of layer `k`, which is the top face of layer `k - 1`.
-  flux_up = kernel_ops.shift_from_minus(flux_up_top, 2)
+  flux_up = _shift_toward_toa(flux_up_top)
 
   return {
       'flux_up': flux_up,

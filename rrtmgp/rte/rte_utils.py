@@ -240,4 +240,10 @@ def recurrent_op_with_halos(
   else:
     output = output.at[:, :, -1].set(init)
 
-  return carry, output
+  # Keep the recurrence a fusion of its own. The unrolled form builds `output`
+  # as a chain of dynamic-update-slices, which XLA runs in place only while the
+  # chain's result is the fusion root; fused into a consumer (the spectral-sum
+  # `add`, or the next recurrence reading `output[:, :, 1]`) the chain is
+  # re-evaluated per output element and its cost grows with its depth. The
+  # barrier makes the result opaque to fusion without changing any value.
+  return jax.lax.optimization_barrier((carry, output))
