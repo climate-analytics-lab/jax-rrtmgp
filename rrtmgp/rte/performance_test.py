@@ -90,6 +90,7 @@ arithmetic. Hence guard 4.
 
 import collections
 import functools
+import gc
 import re
 from pathlib import Path
 from typing import TypeAlias
@@ -706,6 +707,13 @@ def _flops_of(compiled) -> dict[str, float]:
 
 
 class PerformanceTest(unittest.TestCase):
+
+    def tearDown(self):
+        # Each budget compiles whole solves, and their executables are large
+        # (the all-g-point programs are several GiB while compiling); dropping
+        # them after each test keeps the process under the memory of a CI runner.
+        jax.clear_caches()
+        gc.collect()
 
     def test_minor_gas_interval_count_is_bounded_by_widest_band(self):
         """The minor-absorber evaluation must not walk the whole table.
