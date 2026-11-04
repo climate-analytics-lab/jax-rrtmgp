@@ -26,7 +26,12 @@ import numpy as np
 
 Array: TypeAlias = jax.Array
 
-_NETCDF_DATA_DIR = '/tmp/netcdf/data'
+# Local cache of the netCDF data files, which must be copied out of the package
+# before netCDF4 can read them. A fixed `/tmp` path is unusable on a multi-user
+# host where another account owns it (the test suite then dies creating the
+# g256/g224 tables), so `RRTMGP_NETCDF_CACHE_DIR` redirects it; the default is
+# the long-standing `/tmp/netcdf/data`. Read once at import time.
+_NETCDF_DATA_DIR = os.environ.get('RRTMGP_NETCDF_CACHE_DIR', '/tmp/netcdf/data')
 
 
 def _bytes_to_str(split_str):
