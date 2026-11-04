@@ -215,12 +215,18 @@ def lw_noscat_transport(
     out = trans * flux_down_from_above + source_down
     return out, out  # Carry and output are the same.
 
+  # `fence_chain=True` on both recurrences: this solver's recurrences are the
+  # whole cost of the spectral loop, and without the inner fence XLA fuses the
+  # zero-pad onto the unrolled dynamic-update-slice chain and re-evaluates the
+  # chain per output element (3138 vs 502 ms per radiation call on an A100).
+  # The two-stream solvers measure the other way, so the fence is opt-in.
   _, flux_down = rte_utils.recurrent_op_with_halos(
       flux_down_op,
       toa_flux_down,
       {'trans': trans, 'source_down': source_down},
       forward=False,
       use_scan=use_scan,
+      fence_chain=True,
   )
 
   # The downward flux at the surface face (the bottom face of the first
@@ -242,6 +248,7 @@ def lw_noscat_transport(
       {'trans': trans, 'source_up': source_up},
       forward=True,
       use_scan=use_scan,
+      fence_chain=True,
   )
   # The recurrence stores each layer's *top*-face flux in that layer's slot (and
   # the surface flux in the bottom halo slot); face `k` of the output layout is
