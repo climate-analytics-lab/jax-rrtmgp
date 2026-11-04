@@ -57,6 +57,13 @@ fluxes_sw = rrtmgp.compute_shortwave_fluxes(rrtmgp_state, ...)
 - NumPy: Numerical computing
 - NetCDF4: Reading RRTMGP data files
 
+## Data cache
+
+The netCDF data files are copied out of the package into a local cache before
+they are read. The cache is `/tmp/netcdf/data` by default; set the environment
+variable `RRTMGP_NETCDF_CACHE_DIR` before importing `rrtmgp` to put it elsewhere
+(for example on a host where `/tmp/netcdf` belongs to another user).
+
 ## Testing
 
 Run the test suite with:

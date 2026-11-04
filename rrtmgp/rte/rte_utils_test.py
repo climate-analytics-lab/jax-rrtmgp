@@ -101,5 +101,42 @@ class RteUtilsTest(unittest.TestCase):
     np.testing.assert_allclose(output, expected_x, rtol=1e-5, atol=1e-5)
 
 
+  @parameterized.expand(list(product([True, False], [True, False])))
+  def test_fence_chain_changes_no_values_and_adds_one_barrier(
+      self, forward: bool, with_halos: bool
+  ):
+    """`fence_chain` is a fusion hint only: values agree, one barrier is added."""
+    nx, ny, nz = 2, 3, 6
+    rng = np.random.default_rng(0)
+    w = jnp.asarray(rng.uniform(0.2, 0.9, (nx, ny, nz + 2 * with_halos)))
+    b = jnp.asarray(rng.uniform(0.0, 1.0, (nx, ny, nz + 2 * with_halos)))
+    init = jnp.asarray(rng.uniform(0.0, 1.0, (nx, ny)))
+
+    def f(carry, w, b):
+      return w * carry + b, w * carry + b
+
+    def run(fence_chain):
+      if with_halos:
+        return rte_utils.recurrent_op_with_halos(
+            f, init, {'w': w, 'b': b}, forward, fence_chain=fence_chain
+        )
+      return rte_utils.recurrent_op(
+          f, init, {'w': w, 'b': b}, forward, fence_chain=fence_chain
+      )
+
+    def n_barriers(fence_chain):
+      text = jax.jit(lambda: run(fence_chain)).lower().as_text()
+      return text.count('optimization_barrier')
+
+    carry_off, out_off = run(False)
+    carry_on, out_on = run(True)
+    np.testing.assert_array_equal(out_on, out_off)
+    np.testing.assert_array_equal(carry_on, carry_off)
+    # `recurrent_op_with_halos` always fences its result; `fence_chain` adds the
+    # inner fence to either entry point.
+    self.assertEqual(n_barriers(False), 1 if with_halos else 0)
+    self.assertEqual(n_barriers(True), 2 if with_halos else 1)
+
+
 if __name__ == '__main__':
   unittest.main()

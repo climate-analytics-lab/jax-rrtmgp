@@ -29,7 +29,9 @@ from rrtmgp import kernel_ops
 from rrtmgp import test_util
 from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import atmospheric_state
+from rrtmgp.optics import gas_optics
 from rrtmgp.optics import optics
+from rrtmgp.optics import optics_base
 from rrtmgp.rte import two_stream
 
 Array: TypeAlias = jax.Array
@@ -1234,6 +1236,499 @@ class SurfaceAlbedoTest(unittest.TestCase):
     )
     with self.assertRaises(ValueError):
       resolve(jnp.zeros((2, 2, n)), (2, 2), gray, 'a')
+
+
+class SharedClearSkyTest(unittest.TestCase):
+  """`with_clear_sky=True` solves the clear sky inside the all-sky g-point loop.
+
+  The clear-sky problem is the all-sky one with the cloud mix-in removed -- the
+  gas optics, the Planck sources, the aerosol mix-in, the albedos and the night
+  masking are the same -- so sharing the gas optics between the two must return
+  what a separate no-cloud call returns, and must leave the all-sky fluxes as
+  they were.
+
+  The comparisons are to float rounding, not bit for bit, in the shortwave. The
+  combined program lets XLA fuse and contract the arithmetic differently from
+  the two separate ones (the same differences appear between any two
+  structurally different programs), which moves the fluxes by an ulp or two:
+  repeating the comparison in float64 shrinks the differences to ~1e-13 W/m^2,
+  i.e. they are rounding, not a difference in the computation. The longwave
+  happens to agree exactly. `RTOL` is ~16 float32 ulp and `ATOL` ~1e-7 of a
+  typical shortwave flux.
+  """
+
+  RTOL = 2e-6
+  ATOL = 1e-4
+
+  _fixture = None
+  _helper = None
+
+  def setUp(self):
+    super().setUp()
+    if SharedClearSkyTest._fixture is None:
+      SharedClearSkyTest._fixture = _compact_cloudy_setup()
+      helper = GPointChunkingTest()
+      helper._cached = SharedClearSkyTest._fixture
+      SharedClearSkyTest._helper = helper
+    self._cached = SharedClearSkyTest._fixture
+    self._helper = SharedClearSkyTest._helper
+
+  def _solve(self, band, **kwargs):
+    (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+     sfc_temperature, _) = self._cached
+    temperature = kwargs.pop('temperature', temperature)
+    if band == 'lw':
+      return two_stream.solve_lw(
+          p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+          sfc_temperature, **kwargs
+      )
+    return two_stream.solve_sw(
+        p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+        **kwargs
+    )
+
+  def _inputs(self, band, with_mcica, with_aerosol):
+    """Cloud and aerosol arguments of one case, and the same minus cloud."""
+    optics_lib, _, _, temperature, _, _, _, cloud = self._cached
+    extra = self._helper._mcica_and_aerosol(
+        optics_lib, band, cloud, temperature.shape
+    )
+    kwargs = dict(cloud)
+    if with_mcica:
+      kwargs['cloud_path_liq_per_gpt'] = extra['cloud_path_liq_per_gpt']
+      kwargs['cloud_path_ice_per_gpt'] = extra['cloud_path_ice_per_gpt']
+    if with_aerosol:
+      kwargs['aerosol_optics'] = extra['aerosol_optics']
+    no_cloud = {k: v for k, v in kwargs.items() if 'cloud' not in k}
+    return kwargs, no_cloud
+
+  @parameterized.expand([
+      (band, chunk, with_mcica, with_aerosol)
+      for band, (chunk, with_mcica, with_aerosol) in product(
+          ('lw', 'sw'),
+          # Broadcast cloud paths, no aerosol; broadcast + aerosol on a wider
+          # chunk; McICA sub-columns + aerosol; McICA alone on a wider chunk.
+          ((1, False, False), (4, False, True), (1, True, True),
+           (4, True, False)),
+      )
+  ])
+  def test_matches_separate_solves(
+      self, band, chunk, with_mcica, with_aerosol
+  ):
+    kwargs, no_cloud = self._inputs(band, with_mcica, with_aerosol)
+    shared = self._solve(
+        band, gpt_chunk=chunk, with_clear_sky=True, **kwargs
+    )
+    all_sky_shared, clear_shared = two_stream.split_clear_sky_fluxes(shared)
+    all_sky = self._solve(band, gpt_chunk=chunk, **kwargs)
+    clear = self._solve(band, gpt_chunk=chunk, **no_cloud)
+
+    self.assertEqual(set(all_sky_shared), set(all_sky))
+    self.assertEqual(set(clear_shared), set(clear))
+    for name, got, want in (
+        ('all-sky', all_sky_shared, all_sky),
+        ('clear-sky', clear_shared, clear),
+    ):
+      for key in want:
+        np.testing.assert_allclose(
+            np.asarray(got[key]), np.asarray(want[key]),
+            rtol=self.RTOL, atol=self.ATOL,
+            err_msg=f'{band} {name} {key}',
+        )
+    # The cloud must matter, or this proves nothing about the clear branch.
+    diff = np.abs(
+        np.asarray(all_sky['flux_up']) - np.asarray(clear['flux_up'])
+    )
+    self.assertGreater(diff.max(), 1.0)
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_without_cloud_the_two_problems_are_one(self, band):
+    """No cloud to remove: the clear fluxes are the all-sky ones, exactly."""
+    _, no_cloud = self._inputs(band, False, True)
+    shared = self._solve(band, with_clear_sky=True, **no_cloud)
+    all_sky, clear = two_stream.split_clear_sky_fluxes(shared)
+    plain = self._solve(band, **no_cloud)
+    for key in plain:
+      np.testing.assert_array_equal(
+          np.asarray(clear[key]), np.asarray(all_sky[key]), err_msg=key
+      )
+      np.testing.assert_allclose(
+          np.asarray(all_sky[key]), np.asarray(plain[key]),
+          rtol=self.RTOL, atol=self.ATOL, err_msg=key,
+      )
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_gray_atmosphere_has_no_cloud_to_remove(self, band):
+    _, atmos_state, p, temperature, molecules, vmr_fields, sfc_t, cloud = (
+        self._cached
+    )
+    gray = optics.GrayAtmosphereOptics(
+        radiative_transfer.OpticsParameters(
+            optics=radiative_transfer.GrayAtmosphereOptics()
+        )
+    )
+    args = (p, temperature, molecules, gray, atmos_state)
+    if band == 'lw':
+      def solve(**kw):
+        return two_stream.solve_lw(*args, sfc_temperature=sfc_t, **kw)
+    else:
+      def solve(**kw):
+        return two_stream.solve_sw(*args, **kw)
+    plain = solve(**cloud)
+    shared = solve(with_clear_sky=True, **cloud)
+    all_sky, clear = two_stream.split_clear_sky_fluxes(shared)
+    for key in plain:
+      np.testing.assert_allclose(
+          np.asarray(all_sky[key]), np.asarray(plain[key]),
+          rtol=self.RTOL, atol=self.ATOL, err_msg=key,
+      )
+      np.testing.assert_array_equal(
+          np.asarray(clear[key]), np.asarray(all_sky[key]), err_msg=key
+      )
+
+  def test_night_columns_are_zero_in_the_clear_sky_too(self):
+    optics_lib, atmos_state, *_ = self._cached
+    night_state = dataclasses.replace(atmos_state, zenith=jnp.pi)
+    _, _, p, temperature, molecules, vmr_fields, _, cloud = self._cached
+    shared = two_stream.solve_sw(
+        p, temperature, molecules, optics_lib, night_state, vmr_fields,
+        with_clear_sky=True, **cloud
+    )
+    for key, val in shared.items():
+      np.testing.assert_array_equal(np.asarray(val), 0.0, err_msg=key)
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_clear_sky_gradients_are_finite(self, band):
+    """Reverse mode through the shared solve, w.r.t. temperature."""
+    kwargs, _ = self._inputs(band, False, True)
+    temperature = self._cached[3]
+
+    def loss(temp):
+      out = self._solve(
+          band, temperature=temp, gpt_chunk=4, with_clear_sky=True, **kwargs
+      )
+      return jnp.sum(out['clear_flux_net'][:, :, 1:]) + jnp.sum(
+          out['flux_up'][:, :, -2]
+      )
+
+    grad = np.asarray(jax.grad(loss)(temperature))
+    self.assertTrue(np.all(np.isfinite(grad)))
+    self.assertGreater(np.abs(grad).max(), 0.0)
+
+
+class OpticsGasCloudSplitTest(unittest.TestCase):
+  """`compute_gas_optical_properties` + `add_cloud_optical_properties`.
+
+  Together they are `compute_{lw,sw}_optical_properties` -- exactly, the
+  latter being built from them.
+  """
+
+  def test_split_reproduces_the_combined_properties(self):
+    (optics_lib, _, p, temperature, molecules, vmr_fields, _, cloud
+     ) = _compact_cloudy_setup()
+    vmr = {optics_lib.gas_optics_lw.idx_gases[k]: v
+           for k, v in vmr_fields.items()}
+    for is_lw, igpt in ((True, 5), (True, 97), (False, 3), (False, 80)):
+      compute = (optics_lib.compute_lw_optical_properties if is_lw
+                 else optics_lib.compute_sw_optical_properties)
+      want = compute(p, temperature, molecules, igpt, vmr, **cloud)
+      gas = optics_lib.compute_gas_optical_properties(
+          p, temperature, molecules, igpt, is_lw, vmr
+      )
+      got = optics_lib.add_cloud_optical_properties(
+          igpt, gas, is_lw, **cloud
+      )
+      for key in want:
+        np.testing.assert_array_equal(
+            np.asarray(got[key]), np.asarray(want[key]),
+            err_msg=f'is_lw={is_lw} igpt={igpt} {key}',
+        )
+      # No condensate: the gas properties are the whole answer.
+      clear = compute(p, temperature, molecules, igpt, vmr)
+      for key in clear:
+        np.testing.assert_array_equal(
+            np.asarray(gas[key]), np.asarray(clear[key]), err_msg=key
+        )
+
+  def test_scheme_without_a_split_says_so(self):
+    optics_lib = _compact_cloudy_setup()[0]
+    with self.assertRaises(NotImplementedError):
+      optics_base.OpticsScheme.add_cloud_optical_properties(
+          optics_lib, 0, {}, True
+      )
+
+
+class AllGptsGasOpticsTest(unittest.TestCase):
+  """`gas_optics_mode='all_gpts'` computes the same gas optics, in one pass.
+
+  The all-g-point stage re-lays-out the evaluation (g-point innermost, row
+  gathers, the g-independent interpolation shared) without changing the
+  arithmetic of any g-point, so it must reproduce the per-g-point functions:
+  exactly when each operation is executed on its own, and to float rounding once
+  XLA fuses the two programs differently.
+  """
+
+  # ~32 float32 ulp: the fused programs differ by 2-3 ulp where the
+  # interpolation stays inside the table and up to ~15 where a temperature
+  # excursion drives the end-interval extrapolation.
+  RTOL = 4e-6
+  # Flux comparisons: a few ulp of the fluxes (<= 5 ulp, and 3e-4 W/m^2,
+  # measured) with the cancellation in `flux_net` on top.
+  FLUX_RTOL = 2e-6
+  FLUX_ATOL = 1e-3
+
+  _fixture = None
+  _helper = None
+  _reference = {}
+
+  def setUp(self):
+    super().setUp()
+    cls = AllGptsGasOpticsTest
+    if cls._fixture is None:
+      cls._fixture = _compact_cloudy_setup()
+      cls._helper = GPointChunkingTest()
+      cls._helper._cached = cls._fixture
+    self._cached = cls._fixture
+    self._helper = cls._helper
+
+  def _lookup(self, is_lw):
+    optics_lib = self._cached[0]
+    return optics_lib.gas_optics_lw if is_lw else optics_lib.gas_optics_sw
+
+  def _cases(self):
+    """Atmospheres: caller fields, a scaled field, and a hot/cold excursion."""
+    (optics_lib, _, p, temperature, molecules, vmr_fields, _, _
+     ) = self._cached
+    lookup = optics_lib.gas_optics_lw
+    fields = {lookup.idx_gases[k]: v for k, v in vmr_fields.items()}
+    o3x3 = dict(fields)
+    o3x3[lookup.idx_gases['o3']] = 3.0 * fields[lookup.idx_gases['o3']]
+    swing = jnp.asarray(
+        np.random.default_rng(0).uniform(-40.0, 40.0, temperature.shape),
+        temperature.dtype,
+    )
+    return {
+        'fields': (p, temperature, molecules, fields),
+        'o3x3': (p, temperature, molecules, o3x3),
+        # Excursions past both ends of the temperature table, and a shifted
+        # pressure axis, so the extrapolated and clamped branches run.
+        'excursion': (1.3 * p, temperature + swing, molecules, fields),
+        # No caller fields: every gas from its global mean.
+        'global_means': (p, temperature, molecules, None),
+    }
+
+  def _per_gpt(self, is_lw, p, t, molecules, fields):
+    optics_lib = self._cached[0]
+    lookup = self._lookup(is_lw)
+    vmr = optics_lib.vmr_lib
+
+    def one(igpt):
+      tau = gas_optics.compute_minor_optical_depth(
+          lookup, vmr, molecules, t, p, igpt, fields
+      ) + gas_optics.compute_major_optical_depth(
+          lookup, vmr, molecules, t, p, igpt, fields
+      )
+      if is_lw:
+        return tau, gas_optics.compute_planck_fraction(
+            lookup, vmr, p, t, igpt, fields
+        )
+      return tau, gas_optics.compute_rayleigh_optical_depth(
+          lookup, vmr, molecules, t, p, igpt, fields
+      )
+
+    return one
+
+  def _all_gpts(self, is_lw, p, t, molecules, fields):
+    out = self._cached[0].compute_gas_optics_all_gpts(
+        p, t, molecules, fields, is_lw=is_lw
+    )
+    return out['optical_depth'], out['planck_fraction' if is_lw else 'rayleigh']
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_matches_per_gpt_functions(self, band):
+    is_lw = band == 'lw'
+    n_gpt = self._lookup(is_lw).n_gpt
+    for name, (p, t, molecules, fields) in self._cases().items():
+      one = self._per_gpt(is_lw, p, t, molecules, fields)
+      want = jax.jit(jax.vmap(one))(jnp.arange(n_gpt))
+      got = jax.jit(
+          lambda p, t, m, f: self._all_gpts(is_lw, p, t, m, f)
+      )(p, t, molecules, fields)
+      for label, g, w in zip(('optical depth', 'second field'), got, want):
+        self.assertEqual(g.shape, (n_gpt,) + t.shape)
+        np.testing.assert_allclose(
+            np.asarray(g), np.asarray(w), rtol=self.RTOL, atol=0.0,
+            err_msg=f'{band} {name} {label}',
+        )
+    # The case set must reach both sides of the reference troposphere pressure.
+    p = self._cases()['fields'][0]
+    ptropo = self._lookup(is_lw).p_ref_tropo
+    self.assertTrue(bool(jnp.any(p <= ptropo)) and bool(jnp.any(p > ptropo)))
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_is_the_per_gpt_arithmetic_exactly(self, band):
+    """Operation by operation, not just to rounding.
+
+    Run without fusion (every operation dispatched on its own) the two layouts
+    agree bit for bit at every g-point, so the compiled-program differences
+    above are XLA's fusion and contraction choices, not a difference in the
+    computation. A handful of g-points spanning bands with and without minor
+    absorbers and both Rayleigh/Planck tables keeps the per-g-point side cheap.
+    """
+    is_lw = band == 'lw'
+    n_gpt = self._lookup(is_lw).n_gpt
+    p, t, molecules, fields = self._cases()['excursion']
+    one = self._per_gpt(is_lw, p, t, molecules, fields)
+    picks = [0, 9, n_gpt // 2, n_gpt - 1]
+    with jax.disable_jit():
+      got = self._all_gpts(is_lw, p, t, molecules, fields)
+      for igpt in picks:
+        want = one(igpt)
+        for label, g, w in zip(('optical depth', 'second field'), got, want):
+          np.testing.assert_array_equal(
+              np.asarray(g[igpt]), np.asarray(w),
+              err_msg=f'{band} g-point {igpt} {label}',
+          )
+
+  def test_band_groups_partition_the_spectrum(self):
+    for is_lw in (True, False):
+      lookup = self._lookup(is_lw)
+      groups = gas_optics.band_groups(lookup)
+      gpts = np.concatenate([g.gpts for g in groups])
+      np.testing.assert_array_equal(np.sort(gpts), np.arange(lookup.n_gpt))
+      bands = sorted(b for g in groups for b in g.bands)
+      self.assertEqual(bands, list(range(lookup.n_bnd)))
+      key_species = np.asarray(lookup.key_species)
+      for g in groups:
+        # A group's bands share their major-species pair; that is what lets
+        # them share the cell interpolants.
+        for b in g.bands:
+          np.testing.assert_array_equal(
+              key_species[b], key_species[g.bands[0]]
+          )
+        # ...and a group's g-points are exactly its bands' g-points.
+        np.testing.assert_array_equal(
+            np.asarray(lookup.g_point_to_bnd)[g.gpts],
+            np.concatenate([
+                np.full(gas_optics._band_gpt_range(lookup, b).size, b)
+                for b in g.bands
+            ]),
+        )
+
+  def _solve(self, band, mode, chunk, with_clear_sky, with_extras,
+             **solver_kwargs):
+    (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+     sfc_temperature, cloud) = self._cached
+    kwargs = dict(cloud, **solver_kwargs)
+    if with_extras:
+      kwargs.update(
+          self._helper._mcica_and_aerosol(
+              optics_lib, band, cloud, temperature.shape
+          )
+      )
+    solve = functools.partial(
+        two_stream.solve_lw if band == 'lw' else two_stream.solve_sw,
+        gpt_chunk=chunk, with_clear_sky=with_clear_sky, gas_optics_mode=mode,
+        **kwargs,
+    )
+    if band == 'lw':
+      return jax.jit(
+          lambda: solve(p, temperature, molecules, optics_lib, atmos_state,
+                        vmr_fields, sfc_temperature)
+      )()
+    return jax.jit(
+        lambda: solve(p, temperature, molecules, optics_lib, atmos_state,
+                      vmr_fields)
+    )()
+
+  @parameterized.expand([
+      (band, chunk, with_clear_sky, with_extras)
+      for band, (chunk, with_clear_sky, with_extras) in product(
+          ('lw', 'sw'),
+          # Chunked, shared clear sky, McICA sub-columns and aerosol; and the
+          # plain unchunked all-sky solve.
+          ((8, True, True), (1, False, False)),
+      )
+  ])
+  def test_solve_matches_per_gpt(self, band, chunk, with_clear_sky,
+                                 with_extras):
+    key = (band, chunk, with_clear_sky, with_extras)
+    cls = AllGptsGasOpticsTest
+    if key not in cls._reference:
+      cls._reference[key] = self._solve(band, 'per_gpt', *key[1:])
+    want = cls._reference[key]
+    got = self._solve(band, 'all_gpts', *key[1:])
+    self.assertEqual(set(got), set(want))
+    for name in want:
+      np.testing.assert_allclose(
+          np.asarray(got[name]), np.asarray(want[name]),
+          rtol=self.FLUX_RTOL, atol=self.FLUX_ATOL, err_msg=f'{band} {name}',
+      )
+
+  def test_noscat_solve_matches_per_gpt(self):
+    """The no-scattering solver reads the same precomputed gas optics."""
+    args = ('lw', 'per_gpt', 4, True, True)
+    want = self._solve(*args, lw_solver='noscat')
+    got = self._solve('lw', 'all_gpts', 4, True, True, lw_solver='noscat')
+    self.assertEqual(set(got), set(want))
+    for name in want:
+      np.testing.assert_allclose(
+          np.asarray(got[name]), np.asarray(want[name]),
+          rtol=self.FLUX_RTOL, atol=self.FLUX_ATOL, err_msg=f'noscat {name}',
+      )
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_gradients_are_finite_and_match(self, band):
+    """Reverse mode through the gathers: w.r.t. temperature and an o3 field."""
+    (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+     sfc_temperature, cloud) = self._cached
+
+    def toa(temp, o3, mode):
+      fields = dict(vmr_fields)
+      fields['o3'] = o3
+      if band == 'lw':
+        out = two_stream.solve_lw(
+            p, temp, molecules, optics_lib, atmos_state, fields,
+            sfc_temperature, gpt_chunk=4, gas_optics_mode=mode, **cloud
+        )
+      else:
+        out = two_stream.solve_sw(
+            p, temp, molecules, optics_lib, atmos_state, fields,
+            gpt_chunk=4, gas_optics_mode=mode, **cloud
+        )
+      return jnp.sum(out['flux_up'][:, :, -2])
+
+    o3 = vmr_fields['o3']
+    ref = jax.grad(toa, argnums=(0, 1))(temperature, o3, 'per_gpt')
+    got = jax.grad(toa, argnums=(0, 1))(temperature, o3, 'all_gpts')
+    for label, g, r in zip(('temperature', 'o3'), got, ref):
+      g, r = np.asarray(g), np.asarray(r)
+      self.assertTrue(np.all(np.isfinite(g)), f'{band} d/d{label} not finite')
+      self.assertGreater(np.abs(g).max(), 0.0, f'{band} d/d{label} is zero')
+      scale = np.abs(r).max()
+      np.testing.assert_allclose(
+          g / scale, r / scale, rtol=1e-3, atol=1e-5,
+          err_msg=f'{band} d/d{label} differs from the per-g-point gradient',
+      )
+
+  def test_rejects_unknown_mode_and_gray_atmosphere(self):
+    (optics_lib, atmos_state, p, temperature, molecules, vmr_fields,
+     sfc_temperature, _) = self._cached
+    with self.assertRaisesRegex(ValueError, 'gas_optics_mode must be one of'):
+      two_stream.solve_lw(
+          p, temperature, molecules, optics_lib, atmos_state, vmr_fields,
+          sfc_temperature, gas_optics_mode='all_gpt',
+      )
+    gray = optics.GrayAtmosphereOptics(
+        radiative_transfer.OpticsParameters(
+            optics=radiative_transfer.GrayAtmosphereOptics()
+        )
+    )
+    with self.assertRaisesRegex(ValueError, 'requires the RRTMOptics'):
+      two_stream.solve_lw(
+          p, temperature, molecules, gray, atmos_state, vmr_fields,
+          sfc_temperature, gas_optics_mode='all_gpts',
+      )
 
 
 if __name__ == '__main__':

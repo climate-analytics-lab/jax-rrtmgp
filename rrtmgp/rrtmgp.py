@@ -28,6 +28,7 @@ from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import atmospheric_state
 from rrtmgp.optics import lookup_volume_mixing_ratio
 from rrtmgp.optics import optics
+from rrtmgp.rte import longwave_noscat
 from rrtmgp.rte import two_stream
 
 Array: TypeAlias = jax.Array
@@ -139,6 +140,10 @@ class RRTMGP:
       cloud_tau_scale_ice: float | Array | None = None,
       sfc_alb_dir: float | Array | None = None,
       sfc_alb_dif: float | Array | None = None,
+      clear_sky_fluxes: bool = False,
+      lw_solver: str = two_stream.LW_SOLVER_TWO_STREAM,
+      lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
+      gas_optics_mode: str = two_stream.GAS_OPTICS_MODE_PER_GPT,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -212,6 +217,28 @@ class RRTMGP:
     `two_stream._solve_over_gpoints`, which also records the two alternative
     fixes that were measured and failed.
 
+    `gas_optics_mode` selects where the gas optics is evaluated:
+    `'per_gpt'` (default) inside the spectral loop, `'all_gpts'` for every
+    g-point ahead of it, with each table read a row gather over the g-points.
+    It changes no physics. See `two_stream.solve_lw`.
+
+    The clear-sky diagnostics (`do_clear_sky` in the config, or
+    `clear_sky_fluxes=True` for this call) are the cloud-free atmosphere --
+    gas plus aerosol, with the same surface albedos, surface emissivity and
+    surface temperature. They are solved inside the all-sky g-point loop: the
+    gas optics and Planck sources, which dominate the cost of a g-point, are
+    evaluated once and shared, and only the cloud mix-in, cell properties and
+    two-stream transport are repeated. That is much cheaper than a second
+    solve, and returns the same fluxes as one (see
+    `two_stream.solve_lw(with_clear_sky=True)`). Whether they are requested
+    changes nothing in the all-sky outputs.
+
+    `lw_solver` selects the longwave transport: `'two_stream'` (the default) or
+    `'noscat'`, RTE's absorption-only solver (one angle with secant
+    `lw_secant`, default `1 / 0.6096748751`; cloud and aerosol scattering
+    dropped, as in ECHAM6). It applies to the clear-sky diagnostic as well. The
+    shortwave is always two-stream. See `two_stream.solve_lw`.
+
     Returns:
       A dictionary containing the following keys:
         rrtmgp_common.KEY_STORED_RADIATION: The heating rate [K/s].
@@ -225,6 +252,11 @@ class RRTMGP:
           0]`; the diffuse surface flux is the difference.
         'lw_flux_up_full': Full longwave upward flux profile [W/m²]
         'lw_flux_down_full': Full longwave downward flux profile [W/m²]
+      With the clear-sky diagnostics requested, the same names with
+      `clearsky` after the quantity (`'sw_flux_up_clearsky_full'`,
+      `'sw_flux_down_dir_clearsky_sfc'`, `'rad_heat_sw_clearsky_3d'`, ...), and
+      the `*_clearsky_2d_xy` / `*_clearsky_1d_z` diagnostics listed in
+      `diagnostic_fields`.
     """
     atm_state = self.atmospheric_state
     if (
@@ -290,51 +322,70 @@ class RRTMGP:
     # Compute molecules
     molecules_per_area = _air_molecules_per_area(p_ref_xxc, vmr_fields['h2o'])
 
+    # Whether to also return the cloud-free fluxes, solved alongside the
+    # all-sky ones (see `two_stream.solve_lw(with_clear_sky=...)`).
+    with_clear_sky = self._do_clear_sky or clear_sky_fluxes
+
     # Compute water paths for liquid and ice cloud condensate.
     liq_water_path = _compute_cloud_path(rho_xxc, q_liq, self._dz, sg_map)
     ice_water_path = _compute_cloud_path(rho_xxc, q_ice, self._dz, sg_map)
 
-    lw_fluxes = two_stream.solve_lw(
-        p_ref_xxc,
-        temperature,
-        molecules_per_area,
-        self.optics_lib,
-        atm_state,
-        vmr_fields,
-        sfc_temperature,
-        cloud_r_eff_liq=cloud_r_eff_liq,
-        cloud_path_liq=liq_water_path,
-        cloud_r_eff_ice=cloud_r_eff_ice,
-        cloud_path_ice=ice_water_path,
-        use_scan=use_scan,
-        gpt_chunk=gpt_chunk,
-        cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
-        cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
-        aerosol_optics=aerosol_optics_lw,
-        cloud_tau_scale_liq=cloud_tau_scale_liq,
-        cloud_tau_scale_ice=cloud_tau_scale_ice,
-    )
-    sw_fluxes = two_stream.solve_sw(
-        p_ref_xxc,
-        temperature,
-        molecules_per_area,
-        self.optics_lib,
-        atm_state,
-        vmr_fields,
-        cloud_r_eff_liq=cloud_r_eff_liq,
-        cloud_path_liq=liq_water_path,
-        cloud_r_eff_ice=cloud_r_eff_ice,
-        cloud_path_ice=ice_water_path,
-        use_scan=use_scan,
-        gpt_chunk=gpt_chunk,
-        cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
-        cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
-        aerosol_optics=aerosol_optics_sw,
-        cloud_tau_scale_liq=cloud_tau_scale_liq,
-        cloud_tau_scale_ice=cloud_tau_scale_ice,
-        sfc_alb_dir=sfc_alb_dir,
-        sfc_alb_dif=sfc_alb_dif,
-    )
+    with jax.named_scope('lw'):
+      lw_fluxes = two_stream.solve_lw(
+          p_ref_xxc,
+          temperature,
+          molecules_per_area,
+          self.optics_lib,
+          atm_state,
+          vmr_fields,
+          sfc_temperature,
+          cloud_r_eff_liq=cloud_r_eff_liq,
+          cloud_path_liq=liq_water_path,
+          cloud_r_eff_ice=cloud_r_eff_ice,
+          cloud_path_ice=ice_water_path,
+          use_scan=use_scan,
+          gpt_chunk=gpt_chunk,
+          cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
+          cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
+          aerosol_optics=aerosol_optics_lw,
+          cloud_tau_scale_liq=cloud_tau_scale_liq,
+          cloud_tau_scale_ice=cloud_tau_scale_ice,
+          with_clear_sky=with_clear_sky,
+          lw_solver=lw_solver,
+          lw_secant=lw_secant,
+          gas_optics_mode=gas_optics_mode,
+      )
+    with jax.named_scope('sw'):
+      sw_fluxes = two_stream.solve_sw(
+          p_ref_xxc,
+          temperature,
+          molecules_per_area,
+          self.optics_lib,
+          atm_state,
+          vmr_fields,
+          cloud_r_eff_liq=cloud_r_eff_liq,
+          cloud_path_liq=liq_water_path,
+          cloud_r_eff_ice=cloud_r_eff_ice,
+          cloud_path_ice=ice_water_path,
+          use_scan=use_scan,
+          gpt_chunk=gpt_chunk,
+          cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
+          cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
+          aerosol_optics=aerosol_optics_sw,
+          cloud_tau_scale_liq=cloud_tau_scale_liq,
+          cloud_tau_scale_ice=cloud_tau_scale_ice,
+          sfc_alb_dir=sfc_alb_dir,
+          sfc_alb_dif=sfc_alb_dif,
+          with_clear_sky=with_clear_sky,
+          gas_optics_mode=gas_optics_mode,
+      )
+    if with_clear_sky:
+      lw_fluxes, lw_fluxes_clearsky = two_stream.split_clear_sky_fluxes(
+          lw_fluxes
+      )
+      sw_fluxes, sw_fluxes_clearsky = two_stream.split_clear_sky_fluxes(
+          sw_fluxes
+      )
 
     # Compute the heating rate in K/s.
     q_v = q_t - q_c
@@ -396,41 +447,8 @@ class RRTMGP:
     if (v := 'rad_heat_sw_1d_z') in self._diagnostic_fields:
       output[v] = _horiz_mean(sw_heating_rate)
 
-    # Compute clear-sky radiative transfer and diagnostics, if desired.
-    if self._do_clear_sky:
-      lw_fluxes_clearsky = two_stream.solve_lw(
-          p_ref_xxc,
-          temperature,
-          molecules_per_area,
-          self.optics_lib,
-          atm_state,
-          vmr_fields,
-          sfc_temperature,
-          cloud_r_eff_liq=None,
-          cloud_path_liq=None,
-          cloud_r_eff_ice=None,
-          cloud_path_ice=None,
-          use_scan=use_scan,
-          gpt_chunk=gpt_chunk,
-          aerosol_optics=aerosol_optics_lw,
-      )
-      sw_fluxes_clearsky = two_stream.solve_sw(
-          p_ref_xxc,
-          temperature,
-          molecules_per_area,
-          self.optics_lib,
-          atm_state,
-          vmr_fields,
-          cloud_r_eff_liq=None,
-          cloud_path_liq=None,
-          cloud_r_eff_ice=None,
-          cloud_path_ice=None,
-          use_scan=use_scan,
-          gpt_chunk=gpt_chunk,
-          aerosol_optics=aerosol_optics_sw,
-          sfc_alb_dir=sfc_alb_dir,
-          sfc_alb_dif=sfc_alb_dif,
-      )
+    # Clear-sky diagnostics, if desired. The fluxes were solved above.
+    if with_clear_sky:
       # Compute the heating rate in K/s.
       lw_heating_rate_clearsky = two_stream.compute_heating_rate(
           lw_fluxes_clearsky['flux_net'], p_ref_xxc, q_v

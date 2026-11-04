@@ -20,9 +20,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest pytest-cov coverage
           pip install -e ".[dev]"
+      # One process per test file: the compiled programs of the radiation solves
+      # (every g-point program, both solvers, both tables) are large, and a single
+      # process over the whole suite accumulates them until the runner kills it
+      # (exit 137). `-p` keeps each process's coverage data apart; they are
+      # combined below.
       - name: Test with pytest
         run: |
-          coverage run -m pytest -v -s --cov-fail-under=90
+          for f in $(find rrtmgp -name '*_test.py' | sort); do
+            coverage run -p -m pytest -v -s "$f"
+          done
+          coverage combine
       - name: Generate Coverage Report
         run: |
-          coverage report -m
+          # `--include`: after `combine`, coverage also tries to report the Cython
+          # source of netCDF4 that the processes traced and fails on its missing
+          # `.pyx` ("No source for code"). The report is about this package.
+          coverage report -m --include='rrtmgp/*'

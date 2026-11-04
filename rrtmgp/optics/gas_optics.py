@@ -15,6 +15,7 @@
 """Utility functions for computing optical properties of atmospheric gases."""
 
 import collections
+import dataclasses
 from typing import NamedTuple, TypeAlias
 
 import jax
@@ -819,3 +820,523 @@ def compute_planck_sources(
           collections.OrderedDict({'t': lambda: interpolant}),
       )
   )
+
+
+# ---------------------------------------------------------------------------
+# All-g-point gas optics.
+#
+# The functions above evaluate the gas optics of ONE g-point, and the spectral
+# loop calls them once per g-point (or per chunk of g-points under `vmap`).
+# Everything below evaluates ALL g-points of the spectrum in one pass, laid out
+# the way the RRTMGP GPU kernels lay it out
+# (`rrtmgp/kernels/accel/mo_gas_optics_rrtmgp_kernels.F90`: `interpolation`
+# once, then `gas_optical_depths_major` / `_minor` with the g-point innermost):
+#
+# * Everything that does not depend on the g-point -- the temperature, pressure
+#   and mixing-fraction indices and weights, the troposphere mask, the minor
+#   absorbers' scalings -- is computed once per cell and shared by every
+#   g-point.
+# * Every table read is a ROW gather: the table is indexed on its leading
+#   temperature / pressure / mixing-fraction axes with the cell's corner
+#   indices and a full slice on the g-point axis, so one gather index yields a
+#   contiguous run of g-points (`slice_sizes=(1, 1, 1, n)`) instead of a single
+#   scalar. The per-g-point path issues one scalar gather per (cell, corner,
+#   g-point), which on a GPU is bound by gather throughput rather than by
+#   memory bandwidth, and that count is what this layout divides by the row
+#   width.
+#
+# The mixing-fraction interpolant of a cell depends on the band's two major
+# species (`key_species`), so rows can only be shared by g-points whose bands
+# have the same species pair. Bands are therefore grouped by their `key_species`
+# signature (ten groups for each shipped table, against 14-16 bands): the
+# interpolants are computed once per group and the group's g-points, which are
+# not necessarily contiguous, are gathered together as one row.
+#
+# The arithmetic of every g-point is that of the single-g-point functions,
+# term for term and in the same order (the corner order and the left-to-right
+# sum of `optics_utils.interpolate_orig`), so the results are identical to the
+# per-g-point path. Both use the direct-indexing (gather) lookup backend.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _BandGroup:
+  """Bands that share a major-species pair, hence their cell interpolants."""
+
+  # Band indices, ascending.
+  bands: tuple[int, ...]
+  # The group's g-points: the bands' g-point ranges concatenated in band order.
+  gpts: np.ndarray
+
+
+def _band_gpt_range(lookup: AbstractLookupGasOptics, ibnd: int) -> np.ndarray:
+  """The g-points of band `ibnd`, as a static integer array."""
+  lims = np.asarray(lookup.bnd_lims_gpt)
+  return np.arange(int(lims[ibnd, 0]), int(lims[ibnd, 1]) + 1)
+
+
+def band_groups(lookup: AbstractLookupGasOptics) -> list[_BandGroup]:
+  """Groups the bands of a lookup by their pair of major species.
+
+  `key_species[ibnd]` names the two major species (lower and upper atmosphere)
+  that set a band's relative-abundance interpolant, which is the only part of
+  the cell interpolation that depends on the band. Bands with the same
+  signature have identical interpolants.
+
+  Args:
+    lookup: The gas-optics lookup.
+
+  Returns:
+    The groups, in order of their first band.
+  """
+  key_species = np.asarray(lookup.key_species)
+  by_signature: dict[tuple[int, ...], list[int]] = {}
+  for ibnd in range(key_species.shape[0]):
+    by_signature.setdefault(tuple(key_species[ibnd].ravel().tolist()), []).append(
+        ibnd
+    )
+  return [
+      _BandGroup(
+          bands=tuple(bands),
+          gpts=np.concatenate([_band_gpt_range(lookup, b) for b in bands]),
+      )
+      for bands in by_signature.values()
+  ]
+
+
+def _columns(table: Array, gpts: np.ndarray) -> Array:
+  """The last-axis (g-point) entries `gpts` of a table, as a static selection.
+
+  A contiguous run is taken as a slice; anything else as a take with a static
+  index array. Either way the selection is a small constant-index copy of the
+  table (a few hundred KB), not part of the per-cell work.
+  """
+  if gpts.size and np.all(np.diff(gpts) == 1):
+    return table[..., int(gpts[0]) : int(gpts[-1]) + 1]
+  return table[..., gpts]
+
+
+class CellInterpolation:
+  """The g-point-independent interpolation state of one set of cells.
+
+  Built once per call and shared by the major, minor, Planck and Rayleigh
+  evaluations of every band group.
+  """
+
+  def __init__(
+      self,
+      lookup: AbstractLookupGasOptics,
+      vmr_lib: LookupVolumeMixingRatio,
+      temperature: Array,
+      p: Array,
+      vmr_fields: dict[int, Array] | None,
+  ):
+    self.lookup = lookup
+    self.vmr_lib = vmr_lib
+    self.vmr_fields = vmr_fields
+    self.p = p
+    self.temperature = temperature
+    # 1 for levels above the troposphere limit and 0 otherwise.
+    self.tropo_idx = jnp.where(p <= lookup.p_ref_tropo, 1, 0)
+    self.t_interp = optics_utils.create_linear_interpolant(
+        temperature, lookup.t_ref
+    )
+    self.p_interp = _pressure_interpolant(
+        p=p, p_ref=lookup.p_ref, troposphere_offset=self.tropo_idx
+    )
+    self._clamped = None
+    self._mix = {}
+    self._key_species = np.asarray(lookup.key_species)
+
+  def clamped(self) -> tuple[Interpolant, Interpolant]:
+    """Temperature and pressure interpolants clamped at the table ends.
+
+    These are the Planck fraction's (see `compute_planck_fraction`).
+    """
+    if self._clamped is None:
+      self._clamped = (
+          optics_utils.create_linear_interpolant(
+              self.temperature,
+              self.lookup.t_ref,
+              out_of_range=optics_utils.CLAMP,
+          ),
+          _pressure_interpolant(
+              self.p,
+              self.lookup.p_ref,
+              self.tropo_idx,
+              out_of_range=optics_utils.CLAMP,
+          ),
+      )
+    return self._clamped
+
+  def mix(
+      self, ibnd: int, t_side: str, scale_by_mixture: bool
+  ) -> Interpolant:
+    """Relative-abundance interpolant of band `ibnd` at a temperature corner.
+
+    The interpolant depends on the temperature *index* (through the reference
+    mixing ratios), so there is one per temperature corner. Bands with the same
+    major-species pair share it.
+
+    Args:
+      ibnd: The band.
+      t_side: `'high'` or `'low'`, the temperature corner it belongs to.
+      scale_by_mixture: Whether the weights carry the major species' combined
+        mixing ratio (the major absorption coefficient's, not the Planck
+        fraction's or the minor and Rayleigh coefficients').
+    """
+    key = (
+        tuple(self._key_species[ibnd].ravel().tolist()),
+        t_side,
+        scale_by_mixture,
+    )
+    if key not in self._mix:
+      t = getattr(self.t_interp, f'interp_{t_side}')
+      self._mix[key] = _compute_relative_abundance_interpolant(
+          self.lookup,
+          self.vmr_lib,
+          self.tropo_idx,
+          t.idx,
+          ibnd,
+          scale_by_mixture=scale_by_mixture,
+          vmr_fields=self.vmr_fields,
+      )
+    return self._mix[key]
+
+
+_SIDES = ('high', 'low')
+
+
+def _interpolate_rows_tpm(
+    table: Array,
+    t_interp: Interpolant,
+    p_interp: Interpolant,
+    mix_for_t: dict[str, Interpolant],
+) -> Array:
+  """Eight-corner interpolation of rows of a `(t, p, eta, n)` table.
+
+  The corner order, the weight product `(w_t * w_p) * w_eta` and the
+  left-to-right sum are those of `optics_utils.interpolate_orig` for the
+  `t -> p -> eta` interpolation (the mixing-fraction interpolant is chosen by
+  the temperature corner), so each element equals the single-g-point result.
+
+  Args:
+    table: A `(n_t, n_p, n_eta, n)` table; the last axis is read as one row.
+    t_interp: The temperature interpolant, of cell shape.
+    p_interp: The pressure interpolant, of cell shape.
+    mix_for_t: The mixing-fraction interpolant of each temperature corner.
+
+  Returns:
+    An array of shape `(*cell_shape, n)`.
+  """
+  total = None
+  for eta_side in _SIDES:
+    for p_side in _SIDES:
+      for t_side in _SIDES:
+        ti = getattr(t_interp, f'interp_{t_side}')
+        pi = getattr(p_interp, f'interp_{p_side}')
+        mi = getattr(mix_for_t[t_side], f'interp_{eta_side}')
+        weight = (ti.weight * pi.weight) * mi.weight
+        term = table[ti.idx, pi.idx, mi.idx] * weight[..., None]
+        total = term if total is None else total + term
+  return total
+
+
+def _interpolate_rows_te(
+    table: Array,
+    t_interp: Interpolant,
+    mix_for_t: dict[str, Interpolant],
+    leading_idx: Array | None = None,
+) -> Array:
+  """Four-corner interpolation of rows of a `(t, eta, n)` table.
+
+  Same convention as `_interpolate_rows_tpm`, for the minor and Rayleigh
+  tables. With `leading_idx`, the table has one more leading axis that each
+  cell indexes with `leading_idx` (the Rayleigh table's lower/upper half).
+  """
+  total = None
+  for eta_side in _SIDES:
+    for t_side in _SIDES:
+      ti = getattr(t_interp, f'interp_{t_side}')
+      mi = getattr(mix_for_t[t_side], f'interp_{eta_side}')
+      weight = ti.weight * mi.weight
+      if leading_idx is None:
+        rows = table[ti.idx, mi.idx]
+      else:
+        rows = table[leading_idx, ti.idx, mi.idx]
+      term = rows * weight[..., None]
+      total = term if total is None else total + term
+  return total
+
+
+def _minor_slots(
+    lookup: AbstractLookupGasOptics, ibnd: int
+) -> list[tuple[bool, int]]:
+  """The minor-absorber intervals of band `ibnd` as `(is_lower, interval)`.
+
+  Lower-atmosphere intervals first, then upper, each ascending: the order in
+  which the per-g-point path sums its slots.
+  """
+  slots = []
+  for is_lower in (True, False):
+    if is_lower:
+      start = int(np.asarray(lookup.minor_lower_bnd_start)[ibnd])
+      end = int(np.asarray(lookup.minor_lower_bnd_end)[ibnd])
+      n_side = lookup.n_minor_absrb_lower
+    else:
+      start = int(np.asarray(lookup.minor_upper_bnd_start)[ibnd])
+      end = int(np.asarray(lookup.minor_upper_bnd_end)[ibnd])
+      n_side = lookup.n_minor_absrb_upper
+    # A band with no minor absorbers on this side has its start (and end) at
+    # `n_side`, one past the last interval.
+    if 0 <= start < n_side:
+      slots.extend((is_lower, i) for i in range(start, min(end, n_side - 1) + 1))
+  return slots
+
+
+def _minor_optical_depth_band(
+    lookup: AbstractLookupGasOptics,
+    interp: CellInterpolation,
+    molecules: Array,
+    ibnd: int,
+    dry_factor: Array | float,
+) -> Array | None:
+  """Minor-absorber optical depth of every g-point of band `ibnd`.
+
+  The physics is that of `compute_minor_optical_depth` (merged lower/upper
+  intervals, a cell using the half its pressure selects, the density and
+  scaling-gas scalings); only the g-point axis differs. Each interval covers
+  the whole band in the shipped tables, so its contribution to the band's
+  g-points is one contiguous run of `n_gpt_in_band` contributors, gathered as a
+  row. The intervals are accumulated one at a time, so no
+  `(n_intervals, *cells, n_gpt)` array exists.
+
+  Returns:
+    `(*cell_shape, n_gpt_in_band)`, or `None` for a band with no minor
+    absorbers.
+  """
+  slots = _minor_slots(lookup, ibnd)
+  if not slots:
+    return None
+  gpts = _band_gpt_range(lookup, ibnd)
+  width = gpts.size
+  is_lower_atmos = interp.p > lookup.p_ref_tropo
+  mix_for_t = {s: interp.mix(ibnd, s, False) for s in _SIDES}
+  total = None
+  for is_lower, i in slots:
+    if is_lower:
+      table = lookup.kminor_lower
+      meta = (
+          lookup.idx_minor_gases_lower,
+          lookup.idx_scaling_gases_lower,
+          lookup.minor_lower_scales_with_density,
+          lookup.lower_scale_by_complement,
+          lookup.minor_lower_gpt_shift,
+      )
+    else:
+      table = lookup.kminor_upper
+      meta = (
+          lookup.idx_minor_gases_upper,
+          lookup.idx_scaling_gases_upper,
+          lookup.minor_upper_scales_with_density,
+          lookup.upper_scale_by_complement,
+          lookup.minor_upper_gpt_shift,
+      )
+    gas, scaling_gas, scales_with_density, by_complement, shift = (
+        int(np.asarray(m)[i]) for m in meta
+    )
+    vmr_minor = get_vmr(lookup, interp.vmr_lib, gas, interp.vmr_fields)
+    scaling = vmr_minor * molecules / _M2_TO_CM2_FACTOR
+    # Scaling by density and by a scaling gas. These flags are properties of
+    # the interval, not of the cell, so they are static selections here.
+    gas_scaling = 1.0
+    if scaling_gas > 0:
+      scaling_vmr = get_vmr(
+          lookup, interp.vmr_lib, scaling_gas, interp.vmr_fields
+      )
+      gas_scaling = (
+          1.0 - scaling_vmr * dry_factor
+          if by_complement == 1
+          else scaling_vmr * dry_factor
+      )
+    if scales_with_density == 1:
+      density_scaling = (
+          _PASCAL_TO_HPASCAL_FACTOR * interp.p / interp.temperature * gas_scaling
+      )
+      scaling = scaling * density_scaling
+    rows = table[..., shift : shift + width]
+    # Floored like the major coefficient: temperature outside the table is
+    # extrapolated along its end interval.
+    contribution = (
+        optics_utils.floor_at_zero(
+            _interpolate_rows_te(rows, interp.t_interp, mix_for_t)
+        )
+        * scaling[..., None]
+    )
+    side_mask = (is_lower_atmos if is_lower else ~is_lower_atmos)[..., None]
+    term = jnp.where(side_mask, contribution, 0.0)
+    total = term if total is None else total + term
+  return total
+
+
+def _dry_factor(
+    lookup: AbstractLookupGasOptics, vmr_fields: dict[int, Array] | None
+) -> Array | float:
+  if vmr_fields is not None and lookup.idx_h2o in vmr_fields:
+    return 1.0 / (1.0 + vmr_fields[lookup.idx_h2o])
+  return 1.0
+
+
+def _assemble_gpts(
+    pieces: list[Array], groups: list[_BandGroup]
+) -> Array:
+  """Concatenates per-group `(*cells, n)` pieces into `(n_gpt, *cells)`.
+
+  The pieces are in group order; the result is in g-point order, with the
+  g-point axis leading so that the spectral loop takes one g-point (or one
+  chunk of them) as a contiguous slab.
+  """
+  order = np.concatenate([g.gpts for g in groups])
+  stacked = jnp.moveaxis(jnp.concatenate(pieces, axis=-1), -1, 0)
+  if np.array_equal(order, np.arange(order.size)):
+    return stacked
+  return stacked[np.argsort(order)]
+
+
+def compute_optical_depth_all_gpts(
+    lookup: AbstractLookupGasOptics,
+    vmr_lib: LookupVolumeMixingRatio,
+    molecules: Array,
+    temperature: Array,
+    p: Array,
+    vmr_fields: dict[int, Array] | None = None,
+    interp: CellInterpolation | None = None,
+) -> Array:
+  """Gas absorption optical depth of every g-point: major plus minor.
+
+  Equal to `compute_minor_optical_depth + compute_major_optical_depth` at each
+  g-point (the same sum order).
+
+  Args:
+    lookup: The gas-optics lookup.
+    vmr_lib: The volume-mixing-ratio library.
+    molecules: Molecules per area of each cell [molecules/m^2].
+    temperature: Temperature [K].
+    p: Pressure [Pa].
+    vmr_fields: Optional per-gas volume mixing ratio fields, keyed by gas index.
+    interp: The cell interpolation state, if the caller already built it.
+
+  Returns:
+    `(n_gpt, *cell_shape)`.
+  """
+  if interp is None:
+    interp = CellInterpolation(lookup, vmr_lib, temperature, p, vmr_fields)
+  groups = band_groups(lookup)
+  dry_factor = _dry_factor(lookup, vmr_fields)
+  pieces = []
+  for group in groups:
+    ibnd0 = group.bands[0]
+    mix_for_t = {s: interp.mix(ibnd0, s, True) for s in _SIDES}
+    # Temperature and pressure outside the table are extrapolated along its end
+    # interval, which can go negative for a large enough excursion; an
+    # absorption coefficient cannot.
+    major = (molecules / _M2_TO_CM2_FACTOR)[..., None] * (
+        optics_utils.floor_at_zero(
+            _interpolate_rows_tpm(
+                _columns(lookup.kmajor, group.gpts),
+                interp.t_interp,
+                interp.p_interp,
+                mix_for_t,
+            )
+        )
+    )
+    minors = [
+        _minor_optical_depth_band(lookup, interp, molecules, b, dry_factor)
+        for b in group.bands
+    ]
+    if all(m is None for m in minors):
+      pieces.append(major)
+      continue
+    minor = jnp.concatenate(
+        [
+            jnp.zeros(molecules.shape + (_band_gpt_range(lookup, b).size,),
+                      major.dtype) if m is None else m
+            for b, m in zip(group.bands, minors)
+        ],
+        axis=-1,
+    )
+    pieces.append(minor + major)
+  return _assemble_gpts(pieces, groups)
+
+
+def compute_planck_fraction_all_gpts(
+    lookup: LookupGasOpticsLongwave,
+    vmr_lib: LookupVolumeMixingRatio,
+    p: Array,
+    temperature: Array,
+    vmr_fields: dict[int, Array] | None = None,
+    interp: CellInterpolation | None = None,
+) -> Array:
+  """Planck fraction of every g-point; see `compute_planck_fraction`.
+
+  Returns:
+    `(n_gpt, *cell_shape)`.
+  """
+  if interp is None:
+    interp = CellInterpolation(lookup, vmr_lib, temperature, p, vmr_fields)
+  # Clamped, not extrapolated, at the table ends: see `compute_planck_fraction`.
+  t_clamped, p_clamped = interp.clamped()
+  groups = band_groups(lookup)
+  pieces = []
+  for group in groups:
+    ibnd0 = group.bands[0]
+    mix_for_t = {s: interp.mix(ibnd0, s, False) for s in _SIDES}
+    pieces.append(
+        _interpolate_rows_tpm(
+            _columns(lookup.planck_fraction, group.gpts),
+            t_clamped,
+            p_clamped,
+            mix_for_t,
+        )
+    )
+  return _assemble_gpts(pieces, groups)
+
+
+def compute_rayleigh_optical_depth_all_gpts(
+    lkp: LookupGasOpticsShortwave,
+    vmr_lib: LookupVolumeMixingRatio,
+    molecules: Array,
+    temperature: Array,
+    p: Array,
+    vmr_fields: dict[int, Array] | None = None,
+    interp: CellInterpolation | None = None,
+) -> Array:
+  """Rayleigh optical depth of every g-point; see `compute_rayleigh_optical_depth`.
+
+  Returns:
+    `(n_gpt, *cell_shape)`.
+  """
+  if interp is None:
+    interp = CellInterpolation(lkp, vmr_lib, temperature, p, vmr_fields)
+  if vmr_fields is not None and lkp.idx_h2o in vmr_fields:
+    factor = 1.0 + vmr_fields[lkp.idx_h2o]
+  else:
+    factor = 1.0
+  groups = band_groups(lkp)
+  pieces = []
+  for group in groups:
+    ibnd0 = group.bands[0]
+    mix_for_t = {s: interp.mix(ibnd0, s, False) for s in _SIDES}
+    # The lower and upper tables are stacked so a cell reads the half its
+    # pressure selects (the per-g-point path reads both and selects).
+    table = jnp.stack([
+        _columns(lkp.rayl_lower, group.gpts),
+        _columns(lkp.rayl_upper, group.gpts),
+    ])
+    rayl = optics_utils.floor_at_zero(
+        _interpolate_rows_te(
+            table, interp.t_interp, mix_for_t, leading_idx=interp.tropo_idx
+        )
+    )
+    pieces.append((factor * molecules / _M2_TO_CM2_FACTOR)[..., None] * rayl)
+  return _assemble_gpts(pieces, groups)

@@ -25,6 +25,7 @@ from rrtmgp.optics import atmospheric_state
 from rrtmgp.optics import lookup_gas_optics_base
 from rrtmgp.optics import optics
 from rrtmgp.optics import optics_base
+from rrtmgp.rte import longwave_noscat
 from rrtmgp.rte import monochromatic_two_stream
 
 Array: TypeAlias = jax.Array
@@ -40,6 +41,66 @@ AtmosphericState: TypeAlias = atmospheric_state.AtmosphericState
 # GPU A/B confirms the win -- the recommendation, on the structural evidence, is
 # 8.
 DEFAULT_GPT_CHUNK = 1
+
+# The longwave solvers `solve_lw` can use: the two-stream solver (the default;
+# gas, cloud and aerosol scattering) and the absorption-only solver of RTE's
+# `lw_solver_noscat_oneangle` (see `rrtmgp.rte.longwave_noscat`).
+LW_SOLVER_TWO_STREAM = 'two_stream'
+LW_SOLVER_NOSCAT = 'noscat'
+LW_SOLVERS = (LW_SOLVER_TWO_STREAM, LW_SOLVER_NOSCAT)
+# How the spectral loop obtains the gas optics (see `solve_lw`):
+#   'per_gpt'  -- evaluated inside the loop, one g-point (or chunk) at a time.
+#   'all_gpts' -- evaluated for every g-point before the loop, with the
+#                 g-point innermost and every table read a row gather, and read
+#                 back inside the loop.
+GAS_OPTICS_MODE_PER_GPT = 'per_gpt'
+GAS_OPTICS_MODE_ALL_GPTS = 'all_gpts'
+GAS_OPTICS_MODES = (GAS_OPTICS_MODE_PER_GPT, GAS_OPTICS_MODE_ALL_GPTS)
+
+# Prefix of the clear-sky entries `solve_{lw,sw}(with_clear_sky=True)` add to
+# their result.
+_CLEAR_PREFIX = 'clear_'
+
+
+def split_clear_sky_fluxes(
+    fluxes: dict[str, Array],
+) -> tuple[dict[str, Array], dict[str, Array]]:
+  """Splits the result of a `with_clear_sky` solve into all-sky and clear-sky.
+
+  Args:
+    fluxes: The dictionary returned by `solve_lw` / `solve_sw` called with
+      `with_clear_sky=True`.
+
+  Returns:
+    The all-sky dictionary and the clear-sky one, each with the keys a plain
+    `solve_{lw,sw}` call returns (no `clear_` prefix).
+  """
+  all_sky = {k: v for k, v in fluxes.items() if not k.startswith(_CLEAR_PREFIX)}
+  clear = {
+      k[len(_CLEAR_PREFIX):]: v
+      for k, v in fluxes.items()
+      if k.startswith(_CLEAR_PREFIX)
+  }
+  return all_sky, clear
+
+
+def _check_gas_optics_mode(
+    gas_optics_mode: str, optics_lib: optics_base.OpticsScheme
+) -> bool:
+  """Validates `gas_optics_mode`; returns whether the gas optics is hoisted."""
+  if gas_optics_mode not in GAS_OPTICS_MODES:
+    raise ValueError(
+        f'gas_optics_mode must be one of {GAS_OPTICS_MODES}, got'
+        f' {gas_optics_mode!r}.'
+    )
+  if gas_optics_mode == GAS_OPTICS_MODE_PER_GPT:
+    return False
+  if not isinstance(optics_lib, optics.RRTMOptics):
+    raise ValueError(
+        f"gas_optics_mode={GAS_OPTICS_MODE_ALL_GPTS!r} requires the RRTMOptics"
+        ' scheme (it reads the correlated-k gas-optics tables).'
+    )
+  return True
 
 
 def _gpt_chunk_plan(n_gpt: int, gpt_chunk: int) -> tuple[int, int, bool]:
@@ -88,15 +149,24 @@ def _solve_over_gpoints(
   for identical arithmetic, which is exactly what an 8.5-of-80-GiB,
   64-74%-utilised workload has headroom for.
 
-  **Two other levers were tried and failed; do not retry them.**
+  **Other levers on the same bottleneck, and what each measured.**
 
   * *Rearranging the arithmetic.* Collapsing the rewritten two-stream's
     two-branch selects and deduplicating its transcendentals (the parent commit
     of this one) measured 20.45 vs 20.68 s/sim-day -- no recovery. Cutting the
     number of `select`s did not cut the number of fusion roots.
-  * *`use_scan=True`.* XLA's cost model predicts a large win; the measurement is
-    44-49% *slower* end to end, because a `scan` serialises the very kernel
-    launches that are the bottleneck.
+  * *`use_scan=True` at small `gpt_chunk`.* `use_scan` replaces the unrolled
+    level recurrences by a `lax.scan` over levels (the loop over g-point chunks
+    stays a `fori_loop`). XLA's cost model predicts a large win; the
+    measurement at `gpt_chunk=1` is 44-49% *slower* end to end, because a
+    `scan` serialises the very kernel launches that are the bottleneck and each
+    step is a tiny kernel. A scan step is a kernel over `gpt_chunk` x columns
+    elements, so the trade reverses once the chunk is large: with
+    `gas_optics_mode='all_gpts'` and `gpt_chunk=64` (T63L47 ECHAM column, A100,
+    f32) the transport of one radiation call measured 37 ms against 126 ms for
+    the unrolled loop at `gpt_chunk=4`, and the whole call ~139 ms against
+    ~202 ms. The unrolled loop does not profit from a large chunk (its fused
+    level chains are the cost), the scan does.
 
   The corollary is that XLA's flop/byte cost model is not a throughput proxy on
   this workload. The only quantity that tracked the regression is the launch
@@ -119,7 +189,9 @@ def _solve_over_gpoints(
     # leading axis is introduced and the spectral sum is accumulated in the same
     # order, so this path is bit-for-bit the historical result.
     def step_fn(igpt, cumulative):
-      return jax.tree.map(jnp.add, one_gpt(igpt), cumulative)
+      per_gpt = one_gpt(igpt)
+      with jax.named_scope('spectral_sum'):
+        return jax.tree.map(jnp.add, per_gpt, cumulative)
 
     return jax.lax.fori_loop(0, n_gpt, step_fn, init_val)
 
@@ -150,7 +222,8 @@ def _solve_over_gpoints(
         chunked = jnp.where(mask, chunked, jnp.zeros_like(chunked))
       return jnp.sum(chunked, axis=0) + cumulative
 
-    return jax.tree.map(reduce_and_add, per_gpt, cumulative)
+    with jax.named_scope('spectral_sum'):
+      return jax.tree.map(reduce_and_add, per_gpt, cumulative)
 
   return jax.lax.fori_loop(0, n_chunks, step_fn, init_val)
 
@@ -173,23 +246,29 @@ def _cloud_tau_scale_kwargs(
   return kwargs
 
 
-def _compute_local_properties_lw(
+def _lw_planck_sources(
     pressure: Array,
     temperature: Array,
-    molecules: Array,
     igpt: Array,
     optics_lib: optics_base.OpticsScheme,
-    vmr_fields: dict[int, Array] | None = None,
-    sfc_temperature: Array | float | None = None,
-    cloud_r_eff_liq: Array | None = None,
-    cloud_path_liq: Array | None = None,
-    cloud_r_eff_ice: Array | None = None,
-    cloud_path_ice: Array | None = None,
-    aerosol_optics_slice: dict[str, Array] | None = None,
-    cloud_tau_scale_liq: Array | float | None = None,
-    cloud_tau_scale_ice: Array | float | None = None,
-) -> dict[str, Array]:
-  """Compute local optical properties for longwave radiative transfer."""
+    vmr_fields: dict[int, Array] | None,
+    sfc_temperature: Array | float | None,
+    lw_solver: str = LW_SOLVER_TWO_STREAM,
+    planck_fraction: Array | None = None,
+) -> tuple[dict[str, Array], Array]:
+  """Planck sources and the surface source of one g-point.
+
+  These depend on the temperature, pressure and gas amounts but not on any
+  condensate or aerosol, so a clear-sky and an all-sky solve of the same
+  g-point share them (see `solve_lw`, `with_clear_sky`).
+
+  Returns:
+    The layer-centre source (`planck_src`) and the combined face sources
+    (`planck_src_bottom`, `planck_src_top`: the geometric mean of the two
+    adjacent layers' values at each face, so both layers share one source per
+    level), and the surface source. The two-stream solver reads only the face
+    sources; the no-scattering solver reads the layer-centre one as well.
+  """
   if isinstance(sfc_temperature, float):
     # Create a plane for the surface temperature representation.
     nx, ny, _ = temperature.shape
@@ -197,32 +276,16 @@ def _compute_local_properties_lw(
         (nx, ny), dtype=temperature.dtype
     )
 
-  # Compute optical properties: `optical_depth`, `ssa`, & `asymmetry_factor`.
-  lw_optical_props = optics_lib.compute_lw_optical_properties(
-      pressure,
-      temperature,
-      molecules,
-      igpt,
-      vmr_fields,
-      cloud_r_eff_liq,
-      cloud_path_liq,
-      cloud_r_eff_ice,
-      cloud_path_ice,
-      **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
-  )
-
-  # Mix in aerosol contributions for this band, if supplied. Aerosol tau/ssa/g
-  # are passed through as-is (no delta-scaling applied), matching the convention
-  # of simple aerosol parameterisations.
-  if aerosol_optics_slice is not None:
-    lw_optical_props = optics_lib.combine_optical_properties(
-        lw_optical_props, aerosol_optics_slice
-    )
-
   # Compute Planck sources: `planck_src`, `planck_src_bottom`, `planck_src_top`,
   # and `planck_src_sfc`.
+  extra = {} if planck_fraction is None else {'planck_fraction': planck_fraction}
   planck_srcs = optics_lib.compute_planck_sources(
-      pressure, temperature, igpt, vmr_fields, sfc_temperature=sfc_temperature
+      pressure,
+      temperature,
+      igpt,
+      vmr_fields,
+      sfc_temperature=sfc_temperature,
+      **extra,
   )
 
   halo_width = 1
@@ -232,16 +295,53 @@ def _compute_local_properties_lw(
 
   # Compute combined Planck sources.  Output keys are `planck_src_bottom` and
   # `planck_src_top`.
-  combined_srcs = monochromatic_two_stream.lw_combine_sources(planck_srcs)
+  with jax.named_scope('cell'):
+    combined_srcs = monochromatic_two_stream.lw_combine_sources(planck_srcs)
+  if lw_solver == LW_SOLVER_NOSCAT:
+    # One source per level, shared by the two layers that meet there: current
+    # upstream RTE feeds `lw_solver_noscat_oneangle` the same geometric-mean
+    # level source as the two-stream solver
+    # (`mo_gas_optics_rrtmgp_kernels.F90::compute_Planck_source`), so the two
+    # solvers differ only in their transport. The layer-centre value is kept
+    # for the linear-in-tau emission of `lw_source_noscat`. (RRTMG, RTE <= 1.6
+    # and ECHAM6's `rtrnmc` instead give each layer its own face values,
+    # `pfrac(layer) * B(T_face)`, which are discontinuous across a face; the
+    # two conventions differ by at most 0.04 W/m^2 on the RFMIP clear-sky
+    # profiles, so this follows current RTE rather than changing the physics.)
+    return {
+        'planck_src': planck_srcs['planck_src'],
+        'planck_src_top': combined_srcs['planck_src_top'],
+        'planck_src_bottom': combined_srcs['planck_src_bottom'],
+    }, sfc_src
+  return combined_srcs, sfc_src
+
+
+def _lw_cell_properties(
+    lw_optical_props: dict[str, Array],
+    combined_srcs: dict[str, Array],
+    sfc_src: Array,
+    optics_lib: optics_base.OpticsScheme,
+    aerosol_optics_slice: dict[str, Array] | None = None,
+) -> dict[str, Array]:
+  """Two-stream cell properties and sources from a g-point's optical depth."""
+  # Mix in aerosol contributions for this band, if supplied. Aerosol tau/ssa/g
+  # are passed through as-is (no delta-scaling applied), matching the convention
+  # of simple aerosol parameterisations.
+  if aerosol_optics_slice is not None:
+    with jax.named_scope('aerosol_optics'):
+      lw_optical_props = optics_lib.combine_optical_properties(
+          lw_optical_props, aerosol_optics_slice
+      )
 
   # Compute `t_diff`, `r_diff`, `src_up`, and `src_down`.
-  src_and_properties = monochromatic_two_stream.lw_cell_source_and_properties(
-      lw_optical_props['optical_depth'],
-      lw_optical_props['ssa'],
-      combined_srcs['planck_src_bottom'],
-      combined_srcs['planck_src_top'],
-      lw_optical_props['asymmetry_factor'],
-  )
+  with jax.named_scope('cell'):
+    src_and_properties = monochromatic_two_stream.lw_cell_source_and_properties(
+        lw_optical_props['optical_depth'],
+        lw_optical_props['ssa'],
+        combined_srcs['planck_src_bottom'],
+        combined_srcs['planck_src_top'],
+        lw_optical_props['asymmetry_factor'],
+    )
   src_and_properties['sfc_src'] = sfc_src
 
   return src_and_properties
@@ -273,8 +373,15 @@ def solve_lw(
     gpt_chunk: int = DEFAULT_GPT_CHUNK,
     cloud_tau_scale_liq: Array | float | None = None,
     cloud_tau_scale_ice: Array | float | None = None,
+    with_clear_sky: bool = False,
+    lw_solver: str = LW_SOLVER_TWO_STREAM,
+    lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
+    gas_optics_mode: str = GAS_OPTICS_MODE_PER_GPT,
 ) -> dict[str, Array]:
-  """Solves two-stream radiative transfer equation over the longwave spectrum.
+  """Solves the radiative transfer equation over the longwave spectrum.
+
+  By default this is the two-stream solver; `lw_solver='noscat'` selects the
+  absorption-only solver instead (see below).
 
   Local optical properties like optical depth, single-scattering albedo, and
   asymmetry factor are computed using an optics library and transformed to
@@ -331,18 +438,70 @@ def solve_lw(
       cloud paths too. Has no effect in the gray atmosphere, which has no cloud
       optics.
     cloud_tau_scale_ice: Same as above, for the ice cloud optical depth.
+    gas_optics_mode: `'per_gpt'` (default) evaluates the gas optics inside
+      the spectral loop, a g-point (or `gpt_chunk` of them) at a time, as every
+      earlier version did. `'all_gpts'` evaluates it for every g-point before
+      the loop, with the g-point innermost and each table read a row gather over
+      the g-points, and the loop takes its g-points' slices from the result
+      (`RRTMOptics.compute_gas_optics_all_gpts`). The fluxes are the same; the
+      cost moves from per-g-point gather throughput to the memory of the
+      precomputed arrays (`n_gpt` fields each of the optical depth and of the
+      Planck fraction -- the Rayleigh optical depth in the shortwave).
+      Requires the `RRTMOptics` scheme. The precomputed stage reads the tables
+      by direct indexing (a gather), whatever `RRTMGP_LOOKUP_IMPL` selects for
+      the per-g-point path.
+    with_clear_sky: Also solve the cloud-free problem (gas + aerosol, the same
+      aerosol mix-in as the all-sky problem) and return it under `clear_`
+      prefixed keys. The gas optics and the Planck sources, which dominate the
+      cost of a g-point and are identical in the two problems, are evaluated
+      once per g-point; only the cloud mix-in, the cell properties and the
+      transport are done twice. The clear-sky fluxes equal those of a separate
+      call with no cloud arguments, and the all-sky fluxes are those of a call
+      without this flag. Requires an optics scheme that implements
+      `add_cloud_optical_properties` (both shipped ones do). When there is no
+      cloud to remove (no cloud paths, or the gray atmosphere) the two problems
+      are one and the all-sky fluxes are returned for both.
+    lw_solver: `'two_stream'` (the default) solves the two-stream equations
+      with the gas, cloud and aerosol single-scattering albedo and asymmetry
+      factor. `'noscat'` solves RTE's no-scattering equation instead
+      (`rrtmgp.rte.longwave_noscat`, a transcription of
+      `lw_solver_noscat_oneangle`): one propagation angle, and an absorption
+      optical depth `tau (1 - ssa)` formed from the combined gas, cloud and
+      aerosol properties, so cloud and aerosol scattering is dropped, as in
+      ECHAM6's `mo_lrtm_solver.f90`. Everything upstream of the transport (gas
+      optics, Planck sources, cloud and aerosol mix-in, McICA paths, the
+      clear-sky sharing, `gpt_chunk`) is common to both.
+    lw_secant: Secant of the propagation angle of the `'noscat'` solver; the
+      default is upstream RTE's one-point quadrature, `1 / 0.6096748751`.
+      Ignored by the two-stream solver, which has the diffusivity factor 1.66
+      built in.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
       `flux_up`: The upwelling longwave radiative flux at cell face i - 1/2.
       `flux_down`: The downwelling longwave radiative flux at face i - 1/2.
       `flux_net`: The net longwave radiative flux at face i - 1/2.
+    With `with_clear_sky`, also `clear_flux_up`, `clear_flux_down` and
+    `clear_flux_net`: the same three fields for the cloud-free atmosphere.
   """
+  if lw_solver not in LW_SOLVERS:
+    raise ValueError(
+        f'lw_solver must be one of {LW_SOLVERS}, got {lw_solver!r}.'
+    )
   optics_lib = cast(optics.RRTMOptics | optics.GrayAtmosphereOptics, optics_lib)
+  hoist_gas_optics = _check_gas_optics_mode(gas_optics_mode, optics_lib)
   if vmr_fields is not None:
     # Convert the chemical formulas of the gas species to RRTM-consistent
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_lw)
+
+  # The gas optics of every g-point, ahead of the spectral loop. Everything in
+  # it is independent of the cloud, the aerosol and the g-point loop's order.
+  gas_all_gpts = None
+  if hoist_gas_optics:
+    gas_all_gpts = optics_lib.compute_gas_optics_all_gpts(
+        pressure, temperature, molecules, vmr_fields, is_lw=True
+    )
 
   if aerosol_optics is not None:
     assert isinstance(optics_lib, optics.RRTMOptics), (
@@ -350,6 +509,64 @@ def solve_lw(
         ' g_point_to_bnd mapping).'
     )
     g_point_to_bnd_lw = optics_lib.gas_optics_lw.g_point_to_bnd
+
+  def transport(lw_optical_props, srcs, sfc_src, aer_slice):
+    # Boundary conditions. `toa_flux_lw` prescribes the *broadband* downwelling
+    # flux at the top of the atmosphere, but each g-point is solved as a
+    # separate radiative transfer problem and the results are summed over the
+    # spectrum below. Feeding the full broadband value to every g-point would
+    # therefore return `n_gpt_lw` times the prescribed flux. Split it across the
+    # g-points so the spectral sum reproduces it exactly. The shortwave path
+    # does the same thing with the physically-derived
+    # `solar_fraction_by_gpt` weights; a prescribed broadband longwave flux
+    # carries no such spectral information, so it is divided uniformly.
+    toa_flux_down_lw = (
+        atmos_state.toa_flux_lw / optics_lib.n_gpt_lw
+    ) * jnp.ones_like(sfc_src)
+    sfc_emissivity_lw = atmos_state.sfc_emis * jnp.ones_like(sfc_src)
+
+    if lw_solver == LW_SOLVER_NOSCAT:
+      # Mix in aerosol contributions for this band, if supplied, exactly as the
+      # two-stream path does (`_lw_cell_properties`); the solver then keeps only
+      # the absorption part of the combined optical depth.
+      if aer_slice is not None:
+        with jax.named_scope('aerosol_optics'):
+          lw_optical_props = optics_lib.combine_optical_properties(
+              lw_optical_props, aer_slice
+          )
+      with jax.named_scope('transport'):
+        return longwave_noscat.lw_noscat_transport(
+            lw_optical_props['optical_depth'],
+            lw_optical_props['ssa'],
+            srcs['planck_src'],
+            srcs['planck_src_top'],
+            srcs['planck_src_bottom'],
+            toa_flux_down_lw,
+            sfc_src,
+            sfc_emissivity_lw,
+            use_scan,
+            secant=lw_secant,
+            # The fence on the unrolled update chain pays only while the gas
+            # optics sits inside the g-point loop; see `lw_noscat_transport`.
+            fence_chain=gas_optics_mode == GAS_OPTICS_MODE_PER_GPT,
+        )
+
+    optical_props_2stream = _lw_cell_properties(
+        lw_optical_props, srcs, sfc_src, optics_lib, aer_slice
+    )
+    with jax.named_scope('transport'):
+      fluxes = monochromatic_two_stream.lw_transport(
+          optical_props_2stream['t_diff'],
+          optical_props_2stream['r_diff'],
+          optical_props_2stream['src_up'],
+          optical_props_2stream['src_down'],
+          toa_flux_down_lw,
+          sfc_src,
+          sfc_emissivity_lw,
+          use_scan,
+      )
+    # keys: 'flux_up', 'flux_down', 'flux_net'
+    return fluxes
 
   def one_gpt(igpt):
     cpl = (
@@ -366,52 +583,92 @@ def solve_lw(
     if aerosol_optics is not None:
       ibnd = g_point_to_bnd_lw[igpt]
       aer_slice = {k: v[ibnd] for k, v in aerosol_optics.items()}
-    optical_props_2stream = _compute_local_properties_lw(
+
+    srcs, sfc_src = _lw_planck_sources(
         pressure,
         temperature,
-        molecules,
         igpt,
         optics_lib,
         vmr_fields,
         sfc_temperature,
-        cloud_r_eff_liq,
-        cpl,
-        cloud_r_eff_ice,
-        cpi,
-        aerosol_optics_slice=aer_slice,
-        cloud_tau_scale_liq=cloud_tau_scale_liq,
-        cloud_tau_scale_ice=cloud_tau_scale_ice,
+        lw_solver,
+        planck_fraction=(
+            None if gas_all_gpts is None else gas_all_gpts['planck_fraction'][igpt]
+        ),
     )
 
-    # Boundary conditions. `toa_flux_lw` prescribes the *broadband* downwelling
-    # flux at the top of the atmosphere, but each g-point is solved as a
-    # separate radiative transfer problem and the results are summed over the
-    # spectrum below. Feeding the full broadband value to every g-point would
-    # therefore return `n_gpt_lw` times the prescribed flux. Split it across the
-    # g-points so the spectral sum reproduces it exactly. The shortwave path
-    # does the same thing with the physically-derived
-    # `solar_fraction_by_gpt` weights; a prescribed broadband longwave flux
-    # carries no such spectral information, so it is divided uniformly.
-    sfc_src = optical_props_2stream['sfc_src']
-    toa_flux_down_lw = (
-        atmos_state.toa_flux_lw / optics_lib.n_gpt_lw
-    ) * jnp.ones_like(sfc_src)
-    sfc_emissivity_lw = atmos_state.sfc_emis * jnp.ones_like(sfc_src)
+    def gas_properties():
+      if gas_all_gpts is not None:
+        return optics_lib.gas_optical_properties_from_all_gpts(
+            gas_all_gpts, igpt, True
+        )
+      return optics_lib.compute_gas_optical_properties(
+          pressure, temperature, molecules, igpt, True, vmr_fields
+      )
 
-    fluxes = monochromatic_two_stream.lw_transport(
-        optical_props_2stream['t_diff'],
-        optical_props_2stream['r_diff'],
-        optical_props_2stream['src_up'],
-        optical_props_2stream['src_down'],
-        toa_flux_down_lw,
-        sfc_src,
-        sfc_emissivity_lw,
-        use_scan,
-    )
-    # keys: 'flux_up', 'flux_down', 'flux_net'
-    return fluxes
+    if not with_clear_sky:
+      if gas_all_gpts is None:
+        lw_optical_props = optics_lib.compute_lw_optical_properties(
+            pressure,
+            temperature,
+            molecules,
+            igpt,
+            vmr_fields,
+            cloud_r_eff_liq,
+            cpl,
+            cloud_r_eff_ice,
+            cpi,
+            **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
+        )
+      else:
+        # The same composition `compute_lw_optical_properties` makes: the gas
+        # properties, with the cloud mixed in when there is cloud.
+        lw_optical_props = gas_properties()
+        if cpl is not None or cpi is not None:
+          lw_optical_props = optics_lib.add_cloud_optical_properties(
+              igpt,
+              lw_optical_props,
+              True,
+              cloud_r_eff_liq,
+              cpl,
+              cloud_r_eff_ice,
+              cpi,
+              **_cloud_tau_scale_kwargs(
+                  cloud_tau_scale_liq, cloud_tau_scale_ice
+              ),
+          )
+      return transport(lw_optical_props, srcs, sfc_src, aer_slice)
+
+    # The gas optics is the expensive, cloud-independent part: do it once and
+    # form the clear-sky and all-sky optical properties from it.
+    gas_props = gas_properties()
+    has_cloud = cpl is not None or cpi is not None
+    all_sky_props = gas_props
+    if has_cloud:
+      all_sky_props = optics_lib.add_cloud_optical_properties(
+          igpt,
+          gas_props,
+          True,
+          cloud_r_eff_liq,
+          cpl,
+          cloud_r_eff_ice,
+          cpi,
+          **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
+      )
+    clear_fluxes = transport(gas_props, srcs, sfc_src, aer_slice)
+    if all_sky_props is gas_props:
+      # Nothing to remove: the two problems are the same one.
+      all_sky_fluxes = clear_fluxes
+    else:
+      all_sky_fluxes = transport(all_sky_props, srcs, sfc_src, aer_slice)
+    return {
+        **all_sky_fluxes,
+        **{f'{_CLEAR_PREFIX}{k}': v for k, v in clear_fluxes.items()},
+    }
 
   flux_keys = ['flux_up', 'flux_down', 'flux_net']
+  if with_clear_sky:
+    flux_keys += [f'{_CLEAR_PREFIX}{key}' for key in flux_keys]
   init_val = {key: jnp.zeros_like(temperature) for key in flux_keys}
 
   # The top halo face is the top of the atmosphere, and the solver already
@@ -498,6 +755,8 @@ def solve_sw(
     cloud_tau_scale_ice: Array | float | None = None,
     sfc_alb_dir: Array | float | None = None,
     sfc_alb_dif: Array | float | None = None,
+    with_clear_sky: bool = False,
+    gas_optics_mode: str = GAS_OPTICS_MODE_PER_GPT,
 ) -> dict[str, Array]:
   """Solves the two-stream radiative transfer equation for shortwave.
 
@@ -563,6 +822,29 @@ def solve_sw(
       `RRTMOptics` scheme.
     sfc_alb_dif: Same as above, for diffuse light (the surface reflection of
       the downwelling diffuse flux).
+    gas_optics_mode: `'per_gpt'` (default) evaluates the gas optics inside
+      the spectral loop, a g-point (or `gpt_chunk` of them) at a time, as every
+      earlier version did. `'all_gpts'` evaluates it for every g-point before
+      the loop, with the g-point innermost and each table read a row gather over
+      the g-points, and the loop takes its g-points' slices from the result
+      (`RRTMOptics.compute_gas_optics_all_gpts`). The fluxes are the same; the
+      cost moves from per-g-point gather throughput to the memory of the
+      precomputed arrays (`n_gpt` fields each of the optical depth and of the
+      Planck fraction -- the Rayleigh optical depth in the shortwave).
+      Requires the `RRTMOptics` scheme. The precomputed stage reads the tables
+      by direct indexing (a gather), whatever `RRTMGP_LOOKUP_IMPL` selects for
+      the per-g-point path.
+    with_clear_sky: Also solve the cloud-free problem (gas + aerosol, the same
+      aerosol mix-in, surface albedos and night masking as the all-sky problem)
+      and return it under `clear_` prefixed keys. The gas optics, which
+      dominate the cost of a g-point and are identical in the two problems, are
+      evaluated once per g-point; only the cloud mix-in, the cell properties
+      and the transport are done twice. The clear-sky fluxes equal those of a
+      separate call with no cloud arguments, and the all-sky fluxes are those of
+      a call without this flag. Requires an optics scheme that implements
+      `add_cloud_optical_properties` (both shipped ones do). When there is no
+      cloud to remove (no cloud paths, or the gray atmosphere) the two problems
+      are one and the all-sky fluxes are returned for both.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -574,13 +856,24 @@ def solve_sw(
         surface, a `[nx, ny]` field. It is the part of the surface value of
         `flux_down` (`flux_down[:, :, 1]`) that arrives unscattered, so the
         diffuse part is their difference.
+    With `with_clear_sky`, also `clear_flux_up`, `clear_flux_down`,
+    `clear_flux_net` and `clear_flux_down_dir_sfc`: the same four fields for
+    the cloud-free atmosphere.
   """
   zenith = atmos_state.zenith
   optics_lib = cast(optics.RRTMOptics | optics.GrayAtmosphereOptics, optics_lib)
+  hoist_gas_optics = _check_gas_optics_mode(gas_optics_mode, optics_lib)
   if vmr_fields is not None:
     # Convert the chemical formulas of the gas species to RRTM-consistent
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_sw)
+
+  # The gas optics of every g-point, ahead of the spectral loop (see `solve_lw`).
+  gas_all_gpts = None
+  if hoist_gas_optics:
+    gas_all_gpts = optics_lib.compute_gas_optics_all_gpts(
+        pressure, temperature, molecules, vmr_fields, is_lw=False
+    )
 
   if aerosol_optics is not None:
     assert isinstance(optics_lib, optics.RRTMOptics), (
@@ -635,33 +928,10 @@ def solve_sw(
         if cloud_path_ice_per_gpt is not None
         else cloud_path_ice
     )
-    sw_optical_props = optics_lib.compute_sw_optical_properties(
-        pressure,
-        temperature,
-        molecules,
-        igpt,
-        vmr_fields,
-        cloud_r_eff_liq,
-        cpl,
-        cloud_r_eff_ice,
-        cpi,
-        **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
-    )
-    # Mix in aerosol contributions for this band, if supplied. Done after the
-    # gas+cloud combination (where cloud has already been delta-scaled in SW),
-    # so the aerosol tau/ssa/g are passed through as-is.
+    aer_slice = None
     if aerosol_optics is not None:
       ibnd = g_point_to_bnd_sw[igpt]
       aer_slice = {k: v[ibnd] for k, v in aerosol_optics.items()}
-      sw_optical_props = optics_lib.combine_optical_properties(
-          sw_optical_props, aer_slice
-      )
-    optical_props_2stream = monochromatic_two_stream.sw_cell_properties(
-        safe_zenith,
-        sw_optical_props['optical_depth'],
-        sw_optical_props['ssa'],
-        sw_optical_props['asymmetry_factor'],
-    )
 
     # Create an xy plane for the surface albedo and top-of-atmospehre flux, but
     # keep the same horizontal sharding as the temperature. Without a separate
@@ -682,38 +952,131 @@ def solve_sw(
     solar_flux = atmos_state.irrad * optics_lib.solar_fraction_by_gpt[igpt]
     toa_flux = solar_flux * jnp.ones_like(temperature)[:, :, 0]
 
-    sources_2stream = monochromatic_two_stream.sw_cell_source(
-        t_dir=optical_props_2stream['t_dir'],
-        r_dir=optical_props_2stream['r_dir'],
-        optical_depth=sw_optical_props['optical_depth'],
-        toa_flux=toa_flux,
-        sfc_albedo_direct=sfc_albedo_dir,
-        zenith=safe_zenith,
-        use_scan=use_scan,
-    )
+    def solve_optical_props(sw_optical_props):
+      # Mix in aerosol contributions for this band, if supplied. Done after the
+      # gas+cloud combination (where cloud has already been delta-scaled in SW),
+      # so the aerosol tau/ssa/g are passed through as-is.
+      if aer_slice is not None:
+        with jax.named_scope('aerosol_optics'):
+          sw_optical_props = optics_lib.combine_optical_properties(
+              sw_optical_props, aer_slice
+          )
+      with jax.named_scope('cell'):
+        optical_props_2stream = monochromatic_two_stream.sw_cell_properties(
+            safe_zenith,
+            sw_optical_props['optical_depth'],
+            sw_optical_props['ssa'],
+            sw_optical_props['asymmetry_factor'],
+        )
 
-    sw_fluxes = monochromatic_two_stream.sw_transport(
-        t_diff=optical_props_2stream['t_diff'],
-        r_diff=optical_props_2stream['r_diff'],
-        src_up=sources_2stream['src_up'],
-        src_down=sources_2stream['src_down'],
-        sfc_src=sources_2stream['sfc_src'],
-        sfc_albedo=sfc_albedo_dif,
-        flux_down_dir=sources_2stream['flux_down_dir'],
-        use_scan=use_scan,
-    )
-    # The direct beam reaching the surface, for the host model's direct /
-    # diffuse partition of the surface flux. Only the surface plane is kept,
-    # so the spectral sum carries one extra 2D field rather than a 3D one.
-    halo_width = 1
-    sw_fluxes['flux_down_dir_sfc'] = sources_2stream['flux_down_dir'][
-        :, :, halo_width
-    ]
-    return sw_fluxes
+      with jax.named_scope('sources'):
+        sources_2stream = monochromatic_two_stream.sw_cell_source(
+            t_dir=optical_props_2stream['t_dir'],
+            r_dir=optical_props_2stream['r_dir'],
+            optical_depth=sw_optical_props['optical_depth'],
+            toa_flux=toa_flux,
+            sfc_albedo_direct=sfc_albedo_dir,
+            zenith=safe_zenith,
+            use_scan=use_scan,
+        )
+
+      with jax.named_scope('transport'):
+        sw_fluxes = monochromatic_two_stream.sw_transport(
+            t_diff=optical_props_2stream['t_diff'],
+            r_diff=optical_props_2stream['r_diff'],
+            src_up=sources_2stream['src_up'],
+            src_down=sources_2stream['src_down'],
+            sfc_src=sources_2stream['sfc_src'],
+            sfc_albedo=sfc_albedo_dif,
+            flux_down_dir=sources_2stream['flux_down_dir'],
+            use_scan=use_scan,
+        )
+      # The direct beam reaching the surface, for the host model's direct /
+      # diffuse partition of the surface flux. Only the surface plane is kept,
+      # so the spectral sum carries one extra 2D field rather than a 3D one.
+      halo_width = 1
+      sw_fluxes['flux_down_dir_sfc'] = sources_2stream['flux_down_dir'][
+          :, :, halo_width
+      ]
+      return sw_fluxes
+
+    def gas_properties():
+      if gas_all_gpts is not None:
+        return optics_lib.gas_optical_properties_from_all_gpts(
+            gas_all_gpts, igpt, False
+        )
+      return optics_lib.compute_gas_optical_properties(
+          pressure, temperature, molecules, igpt, False, vmr_fields
+      )
+
+    if not with_clear_sky:
+      if gas_all_gpts is None:
+        return solve_optical_props(
+            optics_lib.compute_sw_optical_properties(
+                pressure,
+                temperature,
+                molecules,
+                igpt,
+                vmr_fields,
+                cloud_r_eff_liq,
+                cpl,
+                cloud_r_eff_ice,
+                cpi,
+                **_cloud_tau_scale_kwargs(
+                    cloud_tau_scale_liq, cloud_tau_scale_ice
+                ),
+            )
+        )
+      sw_optical_props = gas_properties()
+      if cpl is not None or cpi is not None:
+        sw_optical_props = optics_lib.add_cloud_optical_properties(
+            igpt,
+            sw_optical_props,
+            False,
+            cloud_r_eff_liq,
+            cpl,
+            cloud_r_eff_ice,
+            cpi,
+            **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
+        )
+      return solve_optical_props(sw_optical_props)
+
+    # The gas optics (absorption + Rayleigh) is the expensive, cloud-independent
+    # part: do it once and form the clear-sky and all-sky optical properties
+    # from it.
+    gas_props = gas_properties()
+    has_cloud = cpl is not None or cpi is not None
+    all_sky_props = gas_props
+    if has_cloud:
+      all_sky_props = optics_lib.add_cloud_optical_properties(
+          igpt,
+          gas_props,
+          False,
+          cloud_r_eff_liq,
+          cpl,
+          cloud_r_eff_ice,
+          cpi,
+          **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
+      )
+    clear_fluxes = solve_optical_props(gas_props)
+    if all_sky_props is gas_props:
+      # Nothing to remove: the two problems are the same one.
+      all_sky_fluxes = clear_fluxes
+    else:
+      all_sky_fluxes = solve_optical_props(all_sky_props)
+    return {
+        **all_sky_fluxes,
+        **{f'{_CLEAR_PREFIX}{k}': v for k, v in clear_fluxes.items()},
+    }
 
   flux_keys = ['flux_up', 'flux_down', 'flux_net']
   fluxes_0 = {key: jnp.zeros_like(temperature) for key in flux_keys}
   fluxes_0['flux_down_dir_sfc'] = jnp.zeros_like(temperature)[:, :, 0]
+  if with_clear_sky:
+    fluxes_0.update({
+        f'{_CLEAR_PREFIX}{key}': jnp.zeros_like(val)
+        for key, val in list(fluxes_0.items())
+    })
 
   # As in `solve_lw`, the top halo face is the top of the atmosphere and the
   # solver already produces the correct value there, so it is left untouched.

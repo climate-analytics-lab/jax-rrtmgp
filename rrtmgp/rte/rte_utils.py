@@ -111,6 +111,7 @@ def recurrent_op(
     init: Array,
     inputs: dict[str, Array],
     forward: bool = True,
+    fence_chain: bool = False,
 ) -> tuple[Array, Array]:
   """Compute sequence of recurrent operations.
 
@@ -128,6 +129,20 @@ def recurrent_op(
     init: The initial state of the recurrent operation.
     inputs: A dictionary of inputs to the recurrent operation.
     forward: Whether to run the recurrent operation in the forward direction.
+    fence_chain: If True, return `(carry, output)` through an
+      `optimization_barrier` straight after the level loop. `output` is built as
+      a chain of `nz` dynamic-update-slices, which XLA executes in place only
+      while that chain is the root of its fusion. Anything fused onto it (the
+      zero-pad and boundary `.at[].set` of `recurrent_op_with_halos`, say) makes
+      the chain's consumer the root instead, and the chain is then re-evaluated
+      per output element. The barrier keeps the chain a fusion of its own.
+      No value changes. It is off by default because the placement is
+      solver- and mode-dependent: the no-scattering longwave solver needs this
+      inner fence while the gas optics is inside the g-point loop (measured on
+      an A100, 3138 -> 502 ms per radiation call) and loses from it once the
+      gas optics is hoisted (163.5 -> 210 ms), whereas for the two-stream
+      solvers it costs time (350 -> 561 ms per call) and only the barrier at the
+      end of `recurrent_op_with_halos` helps.
 
   Returns:
     A tuple of the final carry state and the accumulated output.
@@ -158,6 +173,8 @@ def recurrent_op(
       i_set = -i - 1
     output = output.at[:, :, i_set].set(next_layer)
 
+  if fence_chain:
+    return jax.lax.optimization_barrier((carry, output))
   return carry, output
 
 
@@ -211,8 +228,28 @@ def recurrent_op_with_halos(
     inputs: dict[str, Array],
     forward: bool = True,
     use_scan: bool = False,
+    fence_chain: bool = False,
 ) -> tuple[Array, Array]:
-  """Compute sequence of recurrent operations, accounting for halos in z."""
+  """Compute sequence of recurrent operations, accounting for halos in z.
+
+  The result is always returned through an `optimization_barrier` (see the end
+  of the function). `fence_chain` additionally fences the unrolled chain inside
+  `recurrent_op` before the halo pad is applied; see `recurrent_op` for why and
+  for when it pays. It has no effect with `use_scan`.
+
+  Args:
+    f: The recurrent operation to apply.
+    init: The initial state, also written into the halo face that starts the
+      recurrence.
+    inputs: A dictionary of inputs, with a one-layer halo on each z end.
+    forward: Whether to run the recurrent operation in the forward direction.
+    use_scan: Use `jax.lax.scan` instead of the unrolled loop.
+    fence_chain: Fence the unrolled chain inside `recurrent_op`.
+
+  Returns:
+    A tuple of the final carry state and the output, padded back to the input's
+    z extent.
+  """
   halo_width = 1  # Assumed and hardcoded.
 
   # Step 1. Remove halos in z dimension.
@@ -222,7 +259,7 @@ def recurrent_op_with_halos(
   if use_scan:
     carry, output = recurrent_op_scan(f, init, inputs, forward)
   else:
-    carry, output = recurrent_op(f, init, inputs, forward)
+    carry, output = recurrent_op(f, init, inputs, forward, fence_chain)
 
   # Step 3. Pad result with halo layers that were removed so the output shape
   # matches the input shape. The values in the halos are set to be zero.
@@ -240,4 +277,10 @@ def recurrent_op_with_halos(
   else:
     output = output.at[:, :, -1].set(init)
 
-  return carry, output
+  # Keep the recurrence a fusion of its own. The unrolled form builds `output`
+  # as a chain of dynamic-update-slices, which XLA runs in place only while the
+  # chain's result is the fusion root; fused into a consumer (the spectral-sum
+  # `add`, or the next recurrence reading `output[:, :, 1]`) the chain is
+  # re-evaluated per output element and its cost grows with its depth. The
+  # barrier makes the result opaque to fusion without changing any value.
+  return jax.lax.optimization_barrier((carry, output))

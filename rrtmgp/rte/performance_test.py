@@ -90,6 +90,7 @@ arithmetic. Hence guard 4.
 
 import collections
 import functools
+import gc
 import re
 from pathlib import Path
 from typing import TypeAlias
@@ -110,6 +111,7 @@ from rrtmgp.optics import gas_optics
 from rrtmgp.optics import lookup_gas_optics_longwave
 from rrtmgp.optics import lookup_gas_optics_shortwave
 from rrtmgp.optics import optics
+from rrtmgp.rte import longwave_noscat
 from rrtmgp.rte import monochromatic_two_stream
 from rrtmgp.rte import two_stream
 
@@ -271,6 +273,70 @@ _MAX_LAUNCHES = {
     ('cpu', 'lw', True): 260_000,
     ('cpu', 'sw', False): 59_000,
     ('cpu', 'sw', True): 288_000,
+}
+
+# The no-scattering longwave solver (`lw_solver='noscat'`) has its own budgets,
+# separate from the two-stream ones above: it is a different program, and the
+# ceilings of the two-stream solve would admit the no-scattering one growing
+# several-fold before tripping. Same shape and same conventions as above (CPU
+# backend, jax 0.10.2, `_N_HORIZ`, g256, ceilings ~30% over for arithmetic and
+# ~20% over for launches). The two-stream longwave solve measures 3.01 Gflop,
+# 3.44 M transcendentals and 51,504 launches (`use_scan=False`) on the same
+# build; the no-scattering one:
+#
+#                        flops          transcendentals   launches
+#   LW noscat use_scan=False  2,331,200,000     2,293,504    20,277
+#   LW noscat use_scan=True   2,135,493,888     2,293,504   143,925
+#
+# i.e. per cell one `exp` for the layer transmittance and one `sqrt` for the
+# geometric-mean level source that the two-stream solver shares, where the
+# two-stream cell kernel has three transcendentals and ~340 flops, and no
+# albedo/emission recurrences -- two first-order recurrences instead of three --
+# which is where the launch count goes. The upward flux's one-level shift is a
+# slice and a pad rather than a `jnp.roll`, whose concatenate would be a launch
+# per g-point of its own. The per-cell kernel (`lw_noscat_layer_sources`), in
+# isolation: 35 flops and 1 transcendental per element, against the two-stream
+# kernel's 340 / 3.
+_MAX_NOSCAT_FLOPS = {True: 2_650_000_000, False: 2_950_000_000}
+_MAX_NOSCAT_TRANSCENDENTALS = {True: 3_000_000, False: 3_000_000}
+_MAX_NOSCAT_LAUNCHES = {
+    ('cpu', False): 24_500,
+    ('cpu', True): 171_000,
+}
+_MAX_NOSCAT_KERNEL_FLOPS = 38_500_000
+_MAX_NOSCAT_KERNEL_TRANSCENDENTALS = 1_100_000
+
+# Budgets for `gas_optics_mode='all_gpts'`, which evaluates the gas optics of
+# every g-point in one pass ahead of the spectral loop, with each table read a
+# row gather over the g-points (see `gas_optics.compute_optical_depth_all_gpts`).
+# They are separate numbers because it is a different program: the gas optics
+# are no longer in the loop body, so the body is cheaper per g-point and the
+# stage in front of it carries the cost once. Measured at the `_N_HORIZ` shape,
+# CPU backend, g256 / g224 tables, `use_scan=False`, `gpt_chunk=8`:
+#
+#                     flops (body+stage)  transcendentals  launches
+#   LW solve             43,742,130,176       27,522,048     5,176
+#   SW solve             38,909,423,616       91,740,160     4,708
+#   LW gas stage alone   35,970,183,168                0       252
+#   SW gas stage alone   23,490,105,344                0       170
+#
+# (against `gas_optics_mode='per_gpt'` at the same chunk: 6,864 / 6,262
+# launches). The ceilings carry the same ~30% (arithmetic) and ~20% (launches)
+# headroom as the budgets above. The launch count of the gas stage is the guard
+# that matters most: it is what stays constant while the solve's loop is
+# shortened by chunking, and a rewrite that goes back to per-scalar or
+# per-interval gathers shows up there as a multiple.
+_ALL_GPTS_CHUNK = 8
+_MAX_ALL_GPTS_FLOPS = {'lw': 57_000_000_000, 'sw': 51_000_000_000}
+_MAX_ALL_GPTS_TRANSCENDENTALS = {'lw': 36_000_000, 'sw': 120_000_000}
+_MAX_ALL_GPTS_STAGE_FLOPS = {'lw': 47_000_000_000, 'sw': 31_000_000_000}
+_MAX_ALL_GPTS_LAUNCHES = {
+    ('cpu', 'lw'): 6_300,
+    ('cpu', 'sw'): 5_700,
+}
+_MAX_ALL_GPTS_STAGE_LAUNCHES = {
+    ('cpu', 'lw'): 320,
+    ('cpu', 'sw'): 220,
 }
 
 # HLO text parsing for the launch count. Instruction lines look like
@@ -517,12 +583,13 @@ def _cost_of(fn, *args) -> dict[str, float]:
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled_solve(band: str, use_scan: bool):
+def _compiled_solve(band: str, use_scan: bool, lw_solver: str = 'two_stream'):
     """The compiled solve for `band`, cached.
 
     Compiling the solve at the production shape is the expensive part of this
     file, and the flops, transcendental and launch-count guards all want the
-    same four executables. Caching keeps the suite to one compile each.
+    same executables. Caching keeps the suite to one compile each. `lw_solver`
+    only means something for the longwave.
     """
     (optics_lib, atmos_state, p, t, molecules, vmr_fields,
      sfc_temperature) = _radiation_setup()
@@ -530,7 +597,7 @@ def _compiled_solve(band: str, use_scan: bool):
         if band == 'lw':
             return two_stream.solve_lw(
                 p, temp, molecules, optics_lib, atmos_state, vmr_fields,
-                sfc_temperature, use_scan=use_scan,
+                sfc_temperature, use_scan=use_scan, lw_solver=lw_solver,
             )['flux_net']
         return two_stream.solve_sw(
             p, temp, molecules, optics_lib, atmos_state, vmr_fields,
@@ -540,16 +607,20 @@ def _compiled_solve(band: str, use_scan: bool):
     return jax.jit(solve).lower(t).compile()
 
 
-def _compiled_cost(band: str, use_scan: bool) -> dict[str, float]:
+def _compiled_cost(
+    band: str, use_scan: bool, lw_solver: str = 'two_stream'
+) -> dict[str, float]:
     """Compile the solve for `band` and return XLA's cost analysis."""
-    cost = _compiled_solve(band, use_scan).cost_analysis()
+    cost = _compiled_solve(band, use_scan, lw_solver).cost_analysis()
     return cost[0] if isinstance(cost, list) else cost
 
 
-def _solve_launch_count(band: str, use_scan: bool):
+def _solve_launch_count(
+    band: str, use_scan: bool, lw_solver: str = 'two_stream'
+):
     """Kernel launches per solve, and a histogram of what issues them."""
     histogram = collections.Counter()
-    text = _compiled_solve(band, use_scan).as_text()
+    text = _compiled_solve(band, use_scan, lw_solver).as_text()
     return _count_launches(text, histogram), histogram
 
 
@@ -573,6 +644,18 @@ def _kernel_cost(band: str) -> dict[str, float]:
 
         return _cost_of(sw_kernel, tau, ssa, asymmetry)
 
+    if band == 'lw_noscat':
+        # Optical path out to a few units, as above, and Planck sources whose
+        # centre value differs from its faces, so no term is optimised away.
+        def noscat_kernel(path, centre, top, bottom):
+            return longwave_noscat.lw_noscat_layer_sources(
+                path, centre, top, bottom
+            )
+
+        planck = [jnp.asarray(rng.uniform(0.0, 10.0, shape), f32)
+                  for _ in range(3)]
+        return _cost_of(noscat_kernel, tau, *planck)
+
     def lw_kernel(tau, ssa, s, g):
         return monochromatic_two_stream.lw_cell_source_and_properties(
             tau, ssa, s, s, g
@@ -582,7 +665,55 @@ def _kernel_cost(band: str) -> dict[str, float]:
     return _cost_of(lw_kernel, tau, ssa, src, asymmetry)
 
 
+@functools.lru_cache(maxsize=None)
+def _compiled_all_gpts_solve(band: str):
+    """The compiled `gas_optics_mode='all_gpts'` solve, chunked, cached."""
+    (optics_lib, atmos_state, p, t, molecules, vmr_fields,
+     sfc_temperature) = _radiation_setup()
+
+    def solve(temp):
+        if band == 'lw':
+            return two_stream.solve_lw(
+                p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+                sfc_temperature, gpt_chunk=_ALL_GPTS_CHUNK,
+                gas_optics_mode='all_gpts',
+            )['flux_net']
+        return two_stream.solve_sw(
+            p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+            gpt_chunk=_ALL_GPTS_CHUNK, gas_optics_mode='all_gpts',
+        )['flux_net']
+
+    return jax.jit(solve).lower(t).compile()
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_all_gpts_stage(band: str):
+    """The all-g-point gas-optics stage compiled on its own, cached."""
+    (optics_lib, _, p, t, molecules, vmr_fields, _) = _radiation_setup()
+    lookup = optics_lib.gas_optics_lw
+    fields = {lookup.idx_gases[k]: v for k, v in vmr_fields.items()}
+
+    def stage(temp):
+        return optics_lib.compute_gas_optics_all_gpts(
+            p, temp, molecules, fields, is_lw=band == 'lw'
+        )
+
+    return jax.jit(stage).lower(t).compile()
+
+
+def _flops_of(compiled) -> dict[str, float]:
+    cost = compiled.cost_analysis()
+    return cost[0] if isinstance(cost, list) else cost
+
+
 class PerformanceTest(unittest.TestCase):
+
+    def tearDown(self):
+        # Each budget compiles whole solves, and their executables are large
+        # (the all-g-point programs are several GiB while compiling); dropping
+        # them after each test keeps the process under the memory of a CI runner.
+        jax.clear_caches()
+        gc.collect()
 
     def test_minor_gas_interval_count_is_bounded_by_widest_band(self):
         """The minor-absorber evaluation must not walk the whole table.
@@ -722,6 +853,64 @@ class PerformanceTest(unittest.TestCase):
             with self.subTest(use_scan=use_scan):
                 self._assert_launches_within_budget('sw', use_scan)
 
+    def test_noscat_longwave_solve_arithmetic_within_budget(self):
+        """The no-scattering solver, both `use_scan` settings (see above)."""
+        for use_scan in (True, False):
+            with self.subTest(use_scan=use_scan):
+                label = f'LW noscat solve (use_scan={use_scan})'
+                cost = _compiled_cost('lw', use_scan, 'noscat')
+                self._assert_metrics_present(cost, label)
+                self.assertLessEqual(
+                    cost['flops'], _MAX_NOSCAT_FLOPS[use_scan],
+                    msg=(f'{label} costs {cost["flops"]:,.0f} flops per g-point '
+                         f'body, over the {_MAX_NOSCAT_FLOPS[use_scan]:,} '
+                         f'budget.'),
+                )
+                self.assertLessEqual(
+                    cost['transcendentals'],
+                    _MAX_NOSCAT_TRANSCENDENTALS[use_scan],
+                    msg=(f'{label} costs {cost["transcendentals"]:,.0f} '
+                         f'transcendentals per g-point body, over the '
+                         f'{_MAX_NOSCAT_TRANSCENDENTALS[use_scan]:,} budget.'),
+                )
+
+    def test_noscat_longwave_solve_launch_count_within_budget(self):
+        for use_scan in (True, False):
+            with self.subTest(use_scan=use_scan):
+                platform = jax.devices()[0].platform
+                key = (platform, use_scan)
+                if key not in _MAX_NOSCAT_LAUNCHES:
+                    self.skipTest(
+                        f'no no-scattering launch budget calibrated for '
+                        f'platform {platform!r}; see '
+                        f'`_assert_launches_within_budget`.'
+                    )
+                label = f'LW noscat solve (use_scan={use_scan}) on {platform}'
+                launches, histogram = _solve_launch_count(
+                    'lw', use_scan, 'noscat'
+                )
+                self.assertGreater(launches, 0, msg=f'{label}: nothing counted')
+                self.assertLessEqual(
+                    launches, _MAX_NOSCAT_LAUNCHES[key],
+                    msg=(f'{label} issues {launches:,} kernel launches, over '
+                         f'the {_MAX_NOSCAT_LAUNCHES[key]:,} budget. Biggest '
+                         f'contributors: {histogram.most_common(5)}.'),
+                )
+
+    def test_noscat_cell_kernel_within_budget(self):
+        cost = _kernel_cost('lw_noscat')
+        self._assert_metrics_present(cost, 'LW noscat cell kernel')
+        self.assertLessEqual(
+            cost['flops'], _MAX_NOSCAT_KERNEL_FLOPS,
+            msg=f'LW noscat cell kernel costs {cost["flops"]:,.0f} flops.',
+        )
+        self.assertLessEqual(
+            cost['transcendentals'], _MAX_NOSCAT_KERNEL_TRANSCENDENTALS,
+            msg=(f'LW noscat cell kernel costs '
+                 f'{cost["transcendentals"]:,.0f} transcendentals; it should '
+                 f'be one `exp` per element.'),
+        )
+
     def test_launch_count_sees_loop_trip_counts(self):
         """The counter must multiply a loop body by its trip count.
 
@@ -840,6 +1029,64 @@ class PerformanceTest(unittest.TestCase):
                  f'trip-count assertions above say whether the loop failed to '
                  f'shorten or the body grew to absorb the saving.'),
         )
+
+    def test_all_gpts_solve_within_budget(self):
+        """The hoisted gas optics: arithmetic and launches of both bands.
+
+        A separate program from the default, so its own ceilings (see
+        `_MAX_ALL_GPTS_FLOPS`). The launch ceiling also pins that hoisting the
+        gas optics out of the loop removes launches rather than adding them.
+        """
+        platform = jax.devices()[0].platform
+        for band in ('lw', 'sw'):
+            with self.subTest(band=band):
+                compiled = _compiled_all_gpts_solve(band)
+                cost = _flops_of(compiled)
+                self._assert_metrics_present(cost, f'{band} all_gpts solve')
+                self.assertLessEqual(
+                    cost['flops'], _MAX_ALL_GPTS_FLOPS[band],
+                    msg=f'{band} all_gpts solve: {cost["flops"]:,.0f} flops')
+                self.assertLessEqual(
+                    cost['transcendentals'],
+                    _MAX_ALL_GPTS_TRANSCENDENTALS[band],
+                    msg=(f'{band} all_gpts solve: '
+                         f'{cost["transcendentals"]:,.0f} transcendentals'))
+                if (platform, band) not in _MAX_ALL_GPTS_LAUNCHES:
+                    continue
+                launches = _count_launches(compiled.as_text())
+                self.assertGreater(launches, 0, msg='HLO text did not parse')
+                self.assertLessEqual(
+                    launches, _MAX_ALL_GPTS_LAUNCHES[platform, band],
+                    msg=(f'{band} all_gpts solve issues {launches:,} launches '
+                         f'on {platform}, over the '
+                         f'{_MAX_ALL_GPTS_LAUNCHES[platform, band]:,} budget.'))
+
+    def test_all_gpts_gas_stage_within_budget(self):
+        """The gas-optics stage alone: its launches do not scale with g-points.
+
+        The stage is one pass over every g-point, so its kernel count is set by
+        the number of band groups and minor intervals (a few hundred), not by
+        `n_gpt`. A per-g-point or per-scalar gather would multiply it.
+        """
+        platform = jax.devices()[0].platform
+        for band in ('lw', 'sw'):
+            with self.subTest(band=band):
+                compiled = _compiled_all_gpts_stage(band)
+                cost = _flops_of(compiled)
+                self.assertIn('flops', cost)
+                self.assertLessEqual(
+                    cost['flops'], _MAX_ALL_GPTS_STAGE_FLOPS[band],
+                    msg=f'{band} gas stage: {cost["flops"]:,.0f} flops')
+                if (platform, band) not in _MAX_ALL_GPTS_STAGE_LAUNCHES:
+                    continue
+                launches = _count_launches(compiled.as_text())
+                self.assertGreater(launches, 0, msg='HLO text did not parse')
+                self.assertLessEqual(
+                    launches, _MAX_ALL_GPTS_STAGE_LAUNCHES[platform, band],
+                    msg=(f'{band} gas stage issues {launches:,} launches on '
+                         f'{platform}, over the '
+                         f'{_MAX_ALL_GPTS_STAGE_LAUNCHES[platform, band]:,} '
+                         f'budget.'))
 
     def test_longwave_cell_kernel_within_budget(self):
         self._assert_kernel_within_budget('lw')
