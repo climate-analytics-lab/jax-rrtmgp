@@ -149,15 +149,24 @@ def _solve_over_gpoints(
   for identical arithmetic, which is exactly what an 8.5-of-80-GiB,
   64-74%-utilised workload has headroom for.
 
-  **Two other levers were tried and failed; do not retry them.**
+  **Other levers on the same bottleneck, and what each measured.**
 
   * *Rearranging the arithmetic.* Collapsing the rewritten two-stream's
     two-branch selects and deduplicating its transcendentals (the parent commit
     of this one) measured 20.45 vs 20.68 s/sim-day -- no recovery. Cutting the
     number of `select`s did not cut the number of fusion roots.
-  * *`use_scan=True`.* XLA's cost model predicts a large win; the measurement is
-    44-49% *slower* end to end, because a `scan` serialises the very kernel
-    launches that are the bottleneck.
+  * *`use_scan=True` at small `gpt_chunk`.* `use_scan` replaces the unrolled
+    level recurrences by a `lax.scan` over levels (the loop over g-point chunks
+    stays a `fori_loop`). XLA's cost model predicts a large win; the
+    measurement at `gpt_chunk=1` is 44-49% *slower* end to end, because a
+    `scan` serialises the very kernel launches that are the bottleneck and each
+    step is a tiny kernel. A scan step is a kernel over `gpt_chunk` x columns
+    elements, so the trade reverses once the chunk is large: with
+    `gas_optics_mode='all_gpts'` and `gpt_chunk=64` (T63L47 ECHAM column, A100,
+    f32) the transport of one radiation call measured 37 ms against 126 ms for
+    the unrolled loop at `gpt_chunk=4`, and the whole call ~139 ms against
+    ~202 ms. The unrolled loop does not profit from a large chunk (its fused
+    level chains are the cost), the scan does.
 
   The corollary is that XLA's flop/byte cost model is not a throughput proxy on
   this workload. The only quantity that tracked the regression is the launch
