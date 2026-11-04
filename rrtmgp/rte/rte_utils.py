@@ -137,10 +137,12 @@ def recurrent_op(
       the chain's consumer the root instead, and the chain is then re-evaluated
       per output element. The barrier keeps the chain a fusion of its own.
       No value changes. It is off by default because the placement is
-      solver-dependent: the no-scattering longwave solver needs this inner fence
-      (measured on an A100, 3138 -> 502 ms per radiation call), whereas for the
-      two-stream solvers it costs time (350 -> 561 ms per call) and only the
-      barrier at the end of `recurrent_op_with_halos` helps.
+      solver- and mode-dependent: the no-scattering longwave solver needs this
+      inner fence while the gas optics is inside the g-point loop (measured on
+      an A100, 3138 -> 502 ms per radiation call) and loses from it once the
+      gas optics is hoisted (163.5 -> 210 ms), whereas for the two-stream
+      solvers it costs time (350 -> 561 ms per call) and only the barrier at the
+      end of `recurrent_op_with_halos` helps.
 
   Returns:
     A tuple of the final carry state and the accumulated output.

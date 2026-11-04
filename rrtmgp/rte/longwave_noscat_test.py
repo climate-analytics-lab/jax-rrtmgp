@@ -259,6 +259,36 @@ class NoScatKernelTest(unittest.TestCase):
           atol=1e-4,
       )
 
+  def test_fence_chain_changes_the_program_not_the_values(self):
+    """`fence_chain` adds one optimization barrier per unrolled recurrence (the
+    downward and the upward one) on top of the barrier every halo recurrence
+    ends with, and no value changes."""
+    col = _synthetic_column()
+    shape = col['shape']
+    args = (
+        jnp.full(shape, 0.2), jnp.zeros(shape), col['planck_src'],
+        col['planck_src_top'], col['planck_src_bottom'],
+        jnp.full(shape[:2], 3.0), col['sfc_src'], jnp.full(shape[:2], 0.97),
+    )
+
+    def n_barriers(fence_chain, use_scan=False):
+      jaxpr = jax.make_jaxpr(
+          lambda *a: longwave_noscat.lw_noscat_transport(
+              *a, use_scan=use_scan, fence_chain=fence_chain
+          )
+      )(*args)
+      return str(jaxpr).count('optimization_barrier')
+
+    self.assertEqual(n_barriers(True), n_barriers(False) + 2)
+    # The scanned recurrence has no update chain to fence.
+    self.assertEqual(n_barriers(True, True), n_barriers(False, True))
+    fenced = longwave_noscat.lw_noscat_transport(*args, fence_chain=True)
+    unfenced = longwave_noscat.lw_noscat_transport(*args, fence_chain=False)
+    for key in fenced:
+      np.testing.assert_array_equal(
+          np.asarray(fenced[key]), np.asarray(unfenced[key])
+      )
+
   def test_gradients_are_finite_where_the_forward_pass_is_singular(self):
     """Zero optical depth (the series branch), `ssa = 1` exactly (so the
     absorption optical depth is zero), and negative halo optical depth must not
@@ -443,6 +473,36 @@ class NoScatSolveTest(unittest.TestCase):
     for key in ('flux_up', 'flux_down'):
       diff = np.abs(np.asarray(got[key]) - np.asarray(want[key]))[:, :, 1:]
       self.assertLess(diff.max(), tolerance, msg=key)
+
+  @parameterized.expand([('per_gpt', True), ('all_gpts', False)])
+  def test_solve_fences_the_update_chain_only_with_in_loop_gas_optics(
+      self, gas_optics_mode, expect_fence
+  ):
+    """The caller picks the fence from the gas-optics mode (see
+    `lw_noscat_transport`): fenced with the gas optics inside the g-point loop,
+    unfenced with it hoisted. Both give the same fluxes."""
+    fx = self._rfmip_site(0)
+    real = longwave_noscat.lw_noscat_transport
+    with mock.patch.object(
+        longwave_noscat, 'lw_noscat_transport', wraps=real
+    ) as spy:
+      got = self._solve(
+          fx, lw_solver='noscat', gas_optics_mode=gas_optics_mode,
+          gpt_chunk=4,
+      )
+    self.assertGreater(spy.call_count, 0)
+    for call in spy.call_args_list:
+      self.assertEqual(call.kwargs['fence_chain'], expect_fence)
+    # Same values as the other mode.
+    other = 'all_gpts' if gas_optics_mode == 'per_gpt' else 'per_gpt'
+    want = self._solve(
+        fx, lw_solver='noscat', gas_optics_mode=other, gpt_chunk=4
+    )
+    for key in ('flux_up', 'flux_down', 'flux_net'):
+      np.testing.assert_allclose(
+          np.asarray(got[key]), np.asarray(want[key]), rtol=1e-4, atol=1e-3,
+          err_msg=key,
+      )
 
   def test_default_solver_is_two_stream(self):
     fx = self._rfmip_site(0)

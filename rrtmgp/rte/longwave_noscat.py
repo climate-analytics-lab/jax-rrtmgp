@@ -150,6 +150,7 @@ def lw_noscat_transport(
     use_scan: bool = False,
     secant: float | Array = LW_NOSCAT_DEFAULT_SECANT,
     weight: float = LW_NOSCAT_DEFAULT_WEIGHT,
+    fence_chain: bool = True,
 ) -> StatesMap:
   """Monochromatic longwave fluxes for an absorbing, non-scattering atmosphere.
 
@@ -191,6 +192,16 @@ def lw_noscat_transport(
     secant: Secant of the propagation angle. The default is the one-point
       quadrature of upstream RTE (`LW_NOSCAT_DEFAULT_SECANT`).
     weight: The quadrature weight of that angle (1 for the one-point rule).
+    fence_chain: Whether the unrolled recurrences put an optimization barrier on
+      their dynamic-update-slice chain (`rte_utils.recurrent_op`). The
+      per-level work here is a multiply and an add, so the chain itself is the
+      cost, and whether the barrier pays depends on what is fused around the
+      solve (T63L47 ECHAM-RRTMGP, A100, `use_scan=False`, `gpt_chunk=4`): with
+      the gas optics inside the g-point loop (`gas_optics_mode='per_gpt'`) the
+      fence takes the no-scattering solve from 3138 to 502 ms/call; with it
+      hoisted (`'all_gpts'`) the fence costs, 210 ms/call against 163.5 without.
+      `two_stream.solve_lw` chooses accordingly; the default is the fenced
+      form. No value changes. Has no effect with `use_scan=True`.
 
   Returns:
     A dictionary of fluxes [W/m^2] at the cell faces, laid out like
@@ -215,18 +226,19 @@ def lw_noscat_transport(
     out = trans * flux_down_from_above + source_down
     return out, out  # Carry and output are the same.
 
-  # `fence_chain=True` on both recurrences: this solver's recurrences are the
-  # whole cost of the spectral loop, and without the inner fence XLA fuses the
-  # zero-pad onto the unrolled dynamic-update-slice chain and re-evaluates the
-  # chain per output element (3138 vs 502 ms per radiation call on an A100).
-  # The two-stream solvers measure the other way, so the fence is opt-in.
+  # `fence_chain` is passed to both recurrences. With the gas optics inside the
+  # g-point loop XLA otherwise fuses the zero-pad onto the unrolled
+  # dynamic-update-slice chain and re-evaluates the chain per output element
+  # (3138 vs 502 ms per radiation call on an A100), and the two-stream solvers
+  # measure the other way, so the fence is a per-solver, per-mode choice; see
+  # the `fence_chain` argument.
   _, flux_down = rte_utils.recurrent_op_with_halos(
       flux_down_op,
       toa_flux_down,
       {'trans': trans, 'source_down': source_down},
       forward=False,
       use_scan=use_scan,
-      fence_chain=True,
+      fence_chain=fence_chain,
   )
 
   # The downward flux at the surface face (the bottom face of the first
@@ -248,7 +260,7 @@ def lw_noscat_transport(
       {'trans': trans, 'source_up': source_up},
       forward=True,
       use_scan=use_scan,
-      fence_chain=True,
+      fence_chain=fence_chain,
   )
   # The recurrence stores each layer's *top*-face flux in that layer's slot (and
   # the surface flux in the bottom halo slot); face `k` of the output layout is

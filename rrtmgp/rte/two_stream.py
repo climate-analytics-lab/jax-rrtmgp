@@ -537,6 +537,9 @@ def solve_lw(
             sfc_emissivity_lw,
             use_scan,
             secant=lw_secant,
+            # The fence on the unrolled update chain pays only while the gas
+            # optics sits inside the g-point loop; see `lw_noscat_transport`.
+            fence_chain=gas_optics_mode == GAS_OPTICS_MODE_PER_GPT,
         )
 
     optical_props_2stream = _lw_cell_properties(
