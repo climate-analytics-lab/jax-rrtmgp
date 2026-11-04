@@ -1369,11 +1369,11 @@ class SharedClearSkyTest(unittest.TestCase):
     )
     args = (p, temperature, molecules, gray, atmos_state)
     if band == 'lw':
-      solve = lambda **kw: two_stream.solve_lw(
-          *args, sfc_temperature=sfc_t, **kw
-      )
+      def solve(**kw):
+        return two_stream.solve_lw(*args, sfc_temperature=sfc_t, **kw)
     else:
-      solve = lambda **kw: two_stream.solve_sw(*args, **kw)
+      def solve(**kw):
+        return two_stream.solve_sw(*args, **kw)
     plain = solve(**cloud)
     shared = solve(with_clear_sky=True, **cloud)
     all_sky, clear = two_stream.split_clear_sky_fluxes(shared)

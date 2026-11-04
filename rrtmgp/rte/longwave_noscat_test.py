@@ -66,7 +66,10 @@ def _synthetic_column(nlev: int = 12, n_horiz: int = 2, seed: int = 0):
   t_face = 300.0 - 6.0 * np.arange(nz + 1) + rng.normal(0, 0.5, nz + 1)
   t_layer = 0.5 * (t_face[:-1] + t_face[1:])
   shape = (n_horiz, n_horiz, nz)
-  tile = lambda v: jnp.asarray(np.broadcast_to(v, shape), jnp.float32)
+
+  def tile(v):
+    return jnp.asarray(np.broadcast_to(v, shape), jnp.float32)
+
   return {
       'planck_src': tile(_planck(t_layer)),
       'planck_src_bottom': tile(_planck(t_face[:-1])),
@@ -90,7 +93,10 @@ class NoScatKernelTest(unittest.TestCase):
     nlev = 10
     shape = (2, 2, nlev + 2)
     b = _planck(260.0)
-    full = lambda v: jnp.full(shape, v, jnp.float32)
+
+    def full(v):
+      return jnp.full(shape, v, jnp.float32)
+
     tau = np.zeros(shape, np.float32)
     tau[..., 1:-1] = np.logspace(-6, 1.5, nlev)[::-1]
     tau[..., 3] = 0.0
@@ -325,7 +331,10 @@ class NoScatKernelTest(unittest.TestCase):
     with jax.enable_x64(True):
       col = _synthetic_column(nlev=8, seed=5)
       shape = col['shape']
-      cast = lambda a: jnp.asarray(a, jnp.float64)
+
+      def cast(a):
+        return jnp.asarray(a, jnp.float64)
+
       planck, top, bottom, sfc = (cast(col[k]) for k in (
           'planck_src', 'planck_src_top', 'planck_src_bottom', 'sfc_src'))
       rng = np.random.default_rng(2)
