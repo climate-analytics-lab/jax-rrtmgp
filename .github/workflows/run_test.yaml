@@ -33,4 +33,7 @@ jobs:
           coverage combine
       - name: Generate Coverage Report
         run: |
-          coverage report -m
+          # `--include`: after `combine`, coverage also tries to report the Cython
+          # source of netCDF4 that the processes traced and fails on its missing
+          # `.pyx` ("No source for code"). The report is about this package.
+          coverage report -m --include='rrtmgp/*'
