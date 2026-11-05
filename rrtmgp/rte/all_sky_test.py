@@ -1416,6 +1416,162 @@ class SharedClearSkyTest(unittest.TestCase):
     self.assertGreater(np.abs(grad).max(), 0.0)
 
 
+class SharedAerosolFreeTest(unittest.TestCase):
+  """`with_aerosol_free=True` solves the aerosol-free twins in the same loop.
+
+  The aerosol-free problem is the same optical properties with no aerosol
+  mixed in -- the gas optics, Planck sources, cloud mix-in, albedos and night
+  masking are shared -- so the twin must return what a separate call without
+  `aerosol_optics` returns, for the all-sky problem and, with `with_clear_sky`,
+  for the clear-sky one too, and must leave the problems with aerosol as they
+  were. Tolerances as in `SharedClearSkyTest`: the combined program is fused
+  differently, which moves the fluxes by rounding.
+  """
+
+  RTOL = SharedClearSkyTest.RTOL
+  ATOL = SharedClearSkyTest.ATOL
+
+  def setUp(self):
+    super().setUp()
+    self._helper = SharedClearSkyTest()
+    self._helper.setUp()
+
+  def _solve(self, band, **kwargs):
+    return self._helper._solve(band, **kwargs)
+
+  def _inputs(self, band, with_mcica):
+    """Cloud and aerosol arguments of one case, and the same minus aerosol."""
+    kwargs, _ = self._helper._inputs(band, with_mcica, True)
+    no_aerosol = {k: v for k, v in kwargs.items() if k != 'aerosol_optics'}
+    return kwargs, no_aerosol
+
+  def test_prefix_order(self):
+    self.assertEqual(two_stream._problem_prefixes(False, False), [''])
+    self.assertEqual(
+        two_stream._problem_prefixes(True, False), ['', 'clear_']
+    )
+    self.assertEqual(
+        two_stream._problem_prefixes(False, True), ['', 'aerosol_free_']
+    )
+    self.assertEqual(
+        two_stream._problem_prefixes(True, True),
+        ['', 'clear_', 'aerosol_free_', 'aerosol_free_clear_'],
+    )
+
+  @parameterized.expand([
+      (band, chunk, with_mcica, with_clear_sky, lw_solver, hoisted)
+      for band, (chunk, with_mcica, with_clear_sky, lw_solver, hoisted)
+      in product(
+          ('lw', 'sw'),
+          # Broadcast cloud paths alone; McICA sub-columns with the clear sky
+          # on a wider chunk; broadcast with the clear sky on the no-scatter
+          # longwave solver, whose transport mixes the aerosol in itself; and
+          # the hoisted gas optics with scanned recurrences (the jax-gcm
+          # production placement), with and without the clear sky, since the
+          # `gas_all_gpts is not None` branches build the properties
+          # differently.
+          ((1, False, False, 'two_stream', False),
+           (4, True, True, 'two_stream', False),
+           (2, False, True, 'noscat', False),
+           (8, True, False, 'two_stream', True),
+           (8, False, True, 'two_stream', True)),
+      )
+      if not (band == 'sw' and lw_solver == 'noscat')
+  ])
+  def test_matches_separate_solves(
+      self, band, chunk, with_mcica, with_clear_sky, lw_solver, hoisted
+  ):
+    kwargs, no_aerosol = self._inputs(band, with_mcica)
+    extra = dict(gpt_chunk=chunk, with_clear_sky=with_clear_sky)
+    if hoisted:
+      extra.update(gas_optics_mode='all_gpts', use_scan=True)
+    if band == 'lw':
+      extra['lw_solver'] = lw_solver
+    shared = self._solve(band, with_aerosol_free=True, **extra, **kwargs)
+    with_aer, no_aer = two_stream.split_aerosol_free_fluxes(shared)
+    want_with = self._solve(band, **extra, **kwargs)
+    want_without = self._solve(band, **extra, **no_aerosol)
+    self.assertEqual(set(with_aer), set(want_with))
+    self.assertEqual(set(no_aer), set(want_without))
+    if with_clear_sky:
+      self.assertIn('clear_flux_up', no_aer)
+    for name, got, want in (
+        ('with aerosol', with_aer, want_with),
+        ('aerosol-free', no_aer, want_without),
+    ):
+      for key in want:
+        np.testing.assert_allclose(
+            np.asarray(got[key]), np.asarray(want[key]),
+            rtol=self.RTOL, atol=self.ATOL,
+            err_msg=f'{band} {name} {key}',
+        )
+    # The aerosol must matter, or this proves nothing about the twin.
+    for key in ('flux_up', 'clear_flux_up') if with_clear_sky else ('flux_up',):
+      diff = np.abs(
+          np.asarray(want_with[key]) - np.asarray(want_without[key])
+      )
+      self.assertGreater(diff.max(), 0.1, key)
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_without_aerosol_the_twins_are_the_originals(self, band):
+    """No aerosol to remove: the twins are the originals, exactly."""
+    _, no_aerosol = self._inputs(band, False)
+    shared = self._solve(
+        band, with_clear_sky=True, with_aerosol_free=True, **no_aerosol
+    )
+    with_aer, no_aer = two_stream.split_aerosol_free_fluxes(shared)
+    plain = self._solve(band, with_clear_sky=True, **no_aerosol)
+    self.assertEqual(set(with_aer), set(plain))
+    for key in plain:
+      np.testing.assert_array_equal(
+          np.asarray(no_aer[key]), np.asarray(with_aer[key]), err_msg=key
+      )
+      np.testing.assert_allclose(
+          np.asarray(with_aer[key]), np.asarray(plain[key]),
+          rtol=self.RTOL, atol=self.ATOL, err_msg=key,
+      )
+
+  def test_night_columns_are_zero_in_the_twins_too(self):
+    optics_lib, atmos_state, p, temperature, molecules, vmr_fields, _, _ = (
+        self._helper._cached
+    )
+    kwargs, _ = self._inputs('sw', False)
+    night_state = dataclasses.replace(atmos_state, zenith=jnp.pi)
+    shared = two_stream.solve_sw(
+        p, temperature, molecules, optics_lib, night_state, vmr_fields,
+        with_clear_sky=True, with_aerosol_free=True, **kwargs
+    )
+    for key, val in shared.items():
+      np.testing.assert_array_equal(np.asarray(val), 0.0, err_msg=key)
+
+  @parameterized.expand([('lw',), ('sw',)])
+  def test_aerosol_free_gradients_are_finite(self, band):
+    """Reverse mode through the twins, w.r.t. temperature and the aerosol."""
+    kwargs, _ = self._inputs(band, False)
+    temperature = self._helper._cached[3]
+    aerosol = kwargs.pop('aerosol_optics')
+
+    def loss(temp, tau):
+      out = self._solve(
+          band, temperature=temp, gpt_chunk=4, with_clear_sky=True,
+          with_aerosol_free=True,
+          aerosol_optics={**aerosol, 'optical_depth': tau}, **kwargs
+      )
+      return (
+          jnp.sum(out['aerosol_free_clear_flux_net'][:, :, 1:])
+          + jnp.sum(out['aerosol_free_flux_up'][:, :, -2])
+          + jnp.sum(out['flux_up'][:, :, -2])
+      )
+
+    grad_t, grad_tau = jax.grad(loss, argnums=(0, 1))(
+        temperature, aerosol['optical_depth']
+    )
+    for name, grad in (('temperature', grad_t), ('aerosol', grad_tau)):
+      grad = np.asarray(grad)
+      self.assertTrue(np.all(np.isfinite(grad)), name)
+      self.assertGreater(np.abs(grad).max(), 0.0, name)
+
+
 class OpticsGasCloudSplitTest(unittest.TestCase):
   """`compute_gas_optical_properties` + `add_cloud_optical_properties`.
 
