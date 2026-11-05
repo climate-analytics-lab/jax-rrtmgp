@@ -14,6 +14,7 @@
 
 """A library for solving the two-stream radiative transfer equation."""
 
+from collections.abc import Mapping
 from typing import Callable, TypeAlias, cast
 
 import jax
@@ -60,6 +61,33 @@ GAS_OPTICS_MODES = (GAS_OPTICS_MODE_PER_GPT, GAS_OPTICS_MODE_ALL_GPTS)
 # Prefix of the clear-sky entries `solve_{lw,sw}(with_clear_sky=True)` add to
 # their result.
 _CLEAR_PREFIX = 'clear_'
+# Prefix of the aerosol-free entries `solve_{lw,sw}(with_aerosol_free=True)`
+# add to their result. With both flags the aerosol-free clear sky is under
+# `aerosol_free_clear_`, so `split_aerosol_free_fluxes` first and
+# `split_clear_sky_fluxes` on each half.
+_AEROSOL_FREE_PREFIX = 'aerosol_free_'
+
+
+def _problem_prefixes(
+    with_clear_sky: bool, with_aerosol_free: bool
+) -> list[str]:
+  """Key prefixes of the problems a solve returns, the all-sky one first."""
+  prefixes = ['']
+  if with_clear_sky:
+    prefixes.append(_CLEAR_PREFIX)
+  if with_aerosol_free:
+    prefixes += [_AEROSOL_FREE_PREFIX + prefix for prefix in prefixes]
+  return prefixes
+
+
+def _split_prefixed(
+    fluxes: dict[str, Array], prefix: str
+) -> tuple[dict[str, Array], dict[str, Array]]:
+  rest = {k: v for k, v in fluxes.items() if not k.startswith(prefix)}
+  split = {
+      k[len(prefix):]: v for k, v in fluxes.items() if k.startswith(prefix)
+  }
+  return rest, split
 
 
 def split_clear_sky_fluxes(
@@ -75,13 +103,73 @@ def split_clear_sky_fluxes(
     The all-sky dictionary and the clear-sky one, each with the keys a plain
     `solve_{lw,sw}` call returns (no `clear_` prefix).
   """
-  all_sky = {k: v for k, v in fluxes.items() if not k.startswith(_CLEAR_PREFIX)}
-  clear = {
-      k[len(_CLEAR_PREFIX):]: v
-      for k, v in fluxes.items()
-      if k.startswith(_CLEAR_PREFIX)
-  }
-  return all_sky, clear
+  return _split_prefixed(fluxes, _CLEAR_PREFIX)
+
+
+def split_aerosol_free_fluxes(
+    fluxes: dict[str, Array],
+) -> tuple[dict[str, Array], dict[str, Array]]:
+  """Splits the result of a `with_aerosol_free` solve into with and without.
+
+  Args:
+    fluxes: The dictionary returned by `solve_lw` / `solve_sw` called with
+      `with_aerosol_free=True`.
+
+  Returns:
+    The dictionary of the problems with the aerosol and the dictionary of
+    their aerosol-free twins, each with the keys the same call without
+    `with_aerosol_free` returns (so still with `clear_` entries when the call
+    had `with_clear_sky=True`; `split_clear_sky_fluxes` takes those apart).
+  """
+  return _split_prefixed(fluxes, _AEROSOL_FREE_PREFIX)
+
+
+def _solve_problems(
+    solve: Callable[
+        [Mapping[str, Array], Mapping[str, Array] | None], dict[str, Array]
+    ],
+    all_sky_props: Mapping[str, Array],
+    clear_props: Mapping[str, Array] | None,
+    aer_slice: Mapping[str, Array] | None,
+    with_clear_sky: bool,
+    with_aerosol_free: bool,
+) -> dict[str, Array]:
+  """Runs the transport of one g-point for every requested problem.
+
+  The problems are the all-sky one (`all_sky_props` with `aer_slice` mixed
+  in), the clear-sky one (`clear_props`, the same without the cloud), and the
+  aerosol-free twin of each (the same properties with no aerosol mixed in).
+  They share everything upstream of the transport -- the gas optics, the
+  Planck sources, the cloud mix-in -- so this is where the sharing pays:
+  `solve` is the cell properties and the transport only. Two problems that
+  are the same one (no cloud to remove: `clear_props is all_sky_props`; no
+  aerosol to remove: `aer_slice is None`) are solved once and returned under
+  both prefixes, so asking for a twin that cannot differ costs nothing.
+
+  Args:
+    solve: `(optical_props, aer_slice) -> fluxes`, the transport of one
+      problem; `aer_slice` is the g-point's band of the aerosol optics, or
+      `None` for none.
+    all_sky_props: The gas + cloud optical properties.
+    clear_props: The gas optical properties, when `with_clear_sky`.
+    aer_slice: The aerosol optical properties of this g-point's band, if any.
+    with_clear_sky: Also solve the clear-sky problem(s).
+    with_aerosol_free: Also solve the aerosol-free twin of every problem.
+
+  Returns:
+    The fluxes of every problem, keyed by `_problem_prefixes` order: the
+    all-sky keys bare, the others under their prefix.
+  """
+  solved: dict[tuple[int, bool], dict[str, Array]] = {}
+  fluxes: dict[str, Array] = {}
+  for prefix in _problem_prefixes(with_clear_sky, with_aerosol_free):
+    props = clear_props if prefix.endswith(_CLEAR_PREFIX) else all_sky_props
+    aer = None if prefix.startswith(_AEROSOL_FREE_PREFIX) else aer_slice
+    key = (id(props), aer is None)
+    if key not in solved:
+      solved[key] = solve(props, aer)
+    fluxes.update({prefix + k: v for k, v in solved[key].items()})
+  return fluxes
 
 
 def _check_gas_optics_mode(
@@ -377,6 +465,7 @@ def solve_lw(
     lw_solver: str = LW_SOLVER_TWO_STREAM,
     lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
     gas_optics_mode: str = GAS_OPTICS_MODE_PER_GPT,
+    with_aerosol_free: bool = False,
 ) -> dict[str, Array]:
   """Solves the radiative transfer equation over the longwave spectrum.
 
@@ -475,6 +564,14 @@ def solve_lw(
       default is upstream RTE's one-point quadrature, `1 / 0.6096748751`.
       Ignored by the two-stream solver, which has the diffusivity factor 1.66
       built in.
+    with_aerosol_free: Also solve the aerosol-free twin of every problem (the
+      all-sky one, and the clear-sky one under `with_clear_sky`): the same
+      optical properties with no `aerosol_optics` mixed in, and return it
+      under `aerosol_free_` prefixed keys. As for the clear sky, the gas
+      optics, Planck sources and cloud mix-in are shared and only the cell
+      properties and the transport are repeated. The twin equals a separate
+      call without `aerosol_optics`; without `aerosol_optics` it is the
+      original problem, returned under both names at no extra cost.
 
   Returns:
     A dictionary with the following entries (in units of W/m²):
@@ -483,6 +580,9 @@ def solve_lw(
       `flux_net`: The net longwave radiative flux at face i - 1/2.
     With `with_clear_sky`, also `clear_flux_up`, `clear_flux_down` and
     `clear_flux_net`: the same three fields for the cloud-free atmosphere.
+    With `with_aerosol_free`, also every returned field once more under
+    `aerosol_free_` (so `aerosol_free_flux_up`, ..., and with both flags
+    `aerosol_free_clear_flux_up`, ...) for the problem without aerosol.
   """
   if lw_solver not in LW_SOLVERS:
     raise ValueError(
@@ -606,6 +706,9 @@ def solve_lw(
           pressure, temperature, molecules, igpt, True, vmr_fields
       )
 
+    def solve(lw_optical_props, aer):
+      return transport(lw_optical_props, srcs, sfc_src, aer)
+
     if not with_clear_sky:
       if gas_all_gpts is None:
         lw_optical_props = optics_lib.compute_lw_optical_properties(
@@ -637,7 +740,9 @@ def solve_lw(
                   cloud_tau_scale_liq, cloud_tau_scale_ice
               ),
           )
-      return transport(lw_optical_props, srcs, sfc_src, aer_slice)
+      return _solve_problems(
+          solve, lw_optical_props, None, aer_slice, False, with_aerosol_free
+      )
 
     # The gas optics is the expensive, cloud-independent part: do it once and
     # form the clear-sky and all-sky optical properties from it.
@@ -655,20 +760,17 @@ def solve_lw(
           cpi,
           **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
       )
-    clear_fluxes = transport(gas_props, srcs, sfc_src, aer_slice)
-    if all_sky_props is gas_props:
-      # Nothing to remove: the two problems are the same one.
-      all_sky_fluxes = clear_fluxes
-    else:
-      all_sky_fluxes = transport(all_sky_props, srcs, sfc_src, aer_slice)
-    return {
-        **all_sky_fluxes,
-        **{f'{_CLEAR_PREFIX}{k}': v for k, v in clear_fluxes.items()},
-    }
+    # `all_sky_props is gas_props` when there is no cloud to remove, and
+    # `_solve_problems` then solves the one problem once.
+    return _solve_problems(
+        solve, all_sky_props, gas_props, aer_slice, True, with_aerosol_free
+    )
 
-  flux_keys = ['flux_up', 'flux_down', 'flux_net']
-  if with_clear_sky:
-    flux_keys += [f'{_CLEAR_PREFIX}{key}' for key in flux_keys]
+  flux_keys = [
+      f'{prefix}{key}'
+      for prefix in _problem_prefixes(with_clear_sky, with_aerosol_free)
+      for key in ('flux_up', 'flux_down', 'flux_net')
+  ]
   init_val = {key: jnp.zeros_like(temperature) for key in flux_keys}
 
   # The top halo face is the top of the atmosphere, and the solver already
@@ -757,6 +859,7 @@ def solve_sw(
     sfc_alb_dif: Array | float | None = None,
     with_clear_sky: bool = False,
     gas_optics_mode: str = GAS_OPTICS_MODE_PER_GPT,
+    with_aerosol_free: bool = False,
 ) -> dict[str, Array]:
   """Solves the two-stream radiative transfer equation for shortwave.
 
@@ -859,6 +962,9 @@ def solve_sw(
     With `with_clear_sky`, also `clear_flux_up`, `clear_flux_down`,
     `clear_flux_net` and `clear_flux_down_dir_sfc`: the same four fields for
     the cloud-free atmosphere.
+    With `with_aerosol_free`, also every returned field once more under
+    `aerosol_free_` (with both flags `aerosol_free_clear_...` as well) for
+    the same problem with no `aerosol_optics` mixed in; see `solve_lw`.
   """
   zenith = atmos_state.zenith
   optics_lib = cast(optics.RRTMOptics | optics.GrayAtmosphereOptics, optics_lib)
@@ -952,14 +1058,14 @@ def solve_sw(
     solar_flux = atmos_state.irrad * optics_lib.solar_fraction_by_gpt[igpt]
     toa_flux = solar_flux * jnp.ones_like(temperature)[:, :, 0]
 
-    def solve_optical_props(sw_optical_props):
+    def solve_optical_props(sw_optical_props, aer):
       # Mix in aerosol contributions for this band, if supplied. Done after the
       # gas+cloud combination (where cloud has already been delta-scaled in SW),
       # so the aerosol tau/ssa/g are passed through as-is.
-      if aer_slice is not None:
+      if aer is not None:
         with jax.named_scope('aerosol_optics'):
           sw_optical_props = optics_lib.combine_optical_properties(
-              sw_optical_props, aer_slice
+              sw_optical_props, aer
           )
       with jax.named_scope('cell'):
         optical_props_2stream = monochromatic_two_stream.sw_cell_properties(
@@ -1011,35 +1117,37 @@ def solve_sw(
 
     if not with_clear_sky:
       if gas_all_gpts is None:
-        return solve_optical_props(
-            optics_lib.compute_sw_optical_properties(
-                pressure,
-                temperature,
-                molecules,
-                igpt,
-                vmr_fields,
-                cloud_r_eff_liq,
-                cpl,
-                cloud_r_eff_ice,
-                cpi,
-                **_cloud_tau_scale_kwargs(
-                    cloud_tau_scale_liq, cloud_tau_scale_ice
-                ),
-            )
-        )
-      sw_optical_props = gas_properties()
-      if cpl is not None or cpi is not None:
-        sw_optical_props = optics_lib.add_cloud_optical_properties(
+        sw_optical_props = optics_lib.compute_sw_optical_properties(
+            pressure,
+            temperature,
+            molecules,
             igpt,
-            sw_optical_props,
-            False,
+            vmr_fields,
             cloud_r_eff_liq,
             cpl,
             cloud_r_eff_ice,
             cpi,
             **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
         )
-      return solve_optical_props(sw_optical_props)
+      else:
+        sw_optical_props = gas_properties()
+        if cpl is not None or cpi is not None:
+          sw_optical_props = optics_lib.add_cloud_optical_properties(
+              igpt,
+              sw_optical_props,
+              False,
+              cloud_r_eff_liq,
+              cpl,
+              cloud_r_eff_ice,
+              cpi,
+              **_cloud_tau_scale_kwargs(
+                  cloud_tau_scale_liq, cloud_tau_scale_ice
+              ),
+          )
+      return _solve_problems(
+          solve_optical_props, sw_optical_props, None, aer_slice, False,
+          with_aerosol_free,
+      )
 
     # The gas optics (absorption + Rayleigh) is the expensive, cloud-independent
     # part: do it once and form the clear-sky and all-sky optical properties
@@ -1058,25 +1166,23 @@ def solve_sw(
           cpi,
           **_cloud_tau_scale_kwargs(cloud_tau_scale_liq, cloud_tau_scale_ice),
       )
-    clear_fluxes = solve_optical_props(gas_props)
-    if all_sky_props is gas_props:
-      # Nothing to remove: the two problems are the same one.
-      all_sky_fluxes = clear_fluxes
-    else:
-      all_sky_fluxes = solve_optical_props(all_sky_props)
-    return {
-        **all_sky_fluxes,
-        **{f'{_CLEAR_PREFIX}{k}': v for k, v in clear_fluxes.items()},
-    }
+    # `all_sky_props is gas_props` when there is no cloud to remove, and
+    # `_solve_problems` then solves the one problem once.
+    return _solve_problems(
+        solve_optical_props, all_sky_props, gas_props, aer_slice, True,
+        with_aerosol_free,
+    )
 
-  flux_keys = ['flux_up', 'flux_down', 'flux_net']
-  fluxes_0 = {key: jnp.zeros_like(temperature) for key in flux_keys}
-  fluxes_0['flux_down_dir_sfc'] = jnp.zeros_like(temperature)[:, :, 0]
-  if with_clear_sky:
-    fluxes_0.update({
-        f'{_CLEAR_PREFIX}{key}': jnp.zeros_like(val)
-        for key, val in list(fluxes_0.items())
-    })
+  one_problem = {
+      key: jnp.zeros_like(temperature)
+      for key in ('flux_up', 'flux_down', 'flux_net')
+  }
+  one_problem['flux_down_dir_sfc'] = jnp.zeros_like(temperature)[:, :, 0]
+  fluxes_0 = {
+      f'{prefix}{key}': val
+      for prefix in _problem_prefixes(with_clear_sky, with_aerosol_free)
+      for key, val in one_problem.items()
+  }
 
   # As in `solve_lw`, the top halo face is the top of the atmosphere and the
   # solver already produces the correct value there, so it is left untouched.

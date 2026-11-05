@@ -144,6 +144,7 @@ class RRTMGP:
       lw_solver: str = two_stream.LW_SOLVER_TWO_STREAM,
       lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
       gas_optics_mode: str = two_stream.GAS_OPTICS_MODE_PER_GPT,
+      aerosol_free_fluxes: bool = False,
   ) -> dict[str, Array]:
     """Compute the local heating rate due to radiative transfer.
 
@@ -232,6 +233,19 @@ class RRTMGP:
     solve, and returns the same fluxes as one (see
     `two_stream.solve_lw(with_clear_sky=True)`). Whether they are requested
     changes nothing in the all-sky outputs.
+
+    `aerosol_free_fluxes=True` adds, for every problem solved (the all-sky
+    one, and the clear-sky one when that is requested), its aerosol-free twin:
+    the same atmosphere and cloud with no `aerosol_optics_{lw,sw}` mixed in,
+    which is what the AeroCom `*noa` diagnostics (`rsutnoa`, `rlutnoa` and
+    their clear-sky variants) are. They are solved inside the same g-point
+    loop, sharing the gas optics, Planck sources and cloud mix-in, and equal
+    a separate call without the aerosol arguments (see
+    `two_stream.solve_lw(with_aerosol_free=True)`); the outputs carry an
+    `aerosolfree` tag (`sw_flux_up_aerosolfree_full`,
+    `toa_sw_flux_outgoing_aerosolfree_2d_xy`, and `aerosolfree_clearsky` for
+    the twin of the clear sky). Without aerosol arguments the twins are the
+    originals, at no extra cost.
 
     `lw_solver` selects the longwave transport: `'two_stream'` (the default) or
     `'noscat'`, RTE's absorption-only solver (one angle with secant
@@ -325,6 +339,7 @@ class RRTMGP:
     # Whether to also return the cloud-free fluxes, solved alongside the
     # all-sky ones (see `two_stream.solve_lw(with_clear_sky=...)`).
     with_clear_sky = self._do_clear_sky or clear_sky_fluxes
+    with_aerosol_free = aerosol_free_fluxes
 
     # Compute water paths for liquid and ice cloud condensate.
     liq_water_path = _compute_cloud_path(rho_xxc, q_liq, self._dz, sg_map)
@@ -354,6 +369,7 @@ class RRTMGP:
           lw_solver=lw_solver,
           lw_secant=lw_secant,
           gas_optics_mode=gas_optics_mode,
+          with_aerosol_free=with_aerosol_free,
       )
     with jax.named_scope('sw'):
       sw_fluxes = two_stream.solve_sw(
@@ -378,7 +394,20 @@ class RRTMGP:
           sfc_alb_dif=sfc_alb_dif,
           with_clear_sky=with_clear_sky,
           gas_optics_mode=gas_optics_mode,
+          with_aerosol_free=with_aerosol_free,
       )
+    # Take the extra problems apart: the aerosol-free twins first (they may
+    # still hold `clear_` entries), then the clear sky of each half. `extra`
+    # maps an output tag to its (lw, sw) flux dictionaries.
+    extra: dict[str, tuple[dict[str, Array], dict[str, Array]]] = {}
+    if with_aerosol_free:
+      lw_fluxes, lw_noaer = two_stream.split_aerosol_free_fluxes(lw_fluxes)
+      sw_fluxes, sw_noaer = two_stream.split_aerosol_free_fluxes(sw_fluxes)
+      if with_clear_sky:
+        lw_noaer, lw_noaer_clear = two_stream.split_clear_sky_fluxes(lw_noaer)
+        sw_noaer, sw_noaer_clear = two_stream.split_clear_sky_fluxes(sw_noaer)
+        extra['aerosolfree_clearsky'] = (lw_noaer_clear, sw_noaer_clear)
+      extra['aerosolfree'] = (lw_noaer, sw_noaer)
     if with_clear_sky:
       lw_fluxes, lw_fluxes_clearsky = two_stream.split_clear_sky_fluxes(
           lw_fluxes
@@ -386,6 +415,7 @@ class RRTMGP:
       sw_fluxes, sw_fluxes_clearsky = two_stream.split_clear_sky_fluxes(
           sw_fluxes
       )
+      extra['clearsky'] = (lw_fluxes_clearsky, sw_fluxes_clearsky)
 
     # Compute the heating rate in K/s.
     q_v = q_t - q_c
@@ -447,56 +477,73 @@ class RRTMGP:
     if (v := 'rad_heat_sw_1d_z') in self._diagnostic_fields:
       output[v] = _horiz_mean(sw_heating_rate)
 
-    # Clear-sky diagnostics, if desired. The fluxes were solved above.
-    if with_clear_sky:
-      # Compute the heating rate in K/s.
-      lw_heating_rate_clearsky = two_stream.compute_heating_rate(
-          lw_fluxes_clearsky['flux_net'], p_ref_xxc, q_v
-      )
-      sw_heating_rate_clearsky = two_stream.compute_heating_rate(
-          sw_fluxes_clearsky['flux_net'], p_ref_xxc, q_v
-      )
-
-      if self._save_lw_sw_heating_rates:
-        output['rad_heat_sw_clearsky_3d'] = sw_heating_rate_clearsky
-        output['rad_heat_lw_clearsky_3d'] = lw_heating_rate_clearsky
-
-      lw_flux_down_clearsky = lw_fluxes_clearsky['flux_down']
-      lw_flux_up_clearsky = lw_fluxes_clearsky['flux_up']
-      sw_flux_down_clearsky = sw_fluxes_clearsky['flux_down']
-      sw_flux_up_clearsky = sw_fluxes_clearsky['flux_up']
-
-      # Add clear-sky full flux profiles (remove surface halos)
-      output['sw_flux_up_clearsky_full'] = sw_flux_up_clearsky[:, :, hw:]  # Full profile (..., nlev+1)
-      output['sw_flux_down_clearsky_full'] = sw_flux_down_clearsky[:, :, hw:]  # Full profile (..., nlev+1)
-      output['lw_flux_up_clearsky_full'] = lw_flux_up_clearsky[:, :, hw:]  # Full profile (..., nlev+1)
-      output['lw_flux_down_clearsky_full'] = lw_flux_down_clearsky[:, :, hw:]  # Full profile (..., nlev+1)
-      output['sw_flux_down_dir_clearsky_sfc'] = (
-          sw_fluxes_clearsky['flux_down_dir_sfc']
-      )
-
-      # 2D diagnostics
-      if (v := 'surf_lw_flux_down_clearsky_2d_xy') in self._diagnostic_fields:
-        output[v] = lw_flux_down_clearsky[:, :, hw]
-      if (v := 'surf_lw_flux_up_clearsky_2d_xy') in self._diagnostic_fields:
-        output[v] = lw_flux_up_clearsky[:, :, hw]
-      if (v := 'surf_sw_flux_down_clearsky_2d_xy') in self._diagnostic_fields:
-        output[v] = sw_flux_down_clearsky[:, :, hw]
-      if (v := 'surf_sw_flux_up_clearsky_2d_xy') in self._diagnostic_fields:
-        output[v] = sw_flux_up_clearsky[:, :, hw]
-
-      df = self._diagnostic_fields
-      if (v := 'surf_sw_flux_down_dir_clearsky_2d_xy') in df:
-        output[v] = sw_fluxes_clearsky['flux_down_dir_sfc']
-      if (v := 'toa_sw_flux_outgoing_clearsky_2d_xy') in df:
-        output[v] = sw_flux_up_clearsky[:, :, -hw]
-      if (v := 'toa_lw_flux_outgoing_clearsky_2d_xy') in df:
-        output[v] = lw_flux_up_clearsky[:, :, -hw]
-
-      # 1D diagnostics
-      if (v := 'rad_heat_lw_clearsky_1d_z') in self._diagnostic_fields:
-        output[v] = _horiz_mean(lw_heating_rate_clearsky)
-      if (v := 'rad_heat_sw_clearsky_1d_z') in self._diagnostic_fields:
-        output[v] = _horiz_mean(sw_heating_rate_clearsky)
+    # The extra problems (clear sky, aerosol-free, aerosol-free clear sky):
+    # the same profiles and diagnostics as the all-sky ones, each key tagged
+    # with the problem's name. The fluxes were solved above.
+    for tag, (lw_extra, sw_extra) in extra.items():
+      self._add_tagged_outputs(output, tag, lw_extra, sw_extra, p_ref_xxc, q_v)
 
     return output
+
+  def _add_tagged_outputs(
+      self,
+      output: dict[str, Array],
+      tag: str,
+      lw_fluxes: dict[str, Array],
+      sw_fluxes: dict[str, Array],
+      p_ref_xxc: Array,
+      q_v: Array,
+  ) -> None:
+    """Adds one extra problem's profiles and diagnostics to `output`.
+
+    `tag` is `'clearsky'`, `'aerosolfree'` or `'aerosolfree_clearsky'`; each
+    all-sky key gets the tag before its `_full` / `_sfc` / `_2d_xy` / `_1d_z`
+    / `_3d` suffix (`sw_flux_up_clearsky_full`, ...). The 2D and 1D
+    diagnostics are added when their tagged name is in `diagnostic_fields`;
+    the heating rates when `save_lw_sw_heating_rates` is set.
+    """
+    hw = 1  # halo width.
+    lw_heating_rate = two_stream.compute_heating_rate(
+        lw_fluxes['flux_net'], p_ref_xxc, q_v
+    )
+    sw_heating_rate = two_stream.compute_heating_rate(
+        sw_fluxes['flux_net'], p_ref_xxc, q_v
+    )
+    if self._save_lw_sw_heating_rates:
+      output[f'rad_heat_sw_{tag}_3d'] = sw_heating_rate
+      output[f'rad_heat_lw_{tag}_3d'] = lw_heating_rate
+
+    lw_flux_down = lw_fluxes['flux_down']
+    lw_flux_up = lw_fluxes['flux_up']
+    sw_flux_down = sw_fluxes['flux_down']
+    sw_flux_up = sw_fluxes['flux_up']
+
+    # Full flux profiles (surface halo removed), shaped (..., nlev+1).
+    output[f'sw_flux_up_{tag}_full'] = sw_flux_up[:, :, hw:]
+    output[f'sw_flux_down_{tag}_full'] = sw_flux_down[:, :, hw:]
+    output[f'lw_flux_up_{tag}_full'] = lw_flux_up[:, :, hw:]
+    output[f'lw_flux_down_{tag}_full'] = lw_flux_down[:, :, hw:]
+    output[f'sw_flux_down_dir_{tag}_sfc'] = sw_fluxes['flux_down_dir_sfc']
+
+    df = self._diagnostic_fields
+    # 2D diagnostics
+    if (v := f'surf_lw_flux_down_{tag}_2d_xy') in df:
+      output[v] = lw_flux_down[:, :, hw]
+    if (v := f'surf_lw_flux_up_{tag}_2d_xy') in df:
+      output[v] = lw_flux_up[:, :, hw]
+    if (v := f'surf_sw_flux_down_{tag}_2d_xy') in df:
+      output[v] = sw_flux_down[:, :, hw]
+    if (v := f'surf_sw_flux_up_{tag}_2d_xy') in df:
+      output[v] = sw_flux_up[:, :, hw]
+    if (v := f'surf_sw_flux_down_dir_{tag}_2d_xy') in df:
+      output[v] = sw_fluxes['flux_down_dir_sfc']
+    if (v := f'toa_sw_flux_outgoing_{tag}_2d_xy') in df:
+      output[v] = sw_flux_up[:, :, -hw]
+    if (v := f'toa_lw_flux_outgoing_{tag}_2d_xy') in df:
+      output[v] = lw_flux_up[:, :, -hw]
+
+    # 1D diagnostics
+    if (v := f'rad_heat_lw_{tag}_1d_z') in df:
+      output[v] = _horiz_mean(lw_heating_rate)
+    if (v := f'rad_heat_sw_{tag}_1d_z') in df:
+      output[v] = _horiz_mean(sw_heating_rate)

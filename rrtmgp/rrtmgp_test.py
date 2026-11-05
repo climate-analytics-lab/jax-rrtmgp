@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import netCDF4 as nc
 import numpy as np
+from parameterized import parameterized
 from rrtmgp import constants
 from rrtmgp import rrtmgp
 from rrtmgp import rrtmgp_common
@@ -445,6 +446,130 @@ class RRTMGPClearSkyTest(unittest.TestCase):
         np.max(np.abs(np.asarray(got['sw_flux_up_full'])
                       - np.asarray(got['sw_flux_up_clearsky_full']))),
         1.0,
+    )
+
+
+class RRTMGPAerosolFreeTest(unittest.TestCase):
+  """`aerosol_free_fluxes=True`: the aerosol-free twins, from the one solve."""
+
+  def tearDown(self):
+    jax.clear_caches()
+    super().tearDown()
+
+  def _inputs(self):
+    """A cloudy column with a visible aerosol in both bands."""
+    inputs = RRTMGPCloudTauScaleTest._cloudy_inputs(self)
+    shape = inputs['p_ref_xxc'].shape
+    rt = self._rt()
+    def bundle(n_bnd, tau):
+      ones = jnp.ones((n_bnd,) + shape, dtype=jnp.float_)
+      return {'optical_depth': tau * ones, 'ssa': 0.9 * ones,
+              'asymmetry_factor': 0.7 * ones}
+    aerosol = dict(
+        aerosol_optics_sw=bundle(rt.optics_lib.gas_optics_sw.n_bnd, 0.05),
+        aerosol_optics_lw=bundle(rt.optics_lib.gas_optics_lw.n_bnd, 0.02),
+    )
+    return inputs, aerosol
+
+  def _rt(self):
+    cfg = dataclasses.replace(
+        _build_radiative_transfer_cfg(), save_lw_sw_heating_rates=True
+    )
+    diagnostics = (
+        'toa_sw_flux_outgoing_2d_xy',
+        'toa_lw_flux_outgoing_2d_xy',
+        'toa_sw_flux_outgoing_clearsky_2d_xy',
+        'toa_sw_flux_outgoing_aerosolfree_2d_xy',
+        'toa_lw_flux_outgoing_aerosolfree_2d_xy',
+        'toa_sw_flux_outgoing_aerosolfree_clearsky_2d_xy',
+        'toa_lw_flux_outgoing_aerosolfree_clearsky_2d_xy',
+        'surf_sw_flux_down_aerosolfree_2d_xy',
+        'rad_heat_lw_aerosolfree_1d_z',
+    )
+    return rrtmgp.RRTMGP(cfg, dz=500.0, diagnostic_fields=diagnostics)
+
+  _STEMS = ('sw_flux_up', 'sw_flux_down', 'lw_flux_up', 'lw_flux_down')
+
+  @parameterized.expand([
+      ('per_gpt', dict()),
+      # jax-gcm's production placement: hoisted gas optics, scanned
+      # recurrences, 64 g-points per chunk.
+      ('all_gpts', dict(gas_optics_mode='all_gpts', gpt_chunk=64,
+                        use_scan=True)),
+  ])
+  def test_twins_are_the_solve_without_aerosol(self, _, placement):
+    """Each twin equals the same call with the aerosol arguments left out."""
+    inputs, aerosol = self._inputs()
+    rt = self._rt()
+    got = rt.compute_heating_rate(
+        **inputs, **aerosol, clear_sky_fluxes=True, aerosol_free_fluxes=True,
+        **placement,
+    )
+    want = rt.compute_heating_rate(
+        **inputs, clear_sky_fluxes=True, **placement
+    )
+    for stem in self._STEMS:
+      for tag, want_tag in (('aerosolfree', ''),
+                            ('aerosolfree_clearsky', 'clearsky_')):
+        np.testing.assert_allclose(
+            np.asarray(got[f'{stem}_{tag}_full']),
+            np.asarray(want[f'{stem}_{want_tag}full']),
+            rtol=2e-6, atol=1e-4, err_msg=f'{stem} {tag}',
+        )
+    np.testing.assert_allclose(
+        np.asarray(got['toa_sw_flux_outgoing_aerosolfree_2d_xy']),
+        np.asarray(want['toa_sw_flux_outgoing_2d_xy']), rtol=2e-6, atol=1e-4,
+    )
+    np.testing.assert_allclose(
+        np.asarray(got['toa_lw_flux_outgoing_aerosolfree_clearsky_2d_xy']),
+        np.asarray(want['lw_flux_up_clearsky_full'][:, :, -1]),
+        rtol=2e-6, atol=1e-4,
+    )
+    np.testing.assert_allclose(
+        np.asarray(got['rad_heat_lw_aerosolfree_3d']),
+        np.asarray(want['rad_heat_lw_3d']), rtol=2e-6, atol=1e-9,
+    )
+    self.assertIn('rad_heat_lw_aerosolfree_1d_z', got)
+    self.assertIn('surf_sw_flux_down_aerosolfree_2d_xy', got)
+    self.assertIn('sw_flux_down_dir_aerosolfree_clearsky_sfc', got)
+    # ... and the aerosol makes a difference to the problems that keep it.
+    for stem in ('sw_flux_down', 'lw_flux_up'):
+      self.assertGreater(
+          np.max(np.abs(np.asarray(got[f'{stem}_full'])
+                        - np.asarray(got[f'{stem}_aerosolfree_full']))),
+          0.1, stem,
+      )
+
+  def test_other_outputs_do_not_depend_on_the_flag(self):
+    inputs, aerosol = self._inputs()
+    rt = self._rt()
+    off = rt.compute_heating_rate(**inputs, **aerosol, clear_sky_fluxes=True)
+    on = rt.compute_heating_rate(
+        **inputs, **aerosol, clear_sky_fluxes=True, aerosol_free_fluxes=True
+    )
+    self.assertFalse([k for k in off if 'aerosolfree' in k])
+    self.assertTrue(set(off) < set(on))
+    for key, val in off.items():
+      # Rounding-level: the combined program is fused differently (see
+      # `all_sky_test.SharedAerosolFreeTest`).
+      np.testing.assert_allclose(
+          np.asarray(on[key]), np.asarray(val), rtol=2e-6, atol=1e-4,
+          err_msg=key,
+      )
+
+  def test_without_aerosol_the_twins_are_bit_identical(self):
+    inputs, _ = self._inputs()
+    rt = self._rt()
+    out = rt.compute_heating_rate(**inputs, aerosol_free_fluxes=True)
+    self.assertFalse([k for k in out if 'clearsky' in k])
+    for stem in self._STEMS:
+      np.testing.assert_array_equal(
+          np.asarray(out[f'{stem}_aerosolfree_full']),
+          np.asarray(out[f'{stem}_full']), err_msg=stem,
+      )
+    np.testing.assert_array_equal(
+        np.asarray(out['rad_heat_sw_aerosolfree_3d']),
+        np.asarray(out['rad_heat_sw_3d']),
     )
 
 
