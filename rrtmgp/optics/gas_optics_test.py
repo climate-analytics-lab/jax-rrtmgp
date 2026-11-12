@@ -565,5 +565,129 @@ class GasOpticsTest(unittest.TestCase):
       outside = (t_grid < 160.0) | (t_grid > 355.0)
       np.testing.assert_array_equal(np.asarray(grad_t)[outside], 0.0)
 
+  def test_mxu_row_interpolations_match_gather_and_differentiate(self):
+    """TPU MXU table contractions agree with row gathers and give finite grads."""
+    lw = lookup_gas_optics_longwave.from_nc_file(_LW_LOOKUP_TABLE_FILEPATH)
+    sw = lookup_gas_optics_shortwave.from_nc_file(_SW_LOOKUP_TABLE_FILEPATH)
+    shape = (2, 3, 6)
+    temp = jnp.linspace(190.0, 305.0, int(np.prod(shape)), dtype=jnp.float32).reshape(shape)
+    pres = jnp.geomspace(1.0e5, 50.0, int(np.prod(shape)), dtype=jnp.float32).reshape(shape)
+
+    for lookup, has_rayleigh in ((lw, False), (sw, True)):
+      vmr_fields = {
+          lookup.idx_h2o: jnp.full(shape, 3.0e-3, dtype=jnp.float32),
+          lookup.idx_o3: jnp.full(shape, 1.5e-6, dtype=jnp.float32),
+      }
+      interp = gas_optics.CellInterpolation(
+          lookup, self.vmr_lib, temp, pres, vmr_fields
+      )
+      # Static VMR helper matches dynamic get_vmr for both overridden and
+      # global-mean species.
+      for sp in (lookup.idx_h2o, lookup.idx_o3, 0, 2):
+        expected_vmr = jnp.broadcast_to(
+            gas_optics.get_vmr(
+                lookup, self.vmr_lib, jnp.asarray(sp, jnp.int32), vmr_fields
+            ),
+            shape,
+        )
+        actual_vmr = jnp.broadcast_to(
+            gas_optics._get_vmr_static(lookup, self.vmr_lib, int(sp), vmr_fields),
+            shape,
+        )
+        np.testing.assert_allclose(actual_vmr, expected_vmr, rtol=1e-6, atol=0)
+
+      for ibnd in (0, 3):
+        for scale_by_mixture in (False, True):
+          ref_mix = gas_optics._compute_relative_abundance_interpolant(
+              lookup,
+              self.vmr_lib,
+              interp.tropo_idx,
+              interp.t_interp.interp_low.idx,
+              ibnd,
+              scale_by_mixture,
+              vmr_fields,
+          )
+          mxu_mix = gas_optics._compute_relative_abundance_interpolant_mxu(
+              lookup,
+              self.vmr_lib,
+              interp.tropo_idx,
+              interp.t_interp.interp_low.idx,
+              ibnd,
+              scale_by_mixture,
+              vmr_fields,
+          )
+          np.testing.assert_array_equal(
+              mxu_mix.interp_low.idx, ref_mix.interp_low.idx
+          )
+          np.testing.assert_allclose(
+              mxu_mix.interp_low.weight,
+              ref_mix.interp_low.weight,
+              rtol=1e-6,
+              atol=1e-7,
+          )
+          np.testing.assert_allclose(
+              mxu_mix.interp_high.weight,
+              ref_mix.interp_high.weight,
+              rtol=1e-6,
+              atol=1e-7,
+          )
+
+      mix_major = {s: interp.mix(0, s, True) for s in ('high', 'low')}
+      kmaj_slice = lookup.kmajor[..., :16]
+      ref_tpm = gas_optics._interpolate_rows_tpm(
+          kmaj_slice, interp.t_interp, interp.p_interp, mix_major
+      )
+      mxu_tpm = gas_optics._interpolate_rows_tpm_mxu(
+          kmaj_slice, interp.t_interp, interp.p_interp, mix_major
+      )
+      np.testing.assert_allclose(mxu_tpm, ref_tpm, rtol=2e-6, atol=1e-30)
+
+      mix_minor = {s: interp.mix(0, s, False) for s in ('high', 'low')}
+      kmin_slice = lookup.kminor_lower[..., :8]
+      ref_te = gas_optics._interpolate_rows_te(
+          kmin_slice, interp.t_interp, mix_minor
+      )
+      mxu_te = gas_optics._interpolate_rows_te_mxu(
+          kmin_slice, interp.t_interp, mix_minor
+      )
+      np.testing.assert_allclose(mxu_te, ref_te, rtol=2e-6, atol=1e-30)
+
+      if has_rayleigh:
+        krayl = jnp.stack([lookup.rayl_lower[..., :8], lookup.rayl_upper[..., :8]])
+        ref_rayl = gas_optics._interpolate_rows_te(
+            krayl, interp.t_interp, mix_minor, leading_idx=interp.tropo_idx
+        )
+        mxu_rayl = gas_optics._interpolate_rows_te_mxu(
+            krayl, interp.t_interp, mix_minor, leading_idx=interp.tropo_idx
+        )
+        np.testing.assert_allclose(mxu_rayl, ref_rayl, rtol=2e-6, atol=1e-30)
+
+    def loss_fn(t, p):
+      vmr_f = {lw.idx_h2o: jnp.full(shape, 3.0e-3, dtype=t.dtype)}
+      ci = gas_optics.CellInterpolation(lw, self.vmr_lib, t, p, vmr_f)
+      mix = {
+          s: gas_optics._compute_relative_abundance_interpolant_mxu(
+              lw,
+              self.vmr_lib,
+              ci.tropo_idx,
+              getattr(ci.t_interp, f'interp_{s}').idx,
+              0,
+              True,
+              vmr_f,
+          )
+          for s in ('high', 'low')
+      }
+      maj = gas_optics._interpolate_rows_tpm_mxu(
+          lw.kmajor[..., :8], ci.t_interp, ci.p_interp, mix
+      )
+      minor = gas_optics._interpolate_rows_te_mxu(
+          lw.kminor_lower[..., :8], ci.t_interp, mix
+      )
+      return jnp.sum(maj) + jnp.sum(minor)
+
+    gt, gp = jax.grad(loss_fn, argnums=(0, 1))(temp, pres)
+    self.assertTrue(bool(jnp.all(jnp.isfinite(gt))))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(gp))))
+
 if __name__ == '__main__':
   unittest.main()

@@ -556,6 +556,17 @@ def interpolate(
     indices replaced by the interpolated coefficients.
   """
   if _LOOKUP_IMPL == "gather":
+    if (
+        jax.default_backend() == "tpu"
+        and coeffs.ndim == 1
+        and len(interpolant_fns) == 1
+        and "RRTMGP_LOOKUP_IMPL" not in os.environ
+    ):
+      # 1D tables (cloud Mie curves, Planck totplnk) contract cleanly on the
+      # TPU MXU as (ncells, n_nodes) @ (n_nodes, width) without materialising
+      # the rank-5 intermediates that multi-axis one-hot products create on 3D
+      # tables (issue #6).
+      return interpolate_optimized(coeffs, interpolant_fns)
     # interpolate_orig routes through evaluate_weighted_lookup, which honours
     # the direct-indexing gather backend selected above.
     return interpolate_orig(coeffs, interpolant_fns)

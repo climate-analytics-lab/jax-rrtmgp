@@ -16,6 +16,7 @@
 
 import collections
 import dataclasses
+import math
 from typing import NamedTuple, TypeAlias
 
 import jax
@@ -48,6 +49,10 @@ LookupVolumeMixingRatio: TypeAlias = (
 
 _PASCAL_TO_HPASCAL_FACTOR = 0.01
 _M2_TO_CM2_FACTOR = 1e4
+
+# Capability flag advertising native TPU MXU `all_gpts` table contractions so
+# downstream callers can skip runtime compatibility shims.
+_SUPPORTS_TPU_MXU_ALL_GPTS = True
 
 
 def _pressure_interpolant(
@@ -87,10 +92,26 @@ def _mixing_fraction_interpolant(
   )
 
 
+def _get_vmr_static(
+    lookup_gas_optics: AbstractLookupGasOptics,
+    vmr_lib: LookupVolumeMixingRatio,
+    species_idx: int,
+    vmr_fields: dict[int, Array] | None = None,
+) -> Array:
+  """Return the VMR for a compile-time constant integer `species_idx`."""
+  if vmr_fields is not None and species_idx in vmr_fields:
+    return vmr_fields[species_idx]
+  idx_gases = lookup_gas_optics.idx_gases
+  vmr_gm = [0.0] * len(idx_gases)
+  for k, v in vmr_lib.global_means.items():
+    vmr_gm[idx_gases[k]] = v
+  return jnp.asarray(vmr_gm[species_idx], dtype=lookup_gas_optics.vmr_ref.dtype)
+
+
 def get_vmr(
     lookup_gas_optics: AbstractLookupGasOptics,
     vmr_lib: LookupVolumeMixingRatio,
-    species_idx: Array,
+    species_idx: Array | int,
     vmr_fields: dict[int, Array] | None = None,
 ) -> Array:
   """Get the volume mixing ratio, given major gas species index and pressure.
@@ -100,8 +121,8 @@ def get_vmr(
       for the gas species.
     vmr_lib: A `LookupVolumeMixingRatio` object containing the volume mixing
       ratio of all relevant atmospheric gases.
-    species_idx: An `Array` containing indices of gas species whose VMR will be
-      computed.
+    species_idx: An `Array` or static integer containing indices of gas species
+      whose VMR will be computed.
     vmr_fields: An optional dictionary containing precomputed volume mixing
       ratio fields, keyed by gas index, that will overwrite the global means for
       those gases that have a vmr field already available.
@@ -111,6 +132,12 @@ def get_vmr(
     the pointwise volume mixing ratios of the corresponding gas species at that
     pressure level.
   """
+  if jax.default_backend() == 'tpu' and isinstance(
+      species_idx, (int, np.integer)
+  ):
+    return _get_vmr_static(
+        lookup_gas_optics, vmr_lib, int(species_idx), vmr_fields
+    )
   idx_gases = lookup_gas_optics.idx_gases
   # Indices of background gases for which a global mean VMR is available.
   vmr_gm = [0.0] * len(idx_gases)
@@ -138,12 +165,69 @@ def get_vmr(
   return vmr
 
 
+def _compute_relative_abundance_interpolant_mxu(
+    lookup_gas_optics: AbstractLookupGasOptics,
+    vmr_lib: LookupVolumeMixingRatio,
+    troposphere_idx: Array,
+    temperature_idx: Array,
+    ibnd: int,
+    scale_by_mixture: bool,
+    vmr_fields: dict[int, Array] | None = None,
+) -> Interpolant:
+  """MXU-backed relative-abundance interpolant for a static band `ibnd`.
+
+  Avoids 1D and 3D dynamic gathers on TPU by selecting the lower- and upper-
+  atmosphere species with `jnp.where` and projecting a 14-node temperature
+  one-hot matrix onto `vmr_ref` at IEEE float32 (`HIGHEST`) precision.
+  """
+  ks = np.asarray(lookup_gas_optics.key_species)[int(ibnd)]
+  n_t = lookup_gas_optics.vmr_ref.shape[0]
+  dtype = lookup_gas_optics.vmr_ref.dtype
+  cell_shape = temperature_idx.shape
+  ncells = math.prod(cell_shape)
+  oh_t = jax.nn.one_hot(temperature_idx.reshape(ncells), n_t, dtype=dtype)
+  is_tropo0 = troposphere_idx == 0
+  vmr_for_interp = []
+  vmr_ref = []
+  for i in range(2):
+    sp0 = int(ks[0, i])
+    sp1 = int(ks[1, i])
+    v_sp0 = _get_vmr_static(lookup_gas_optics, vmr_lib, sp0, vmr_fields)
+    v_sp1 = _get_vmr_static(lookup_gas_optics, vmr_lib, sp1, vmr_fields)
+    vmr_for_interp.append(jnp.where(is_tropo0, v_sp0, v_sp1))
+    ref_cols = jnp.stack(
+        [
+            lookup_gas_optics.vmr_ref[:, sp0, 0],
+            lookup_gas_optics.vmr_ref[:, sp1, 1],
+        ],
+        axis=-1,
+    )
+    ref_both = jnp.matmul(
+        oh_t, ref_cols, precision=jax.lax.Precision.HIGHEST
+    ).reshape(*cell_shape, 2)
+    vmr_ref.append(jnp.where(is_tropo0, ref_both[..., 0], ref_both[..., 1]))
+  vmr_ref_ratio = vmr_ref[0] / vmr_ref[1]
+  combined_vmr = vmr_for_interp[0] + vmr_ref_ratio * vmr_for_interp[1]
+  is_present = combined_vmr > 0
+  safe_combined_vmr = jnp.where(is_present, combined_vmr, 1.0)
+  relative_abundance = jnp.where(
+      is_present, vmr_for_interp[0] / safe_combined_vmr, 0.5
+  )
+  interpolant = _mixing_fraction_interpolant(
+      relative_abundance, lookup_gas_optics.n_mixing_fraction
+  )
+  if scale_by_mixture:
+    interpolant.interp_low.weight *= combined_vmr
+    interpolant.interp_high.weight *= combined_vmr
+  return interpolant
+
+
 def _compute_relative_abundance_interpolant(
     lookup_gas_optics: AbstractLookupGasOptics,
     vmr_lib: LookupVolumeMixingRatio,
     troposphere_idx: Array,
     temperature_idx: Array,
-    ibnd: Array,
+    ibnd: Array | int,
     scale_by_mixture: bool,
     vmr_fields: dict[int, Array] | None = None,
 ) -> Interpolant:
@@ -170,6 +254,20 @@ def _compute_relative_abundance_interpolant(
     An `Interpolant` object for the relative abundance of the major gas species
       in a particular electromagnetic frequency band.
   """
+  if (
+      jax.default_backend() == 'tpu'
+      and isinstance(ibnd, (int, np.integer))
+      and temperature_idx.ndim > 0
+  ):
+    return _compute_relative_abundance_interpolant_mxu(
+        lookup_gas_optics,
+        vmr_lib,
+        troposphere_idx,
+        temperature_idx,
+        int(ibnd),
+        scale_by_mixture,
+        vmr_fields,
+    )
   major_species_idx = []
   vmr_for_interp = []
   vmr_ref = []
@@ -1007,6 +1105,73 @@ class CellInterpolation:
 _SIDES = ('high', 'low')
 
 
+def _interpolate_rows_tpm_mxu(
+    table: Array,
+    t_interp: Interpolant,
+    p_interp: Interpolant,
+    mix_for_t: dict[str, Interpolant],
+) -> Array:
+  """Factored level-mapped MXU eight-corner interpolation for `(t, p, eta, n)`.
+
+  Contracts the `(n_t * n_eta = 126)` corners first and the `(n_p = 60)`
+  pressure nodes second at IEEE float32 (`HIGHEST`) precision, mapped one
+  vertical level at a time via `jax.lax.map` so per-level intermediates fit in
+  VMEM without materialising simultaneous 5D `(ncells, n_p, n_eta, n)` buffers
+  across band groups (issue #6).
+  """
+  cell_shape = t_interp.interp_high.idx.shape
+  n_t, n_p, n_eta, width = table.shape
+  n_te = n_t * n_eta
+  nz = cell_shape[-1]
+  nxy = math.prod(cell_shape[:-1]) if len(cell_shape) > 1 else 1
+  table_pteg = jnp.transpose(table, (1, 0, 2, 3)).reshape(n_p, n_te, width)
+
+  p_lo_i_z = jnp.moveaxis(p_interp.interp_low.idx, -1, 0).reshape(nz, nxy)
+  p_lo_w_z = jnp.moveaxis(p_interp.interp_low.weight, -1, 0).reshape(
+      nz, nxy, 1
+  )
+  p_hi_i_z = jnp.moveaxis(p_interp.interp_high.idx, -1, 0).reshape(nz, nxy)
+  p_hi_w_z = jnp.moveaxis(p_interp.interp_high.weight, -1, 0).reshape(
+      nz, nxy, 1
+  )
+
+  te_idx_w = []
+  for eta_side in _SIDES:
+    for t_side in _SIDES:
+      ti = getattr(t_interp, f'interp_{t_side}')
+      mi = getattr(mix_for_t[t_side], f'interp_{eta_side}')
+      idx_z = jnp.moveaxis(ti.idx * n_eta + mi.idx, -1, 0).reshape(nz, nxy)
+      w_z = jnp.moveaxis(ti.weight * mi.weight, -1, 0).reshape(nz, nxy, 1)
+      te_idx_w.append((idx_z, w_z))
+
+  def _one_level(inputs):
+    p_lo_i, p_lo_w, p_hi_i, p_hi_w, corners = inputs
+    wp = p_lo_w * jax.nn.one_hot(
+        p_lo_i, n_p, dtype=table.dtype
+    ) + p_hi_w * jax.nn.one_hot(p_hi_i, n_p, dtype=table.dtype)
+    wte = None
+    for idx_c, w_c in corners:
+      oh = w_c * jax.nn.one_hot(idx_c, n_te, dtype=table.dtype)
+      wte = oh if wte is None else wte + oh
+    mid = jnp.einsum(
+        'cm,pmg->cpg',
+        wte,
+        table_pteg,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    return jnp.einsum(
+        'cp,cpg->cg',
+        wp,
+        mid,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+
+  out_z = jax.lax.map(
+      _one_level, (p_lo_i_z, p_lo_w_z, p_hi_i_z, p_hi_w_z, te_idx_w)
+  )
+  return jnp.moveaxis(out_z, 0, 1).reshape(*cell_shape, width)
+
+
 def _interpolate_rows_tpm(
     table: Array,
     t_interp: Interpolant,
@@ -1029,6 +1194,8 @@ def _interpolate_rows_tpm(
   Returns:
     An array of shape `(*cell_shape, n)`.
   """
+  if jax.default_backend() == 'tpu' and t_interp.interp_high.idx.ndim > 0:
+    return _interpolate_rows_tpm_mxu(table, t_interp, p_interp, mix_for_t)
   total = None
   for eta_side in _SIDES:
     for p_side in _SIDES:
@@ -1040,6 +1207,53 @@ def _interpolate_rows_tpm(
         term = table[ti.idx, pi.idx, mi.idx] * weight[..., None]
         total = term if total is None else total + term
   return total
+
+
+def _interpolate_rows_te_mxu(
+    table: Array,
+    t_interp: Interpolant,
+    mix_for_t: dict[str, Interpolant],
+    leading_idx: Array | None = None,
+) -> Array:
+  """MXU four-corner interpolation of rows of a `(t, eta, n)` table."""
+  cell_shape = t_interp.interp_high.idx.shape
+  ncells = math.prod(cell_shape)
+  if leading_idx is None:
+    n_t, n_eta, width = table.shape
+    n_te = n_t * n_eta
+    flat_table = table.reshape(n_te, width)
+    w_oh = None
+    for eta_side in _SIDES:
+      for t_side in _SIDES:
+        ti = getattr(t_interp, f'interp_{t_side}')
+        mi = getattr(mix_for_t[t_side], f'interp_{eta_side}')
+        idx = (ti.idx * n_eta + mi.idx).reshape(ncells)
+        w = (ti.weight * mi.weight).reshape(ncells, 1)
+        oh = w * jax.nn.one_hot(idx, n_te, dtype=table.dtype)
+        w_oh = oh if w_oh is None else w_oh + oh
+    return jnp.matmul(
+        w_oh, flat_table, precision=jax.lax.Precision.HIGHEST
+    ).reshape(*cell_shape, width)
+
+  n_lead, n_t, n_eta, width = table.shape
+  n_lte = n_lead * n_t * n_eta
+  flat_table = table.reshape(n_lte, width)
+  lead_flat = leading_idx.reshape(ncells)
+  w_oh = None
+  for eta_side in _SIDES:
+    for t_side in _SIDES:
+      ti = getattr(t_interp, f'interp_{t_side}')
+      mi = getattr(mix_for_t[t_side], f'interp_{eta_side}')
+      idx = (
+          (lead_flat * n_t + ti.idx.reshape(ncells)) * n_eta
+          + mi.idx.reshape(ncells)
+      )
+      w = (ti.weight * mi.weight).reshape(ncells, 1)
+      oh = w * jax.nn.one_hot(idx, n_lte, dtype=table.dtype)
+      w_oh = oh if w_oh is None else w_oh + oh
+  return jnp.matmul(
+      w_oh, flat_table, precision=jax.lax.Precision.HIGHEST
+  ).reshape(*cell_shape, width)
 
 
 def _interpolate_rows_te(
@@ -1054,6 +1268,10 @@ def _interpolate_rows_te(
   tables. With `leading_idx`, the table has one more leading axis that each
   cell indexes with `leading_idx` (the Rayleigh table's lower/upper half).
   """
+  if jax.default_backend() == 'tpu' and t_interp.interp_high.idx.ndim > 0:
+    return _interpolate_rows_te_mxu(
+        table, t_interp, mix_for_t, leading_idx=leading_idx
+    )
   total = None
   for eta_side in _SIDES:
     for t_side in _SIDES:

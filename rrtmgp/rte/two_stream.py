@@ -537,8 +537,7 @@ def solve_lw(
       precomputed arrays (`n_gpt` fields each of the optical depth and of the
       Planck fraction -- the Rayleigh optical depth in the shortwave).
       Requires the `RRTMOptics` scheme. The precomputed stage reads the tables
-      by direct indexing (a gather), whatever `RRTMGP_LOOKUP_IMPL` selects for
-      the per-g-point path.
+      by row gathers on CPU/GPU and factored MXU contractions on TPU.
     with_clear_sky: Also solve the cloud-free problem (gas + aerosol, the same
       aerosol mix-in as the all-sky problem) and return it under `clear_`
       prefixed keys. The gas optics and the Planck sources, which dominate the
@@ -940,8 +939,7 @@ def solve_sw(
       precomputed arrays (`n_gpt` fields each of the optical depth and of the
       Planck fraction -- the Rayleigh optical depth in the shortwave).
       Requires the `RRTMOptics` scheme. The precomputed stage reads the tables
-      by direct indexing (a gather), whatever `RRTMGP_LOOKUP_IMPL` selects for
-      the per-g-point path.
+      by row gathers on CPU/GPU and factored MXU contractions on TPU.
     with_clear_sky: Also solve the cloud-free problem (gas + aerosol, the same
       aerosol mix-in, surface albedos and night masking as the all-sky problem)
       and return it under `clear_` prefixed keys. The gas optics, which
