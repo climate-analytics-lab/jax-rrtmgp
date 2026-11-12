@@ -382,6 +382,100 @@ class TestTwoStream(unittest.TestCase):
     fluxes = solve(atmos_state=night, sfc_alb_dir=a_dir, sfc_alb_dif=a_dif)
     np.testing.assert_array_equal(fluxes['flux_down_dir_sfc'], 0.0)
 
+  def test_solve_sw_2d_zenith_matches_per_column_scalar_zenith(self):
+    """A 2D `(nx, ny)` zenith grid matches per-column scalar solves, day and night."""
+    radiation_params = radiative_transfer.RadiativeTransfer(
+        optics=radiative_transfer.OpticsParameters(
+            optics=radiative_transfer.GrayAtmosphereOptics(
+                p0=100_000, d0_lw=5.35, d0_sw=0.22
+            )
+        ),
+        atmospheric_state_cfg=radiative_transfer.AtmosphericStateCfg(
+            sfc_alb=0.2,
+            zenith=0.15 * np.pi,
+            irrad=1360.0,
+        ),
+    )
+    temperature, pressure = _setup_atmospheric_profiles(
+        radiation_params.optics.optics, 9000, 220.0, 12
+    )
+    nx, ny = 2, 2
+    p3d = jnp.broadcast_to(
+        jnp.asarray(pressure, jnp.float32)[None, None, :],
+        (nx, ny, pressure.size),
+    )
+    t3d = jnp.broadcast_to(
+        jnp.asarray(temperature, jnp.float32)[None, None, :],
+        (nx, ny, temperature.size),
+    )
+    mol3d = jnp.zeros_like(p3d)
+    atmos_state = atmospheric_state.from_config(
+        radiation_params.atmospheric_state_cfg
+    )
+    optics_lib = optics.optics_factory(radiation_params.optics, atmos_state.vmr)
+
+    # Mix sunlit, oblique, horizon, and night columns in one 2D grid.
+    zenith_2d = jnp.array(
+        [[0.1 * np.pi, 0.35 * np.pi], [0.5 * np.pi, 0.75 * np.pi]],
+        dtype=jnp.float32,
+    )
+    alb_dir = jnp.array([[0.15, 0.25], [0.30, 0.40]], dtype=jnp.float32)
+    alb_dif = jnp.array([[0.20, 0.35], [0.45, 0.55]], dtype=jnp.float32)
+
+    for use_scan, gpt_chunk in ((False, 1), (True, 1)):
+      grid_state = dataclasses.replace(atmos_state, zenith=zenith_2d)
+      grid_fluxes = two_stream.solve_sw(
+          p3d,
+          t3d,
+          mol3d,
+          optics_lib,
+          grid_state,
+          use_scan=use_scan,
+          gpt_chunk=gpt_chunk,
+          sfc_alb_dir=alb_dir,
+          sfc_alb_dif=alb_dif,
+      )
+      for i in range(nx):
+        for j in range(ny):
+          col_state = dataclasses.replace(atmos_state, zenith=zenith_2d[i, j])
+          col_fluxes = two_stream.solve_sw(
+              p3d[i : i + 1, j : j + 1],
+              t3d[i : i + 1, j : j + 1],
+              mol3d[i : i + 1, j : j + 1],
+              optics_lib,
+              col_state,
+              use_scan=use_scan,
+              gpt_chunk=gpt_chunk,
+              sfc_alb_dir=alb_dir[i : i + 1, j : j + 1],
+              sfc_alb_dif=alb_dif[i : i + 1, j : j + 1],
+          )
+          for key, val in grid_fluxes.items():
+            expected = (
+                col_fluxes[key][0, 0]
+                if val.ndim in (2, 3)
+                else col_fluxes[key]
+            )
+            actual = val[i, j]
+            np.testing.assert_allclose(
+                actual, expected, rtol=1e-6, atol=1e-6, err_msg=f'{key} ({i},{j})'
+            )
+      # Horizon and night columns must be exact zero.
+      np.testing.assert_array_equal(grid_fluxes['flux_down'][1, 0], 0.0)
+      np.testing.assert_array_equal(grid_fluxes['flux_down'][1, 1], 0.0)
+      np.testing.assert_array_equal(grid_fluxes['flux_down_dir_sfc'][1, 0], 0.0)
+      np.testing.assert_array_equal(grid_fluxes['flux_down_dir_sfc'][1, 1], 0.0)
+
+    # Reverse-mode gradient with respect to temperature and zenith must be finite
+    # even with night columns in the same 2D batch.
+    def loss_fn(temp, zen):
+      st = dataclasses.replace(atmos_state, zenith=zen)
+      out = two_stream.solve_sw(p3d, temp, mol3d, optics_lib, st, use_scan=True)
+      return jnp.sum(out['flux_net'])
+
+    gt, gz = jax.grad(loss_fn, argnums=(0, 1))(t3d, zenith_2d)
+    self.assertTrue(bool(jnp.all(jnp.isfinite(gt))))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(gz))))
+
   def test_compute_heating_rate(self):
     """Check the heating rate as derived from fluxes and the pressure field."""
     # SETUP

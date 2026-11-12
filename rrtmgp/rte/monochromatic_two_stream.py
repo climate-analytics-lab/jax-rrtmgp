@@ -550,7 +550,8 @@ def sw_cell_properties(
   Equations are developed in Meador and Weaver (1980).
 
   Args:
-    zenith: The zenith angle of the shortwave collimated radiation.
+    zenith: The zenith angle of the shortwave collimated radiation, scalar or
+      broadcastable against the horizontal plane `optical_depth.shape[:-1]`.
     optical_depth: A 3D variable containing the pointwise optical depth.
     ssa: A 3D variable containing the pointwise single-scattering albedo.
     asymmetry_factor: A 3D variable containing the pointwise asymmetry factor.
@@ -568,6 +569,10 @@ def sw_cell_properties(
   # fluxes -- poison the reverse-mode cotangents. See the longwave counterpart
   # in `lw_cell_source_and_properties` for details.
   optical_depth = jnp.maximum(optical_depth, 0.0)
+  if jnp.ndim(zenith) > 0 and jnp.ndim(zenith) < optical_depth.ndim:
+    zenith = jnp.broadcast_to(
+        jnp.asarray(zenith), optical_depth.shape[:-1]
+    )[..., jnp.newaxis]
 
   # Exchange rate coefficients from Zdunkowski et al. (1980).
   g = asymmetry_factor
@@ -659,7 +664,7 @@ def sw_cell_source(
     toa_flux: The top-of-atmosphere incoming flux, a 2D field.
     sfc_albedo_direct: The surface albedo with respect to direct radiation, a 2D
       field.
-    zenith: The solar zenith angle.
+    zenith: The solar zenith angle, scalar or broadcastable against `toa_flux`.
     use_scan: Whether to use scan or for loops for the recurrent operation.
 
   Returns:
@@ -676,8 +681,13 @@ def sw_cell_source(
   optical_depth = jnp.maximum(optical_depth, 0.0)
 
   # Transmittance of direct, unscattered beam.
-  t_noscat = jnp.exp(-optical_depth / jnp.cos(zenith))
-  mu = jnp.cos(zenith)
+  if jnp.ndim(zenith) > 0:
+    mu = jnp.broadcast_to(jnp.cos(zenith), toa_flux.shape)
+    mu_3d = mu[..., jnp.newaxis] if mu.ndim < optical_depth.ndim else mu
+    t_noscat = jnp.exp(-optical_depth / mu_3d)
+  else:
+    t_noscat = jnp.exp(-optical_depth / jnp.cos(zenith))
+    mu = jnp.cos(zenith)
 
   # The vertical component of incident flux at the top boundary.
   flux_down_direct_bc = toa_flux * mu

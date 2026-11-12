@@ -837,6 +837,11 @@ def _sw_sfc_albedo_by_band(
   return jnp.moveaxis(by_band, -1, 0)
 
 
+# Capability flag advertising native 2-D `(nx, ny)` solar zenith support in
+# `solve_sw` so downstream callers can skip scalar-zenith shims.
+_SUPPORTS_2D_ZENITH = True
+
+
 def solve_sw(
     pressure: Array,
     temperature: Array,
@@ -1018,6 +1023,8 @@ def solve_sw(
   # the night columns (the raw `exp(-tau / cos(zenith))` terms in the shortwave
   # solve diverge to +inf once `cos(zenith) <= 0`), the solve is fed a
   # horizon-clamped zenith and the night columns are zeroed out afterwards.
+  if jnp.ndim(zenith) > 0:
+    zenith = jnp.broadcast_to(jnp.asarray(zenith), plane)
   night = zenith >= 0.5 * jnp.pi
   # Overhead sun (cos = 1) is the most benign valid angle; the resulting night
   # fluxes are masked to zero below, so this placeholder never reaches output.
@@ -1190,10 +1197,16 @@ def solve_sw(
       one_gpt, optics_lib.n_gpt_sw, gpt_chunk, fluxes_0
   )
   # Zero out columns where the sun is at or below the horizon. `night` is a
-  # scalar (single column) or, under a column `vmap`, a per-column scalar; it
-  # broadcasts over the trailing spatial/vertical axes of each flux field.
+  # scalar (single column / column `vmap`) or a 2D `[nx, ny]` mask over the
+  # horizontal plane.
   fluxes = {
-      key: jnp.where(night, jnp.zeros_like(val), val)
+      key: jnp.where(
+          night[..., jnp.newaxis]
+          if (jnp.ndim(night) == 2 and val.ndim == 3)
+          else night,
+          jnp.zeros_like(val),
+          val,
+      )
       for key, val in fluxes.items()
   }
   return fluxes
