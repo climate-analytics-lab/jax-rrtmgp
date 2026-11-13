@@ -18,6 +18,7 @@ import collections
 from collections.abc import Sequence
 import dataclasses
 import inspect
+import math
 import os
 import string
 from typing import Callable, TypeAlias
@@ -505,6 +506,41 @@ def interpolate_optimized(
   return weighted_sum
 
 
+def _interpolate_1d_mxu(
+    coeffs: Array,
+    interpolant_fns: collections.OrderedDict[str, Callable[..., Interpolant]],
+) -> Array:
+  """Cell-minor 1D MXU table interpolation with IEEE float32 precision."""
+  fn = next(iter(interpolant_fns.values()))
+  interp = fn()
+  n_nodes = coeffs.shape[0]
+  cell_shape = (
+      interp.idx.shape
+      if isinstance(interp, IndexAndWeight)
+      else interp.interp_high.idx.shape
+  )
+  ncells = math.prod(cell_shape)
+  if isinstance(interp, IndexAndWeight):
+    oh = interp.weight.reshape(1, ncells) * jax.nn.one_hot(
+        interp.idx.reshape(ncells), n_nodes, dtype=coeffs.dtype, axis=0
+    )
+  else:
+    oh = interp.interp_low.weight.reshape(1, ncells) * jax.nn.one_hot(
+        interp.interp_low.idx.reshape(ncells),
+        n_nodes,
+        dtype=coeffs.dtype,
+        axis=0,
+    ) + interp.interp_high.weight.reshape(1, ncells) * jax.nn.one_hot(
+        interp.interp_high.idx.reshape(ncells),
+        n_nodes,
+        dtype=coeffs.dtype,
+        axis=0,
+    )
+  return jnp.einsum(
+      "a,ac->c", coeffs, oh, precision=jax.lax.Precision.HIGHEST
+  ).reshape(cell_shape)
+
+
 def interpolate(
     coeffs: Array,
     interpolant_fns: collections.OrderedDict[str, Callable[..., Interpolant]],
@@ -556,6 +592,15 @@ def interpolate(
     indices replaced by the interpolated coefficients.
   """
   if _LOOKUP_IMPL == "gather":
+    if (
+        jax.default_backend() == "tpu"
+        and coeffs.ndim == 1
+        and len(interpolant_fns) == 1
+        and "RRTMGP_LOOKUP_IMPL" not in os.environ
+    ):
+      # 1D tables (cloud Mie curves, Planck totplnk) contract cleanly on the
+      # TPU MXU as (n_nodes,) @ (n_nodes, ncells) with ncells on the minor axis.
+      return _interpolate_1d_mxu(coeffs, interpolant_fns)
     # interpolate_orig routes through evaluate_weighted_lookup, which honours
     # the direct-indexing gather backend selected above.
     return interpolate_orig(coeffs, interpolant_fns)

@@ -82,6 +82,21 @@ def _horiz_mean(f: Array) -> Array:
   return jnp.mean(f, axis=(0, 1), dtype=jnp.float64).astype(jnp.float32)
 
 
+def _horiz_mean_zc(f_zc: Array) -> Array:
+  """Compute the horizontal mean of a column-minor `(nzh, nc)` array."""
+  acc_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+  return jnp.mean(f_zc, axis=1, dtype=acc_dtype).astype(jnp.float32)
+
+
+def _air_molecules_per_area_zc(p_zc: Array, vmr_h2o_zc: Array) -> Array:
+  """Column-minor `(nzh, nc)` counterpart of `_air_molecules_per_area`."""
+  dp_zc = 0.5 * (jnp.roll(p_zc, -1, axis=0) - jnp.roll(p_zc, 1, axis=0))
+  mol_m_air_zc = (
+      constants.DRY_AIR_MOL_MASS + constants.WATER_MOL_MASS * vmr_h2o_zc
+  )
+  return -(dp_zc / constants.G) * constants.AVOGADRO / mol_m_air_zc
+
+
 class RRTMGP:
   """Rapid Radiative Transfer Model for General Circulation Models (RRTMGP)."""
 
@@ -121,8 +136,8 @@ class RRTMGP:
       p_ref_xxc: Array,
       sg_map: dict[str, Array],
       use_scan: bool = False,
-      zenith: float | None = None,
-      irrad: float | None = None,
+      zenith: float | Array | None = None,
+      irrad: float | Array | None = None,
       cloud_path_liq_lw_per_gpt: Array | None = None,
       cloud_path_ice_lw_per_gpt: Array | None = None,
       cloud_path_liq_sw_per_gpt: Array | None = None,
@@ -298,11 +313,11 @@ class RRTMGP:
     # because halos are discarded later on, but there are places where the halos
     # of the temperature are used to determine interior values.
     def fill_halo(f: Array) -> Array:
-      bottom_halo_val = 2 * f[:, :, 1] - f[:, :, 2]
-      top_halo_val = 2 * f[:, :, -2] - f[:, :, -3]
-      f = f.at[:, :, 0].set(bottom_halo_val)
-      f = f.at[:, :, -1].set(top_halo_val)
-      return f
+      bottom_halo_val = (2 * f[:, :, 1] - f[:, :, 2])[..., jnp.newaxis]
+      top_halo_val = (2 * f[:, :, -2] - f[:, :, -3])[..., jnp.newaxis]
+      return jnp.concatenate(
+          [bottom_halo_val, f[:, :, 1:-1], top_halo_val], axis=2
+      )
 
     temperature = fill_halo(temperature)
 
@@ -547,3 +562,277 @@ class RRTMGP:
       output[v] = _horiz_mean(lw_heating_rate)
     if (v := f'rad_heat_sw_{tag}_1d_z') in df:
       output[v] = _horiz_mean(sw_heating_rate)
+
+  def compute_heating_rate_zc(
+      self,
+      q_t: Array,
+      cloud_r_eff_liq: Array | None,
+      cloud_r_eff_ice: Array | None,
+      temperature: Array,
+      sfc_temperature: Array | float,
+      p_ref_zc: Array,
+      *,
+      rho_zc: Array | None = None,
+      q_liq: Array | None = None,
+      q_ice: Array | None = None,
+      q_c: Array | None = None,
+      dz_zc: float | Array | None = None,
+      zenith: float | Array | None = None,
+      irrad: float | Array | None = None,
+      cloud_path_liq_lw_per_gpt: Array | None = None,
+      cloud_path_ice_lw_per_gpt: Array | None = None,
+      cloud_path_liq_sw_per_gpt: Array | None = None,
+      cloud_path_ice_sw_per_gpt: Array | None = None,
+      vmr_fields: dict[str, Array] | None = None,
+      aerosol_optics_lw: dict[str, Array] | None = None,
+      aerosol_optics_sw: dict[str, Array] | None = None,
+      sfc_alb: float | Array | None = None,
+      sfc_emis: float | Array | None = None,
+      gpt_chunk: int = 64,
+      cloud_tau_scale_liq: float | Array | None = None,
+      cloud_tau_scale_ice: float | Array | None = None,
+      sfc_alb_dir: float | Array | None = None,
+      sfc_alb_dif: float | Array | None = None,
+      clear_sky_fluxes: bool = False,
+      lw_solver: str = two_stream.LW_SOLVER_TWO_STREAM,
+      lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
+      aerosol_free_fluxes: bool = False,
+      per_gpt_axis: int = 1,
+  ) -> dict[str, Array]:
+    """Column-minor `(nzh, nc)` counterpart of `compute_heating_rate` for TPU.
+
+    Accepts column-minor `(nzh, nc)` atmospheric profiles (`nc` trailing),
+    interior `(nz, nc)` or haloed `(nzh, nc)` effective radii, interior
+    `(nz, n_gpt, nc)` McICA cloud paths (or `(n_gpt, nz, nc)` with
+    `per_gpt_axis=0`), interior `(n_bnd, nz, nc)` aerosol optics, `(nc,)`
+    surface fields, and `(n_bnd_sw, nc)` per-band SW surface albedos, returning
+    column-minor heating rates `(nzh, nc)`, full flux profiles `(nz + 1, nc)`,
+    and `(nc,)` surface/TOA diagnostics without `(ncols, ..., nlev)` transposes.
+    """
+    assert isinstance(self.optics_lib, optics.RRTMOptics), (
+        'compute_heating_rate_zc requires the RRTMOptics scheme.'
+    )
+    atm_state = self.atmospheric_state
+    if (
+        zenith is not None
+        or irrad is not None
+        or sfc_alb is not None
+        or sfc_emis is not None
+    ):
+      atm_state = dataclasses.replace(
+          atm_state,
+          **({'zenith': zenith} if zenith is not None else {}),
+          **({'irrad': irrad} if irrad is not None else {}),
+          **({'sfc_alb': sfc_alb} if sfc_alb is not None else {}),
+          **({'sfc_emis': sfc_emis} if sfc_emis is not None else {}),
+      )
+
+    bottom_halo_val = 2.0 * temperature[1:2, :] - temperature[2:3, :]
+    top_halo_val = 2.0 * temperature[-2:-1, :] - temperature[-3:-2, :]
+    temperature = jnp.concatenate(
+        [bottom_halo_val, temperature[1:-1, :], top_halo_val], axis=0
+    )
+
+    q_t = jnp.clip(q_t, 0.0, None)
+    q_c_val = jnp.zeros_like(q_t) if q_c is None else jnp.clip(q_c, 0.0, None)
+
+    vmr_lib = atm_state.vmr
+    merged_vmr_fields = (
+        lookup_volume_mixing_ratio.reconstruct_vmr_fields_from_pressure(
+            vmr_lib, p_ref_zc
+        )
+    )
+    if vmr_fields is not None:
+      merged_vmr_fields.update(vmr_fields)
+    merged_vmr_fields['h2o'] = _humidity_to_volume_mixing_ratio(q_t, q_c_val)
+
+    molecules_per_area = _air_molecules_per_area_zc(
+        p_ref_zc, merged_vmr_fields['h2o']
+    )
+
+    with_clear_sky = self._do_clear_sky or clear_sky_fluxes
+    with_aerosol_free = aerosol_free_fluxes
+
+    h = self._dz if dz_zc is None else dz_zc
+    liq_water_path = None
+    if q_liq is not None and rho_zc is not None:
+      liq_water_path = rho_zc * jnp.clip(q_liq, 0.0, None) * h
+    ice_water_path = None
+    if q_ice is not None and rho_zc is not None:
+      ice_water_path = rho_zc * jnp.clip(q_ice, 0.0, None) * h
+
+    with jax.named_scope('lw'):
+      lw_fluxes = two_stream.solve_lw_zc(
+          p_ref_zc,
+          temperature,
+          molecules_per_area,
+          self.optics_lib,
+          atm_state,
+          merged_vmr_fields,
+          sfc_temperature,
+          cloud_r_eff_liq=cloud_r_eff_liq,
+          cloud_path_liq=liq_water_path,
+          cloud_r_eff_ice=cloud_r_eff_ice,
+          cloud_path_ice=ice_water_path,
+          cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
+          cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
+          aerosol_optics=aerosol_optics_lw,
+          gpt_chunk=gpt_chunk,
+          cloud_tau_scale_liq=cloud_tau_scale_liq,
+          cloud_tau_scale_ice=cloud_tau_scale_ice,
+          with_clear_sky=with_clear_sky,
+          lw_solver=lw_solver,
+          lw_secant=lw_secant,
+          with_aerosol_free=with_aerosol_free,
+          per_gpt_axis=per_gpt_axis,
+      )
+    with jax.named_scope('sw'):
+      sw_fluxes = two_stream.solve_sw_zc(
+          p_ref_zc,
+          temperature,
+          molecules_per_area,
+          self.optics_lib,
+          atm_state,
+          merged_vmr_fields,
+          cloud_r_eff_liq=cloud_r_eff_liq,
+          cloud_path_liq=liq_water_path,
+          cloud_r_eff_ice=cloud_r_eff_ice,
+          cloud_path_ice=ice_water_path,
+          cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
+          cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
+          aerosol_optics=aerosol_optics_sw,
+          gpt_chunk=gpt_chunk,
+          cloud_tau_scale_liq=cloud_tau_scale_liq,
+          cloud_tau_scale_ice=cloud_tau_scale_ice,
+          sfc_alb_dir=sfc_alb_dir,
+          sfc_alb_dif=sfc_alb_dif,
+          with_clear_sky=with_clear_sky,
+          with_aerosol_free=with_aerosol_free,
+          per_gpt_axis=per_gpt_axis,
+      )
+
+    extra: dict[str, tuple[dict[str, Array], dict[str, Array]]] = {}
+    if with_aerosol_free:
+      lw_fluxes, lw_noaer = two_stream.split_aerosol_free_fluxes(lw_fluxes)
+      sw_fluxes, sw_noaer = two_stream.split_aerosol_free_fluxes(sw_fluxes)
+      if with_clear_sky:
+        lw_noaer, lw_noaer_clear = two_stream.split_clear_sky_fluxes(lw_noaer)
+        sw_noaer, sw_noaer_clear = two_stream.split_clear_sky_fluxes(sw_noaer)
+        extra['aerosolfree_clearsky'] = (lw_noaer_clear, sw_noaer_clear)
+      extra['aerosolfree'] = (lw_noaer, sw_noaer)
+    if with_clear_sky:
+      lw_fluxes, lw_fluxes_clearsky = two_stream.split_clear_sky_fluxes(
+          lw_fluxes
+      )
+      sw_fluxes, sw_fluxes_clearsky = two_stream.split_clear_sky_fluxes(
+          sw_fluxes
+      )
+      extra['clearsky'] = (lw_fluxes_clearsky, sw_fluxes_clearsky)
+
+    q_v = q_t if q_c is None else (q_t - q_c_val)
+    lw_heating_rate = two_stream.compute_heating_rate_zc(
+        lw_fluxes['flux_net'], p_ref_zc, q_v
+    )
+    sw_heating_rate = two_stream.compute_heating_rate_zc(
+        sw_fluxes['flux_net'], p_ref_zc, q_v
+    )
+    heating_rate = lw_heating_rate + sw_heating_rate
+
+    output = {rrtmgp_common.KEY_STORED_RADIATION: heating_rate}
+    if self._save_lw_sw_heating_rates:
+      output['rad_heat_sw_3d'] = sw_heating_rate
+      output['rad_heat_lw_3d'] = lw_heating_rate
+
+    lw_flux_down = lw_fluxes['flux_down']
+    lw_flux_up = lw_fluxes['flux_up']
+    sw_flux_down = sw_fluxes['flux_down']
+    sw_flux_up = sw_fluxes['flux_up']
+    hw = 1
+
+    output['sw_flux_up_full'] = sw_flux_up[hw:, :]
+    output['sw_flux_down_full'] = sw_flux_down[hw:, :]
+    output['lw_flux_up_full'] = lw_flux_up[hw:, :]
+    output['lw_flux_down_full'] = lw_flux_down[hw:, :]
+    output['sw_flux_down_dir_sfc'] = sw_fluxes['flux_down_dir_sfc']
+
+    df = self._diagnostic_fields
+    if (v := 'surf_lw_flux_down_2d_xy') in df:
+      output[v] = lw_flux_down[hw, :]
+    if (v := 'surf_lw_flux_up_2d_xy') in df:
+      output[v] = lw_flux_up[hw, :]
+    if (v := 'surf_sw_flux_down_2d_xy') in df:
+      output[v] = sw_flux_down[hw, :]
+    if (v := 'surf_sw_flux_up_2d_xy') in df:
+      output[v] = sw_flux_up[hw, :]
+    if (v := 'surf_sw_flux_down_dir_2d_xy') in df:
+      output[v] = sw_fluxes['flux_down_dir_sfc']
+
+    if (v := 'toa_sw_flux_incoming_2d_xy') in df:
+      output[v] = sw_flux_down[-hw, :]
+    if (v := 'toa_sw_flux_outgoing_2d_xy') in df:
+      output[v] = sw_flux_up[-hw, :]
+    if (v := 'toa_lw_flux_outgoing_2d_xy') in df:
+      output[v] = lw_flux_up[-hw, :]
+
+    if (v := 'rad_heat_lw_1d_z') in df:
+      output[v] = _horiz_mean_zc(lw_heating_rate)
+    if (v := 'rad_heat_sw_1d_z') in df:
+      output[v] = _horiz_mean_zc(sw_heating_rate)
+
+    for tag, (lw_extra, sw_extra) in extra.items():
+      self._add_tagged_outputs_zc(output, tag, lw_extra, sw_extra, p_ref_zc, q_v)
+
+    return output
+
+  def _add_tagged_outputs_zc(
+      self,
+      output: dict[str, Array],
+      tag: str,
+      lw_fluxes: dict[str, Array],
+      sw_fluxes: dict[str, Array],
+      p_ref_zc: Array,
+      q_v: Array,
+  ) -> None:
+    """Column-minor `(nzh, nc)` counterpart of `_add_tagged_outputs`."""
+    hw = 1
+    lw_heating_rate = two_stream.compute_heating_rate_zc(
+        lw_fluxes['flux_net'], p_ref_zc, q_v
+    )
+    sw_heating_rate = two_stream.compute_heating_rate_zc(
+        sw_fluxes['flux_net'], p_ref_zc, q_v
+    )
+    if self._save_lw_sw_heating_rates:
+      output[f'rad_heat_sw_{tag}_3d'] = sw_heating_rate
+      output[f'rad_heat_lw_{tag}_3d'] = lw_heating_rate
+
+    lw_flux_down = lw_fluxes['flux_down']
+    lw_flux_up = lw_fluxes['flux_up']
+    sw_flux_down = sw_fluxes['flux_down']
+    sw_flux_up = sw_fluxes['flux_up']
+
+    output[f'sw_flux_up_{tag}_full'] = sw_flux_up[hw:, :]
+    output[f'sw_flux_down_{tag}_full'] = sw_flux_down[hw:, :]
+    output[f'lw_flux_up_{tag}_full'] = lw_flux_up[hw:, :]
+    output[f'lw_flux_down_{tag}_full'] = lw_flux_down[hw:, :]
+    output[f'sw_flux_down_dir_{tag}_sfc'] = sw_fluxes['flux_down_dir_sfc']
+
+    df = self._diagnostic_fields
+    if (v := f'surf_lw_flux_down_{tag}_2d_xy') in df:
+      output[v] = lw_flux_down[hw, :]
+    if (v := f'surf_lw_flux_up_{tag}_2d_xy') in df:
+      output[v] = lw_flux_up[hw, :]
+    if (v := f'surf_sw_flux_down_{tag}_2d_xy') in df:
+      output[v] = sw_flux_down[hw, :]
+    if (v := f'surf_sw_flux_up_{tag}_2d_xy') in df:
+      output[v] = sw_flux_up[hw, :]
+    if (v := f'surf_sw_flux_down_dir_{tag}_2d_xy') in df:
+      output[v] = sw_fluxes['flux_down_dir_sfc']
+    if (v := f'toa_sw_flux_outgoing_{tag}_2d_xy') in df:
+      output[v] = sw_flux_up[-hw, :]
+    if (v := f'toa_lw_flux_outgoing_{tag}_2d_xy') in df:
+      output[v] = lw_flux_up[-hw, :]
+
+    if (v := f'rad_heat_lw_{tag}_1d_z') in df:
+      output[v] = _horiz_mean_zc(lw_heating_rate)
+    if (v := f'rad_heat_sw_{tag}_1d_z') in df:
+      output[v] = _horiz_mean_zc(sw_heating_rate)
