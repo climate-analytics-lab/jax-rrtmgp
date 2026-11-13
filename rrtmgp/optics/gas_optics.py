@@ -177,36 +177,49 @@ def _compute_relative_abundance_interpolant_mxu(
   """MXU-backed relative-abundance interpolant for a static band `ibnd`.
 
   Avoids 1D and 3D dynamic gathers on TPU by selecting the lower- and upper-
-  atmosphere species with `jnp.where` and projecting a 14-node temperature
-  one-hot matrix onto `vmr_ref` at IEEE float32 (`HIGHEST`) precision.
+  atmosphere species with `jnp.where` and projecting `vmr_ref` against a
+  `(n_t, ncells)` temperature one-hot matrix at IEEE float32 (`HIGHEST`)
+  precision, keeping `ncells` on the minor axis so 128-lane tiles are filled
+  without padding.
   """
   ks = np.asarray(lookup_gas_optics.key_species)[int(ibnd)]
   n_t = lookup_gas_optics.vmr_ref.shape[0]
   dtype = lookup_gas_optics.vmr_ref.dtype
   cell_shape = temperature_idx.shape
   ncells = math.prod(cell_shape)
-  oh_t = jax.nn.one_hot(temperature_idx.reshape(ncells), n_t, dtype=dtype)
+  oh_t = jax.nn.one_hot(
+      temperature_idx.reshape(ncells), n_t, dtype=dtype, axis=0
+  )
   is_tropo0 = troposphere_idx == 0
-  vmr_for_interp = []
-  vmr_ref = []
-  for i in range(2):
-    sp0 = int(ks[0, i])
-    sp1 = int(ks[1, i])
-    v_sp0 = _get_vmr_static(lookup_gas_optics, vmr_lib, sp0, vmr_fields)
-    v_sp1 = _get_vmr_static(lookup_gas_optics, vmr_lib, sp1, vmr_fields)
-    vmr_for_interp.append(jnp.where(is_tropo0, v_sp0, v_sp1))
-    ref_cols = jnp.stack(
-        [
-            lookup_gas_optics.vmr_ref[:, sp0, 0],
-            lookup_gas_optics.vmr_ref[:, sp1, 1],
-        ],
-        axis=-1,
-    )
-    ref_both = jnp.matmul(
-        oh_t, ref_cols, precision=jax.lax.Precision.HIGHEST
-    ).reshape(*cell_shape, 2)
-    vmr_ref.append(jnp.where(is_tropo0, ref_both[..., 0], ref_both[..., 1]))
-  vmr_ref_ratio = vmr_ref[0] / vmr_ref[1]
+  sp00, sp10 = int(ks[0, 0]), int(ks[1, 0])
+  sp01, sp11 = int(ks[0, 1]), int(ks[1, 1])
+  vmr_for_interp = [
+      jnp.where(
+          is_tropo0,
+          _get_vmr_static(lookup_gas_optics, vmr_lib, sp00, vmr_fields),
+          _get_vmr_static(lookup_gas_optics, vmr_lib, sp10, vmr_fields),
+      ),
+      jnp.where(
+          is_tropo0,
+          _get_vmr_static(lookup_gas_optics, vmr_lib, sp01, vmr_fields),
+          _get_vmr_static(lookup_gas_optics, vmr_lib, sp11, vmr_fields),
+      ),
+  ]
+  ref_rows = jnp.stack(
+      [
+          lookup_gas_optics.vmr_ref[:, sp00, 0],
+          lookup_gas_optics.vmr_ref[:, sp10, 1],
+          lookup_gas_optics.vmr_ref[:, sp01, 0],
+          lookup_gas_optics.vmr_ref[:, sp11, 1],
+      ],
+      axis=0,
+  )
+  ref_all = jnp.matmul(
+      ref_rows, oh_t, precision=jax.lax.Precision.HIGHEST
+  ).reshape(4, *cell_shape)
+  vmr_ref_0 = jnp.where(is_tropo0, ref_all[0], ref_all[1])
+  vmr_ref_1 = jnp.where(is_tropo0, ref_all[2], ref_all[3])
+  vmr_ref_ratio = vmr_ref_0 / vmr_ref_1
   combined_vmr = vmr_for_interp[0] + vmr_ref_ratio * vmr_for_interp[1]
   is_present = combined_vmr > 0
   safe_combined_vmr = jnp.where(is_present, combined_vmr, 1.0)
@@ -1105,71 +1118,107 @@ class CellInterpolation:
 _SIDES = ('high', 'low')
 
 
+def _tpm_block_plan(ncells: int) -> tuple[int, int]:
+  """Choose `(n_blocks, block_cells)` for cell-minor MXU `tpm` contraction."""
+  if ncells <= 4096:
+    return 1, ncells
+  if ncells % 128 == 0:
+    for n_blocks in range(1, 65):
+      if ncells % n_blocks != 0:
+        continue
+      block_cells = ncells // n_blocks
+      if block_cells % 128 == 0 and 12288 <= block_cells <= 32768:
+        return n_blocks, block_cells
+  block_cells = 16384
+  n_blocks = (ncells + block_cells - 1) // block_cells
+  return n_blocks, block_cells
+
+
 def _interpolate_rows_tpm_mxu(
     table: Array,
     t_interp: Interpolant,
     p_interp: Interpolant,
     mix_for_t: dict[str, Interpolant],
 ) -> Array:
-  """Factored level-mapped MXU eight-corner interpolation for `(t, p, eta, n)`.
+  """Factored cell-minor MXU eight-corner interpolation for `(t, p, eta, n)`.
 
   Contracts the `(n_t * n_eta = 126)` corners first and the `(n_p = 60)`
-  pressure nodes second at IEEE float32 (`HIGHEST`) precision, mapped one
-  vertical level at a time via `jax.lax.map` so per-level intermediates fit in
-  VMEM without materialising simultaneous 5D `(ncells, n_p, n_eta, n)` buffers
-  across band groups (issue #6).
+  pressure nodes second at IEEE float32 (`HIGHEST`) precision in 128-lane-
+  aligned cell blocks with `block_cells` on the minor axis, avoiding both 5D
+  whole-grid intermediates (issue #6) and minor-axis tile padding on `n`.
   """
   cell_shape = t_interp.interp_high.idx.shape
+  ncells = math.prod(cell_shape)
   n_t, n_p, n_eta, width = table.shape
   n_te = n_t * n_eta
-  nz = cell_shape[-1]
-  nxy = math.prod(cell_shape[:-1]) if len(cell_shape) > 1 else 1
   table_pteg = jnp.transpose(table, (1, 0, 2, 3)).reshape(n_p, n_te, width)
+  n_blocks, block_cells = _tpm_block_plan(ncells)
+  padded_cells = n_blocks * block_cells
+  pad = padded_cells - ncells
 
-  p_lo_i_z = jnp.moveaxis(p_interp.interp_low.idx, -1, 0).reshape(nz, nxy)
-  p_lo_w_z = jnp.moveaxis(p_interp.interp_low.weight, -1, 0).reshape(
-      nz, nxy, 1
-  )
-  p_hi_i_z = jnp.moveaxis(p_interp.interp_high.idx, -1, 0).reshape(nz, nxy)
-  p_hi_w_z = jnp.moveaxis(p_interp.interp_high.weight, -1, 0).reshape(
-      nz, nxy, 1
-  )
+  def _pack_idx(arr: Array) -> Array:
+    flat = arr.reshape(ncells)
+    if pad:
+      flat = jnp.pad(flat, (0, pad))
+    return flat.reshape(n_blocks, block_cells)
+
+  def _pack_w(arr: Array) -> Array:
+    flat = arr.reshape(ncells)
+    if pad:
+      flat = jnp.pad(flat, (0, pad))
+    return flat.reshape(n_blocks, 1, block_cells)
+
+  p_lo_i_b = _pack_idx(p_interp.interp_low.idx)
+  p_lo_w_b = _pack_w(p_interp.interp_low.weight)
+  p_hi_i_b = _pack_idx(p_interp.interp_high.idx)
+  p_hi_w_b = _pack_w(p_interp.interp_high.weight)
 
   te_idx_w = []
   for eta_side in _SIDES:
     for t_side in _SIDES:
       ti = getattr(t_interp, f'interp_{t_side}')
       mi = getattr(mix_for_t[t_side], f'interp_{eta_side}')
-      idx_z = jnp.moveaxis(ti.idx * n_eta + mi.idx, -1, 0).reshape(nz, nxy)
-      w_z = jnp.moveaxis(ti.weight * mi.weight, -1, 0).reshape(nz, nxy, 1)
-      te_idx_w.append((idx_z, w_z))
+      te_idx_w.append((
+          _pack_idx(ti.idx * n_eta + mi.idx),
+          _pack_w(ti.weight * mi.weight),
+      ))
 
-  def _one_level(inputs):
+  def _one_block(inputs):
     p_lo_i, p_lo_w, p_hi_i, p_hi_w, corners = inputs
     wp = p_lo_w * jax.nn.one_hot(
-        p_lo_i, n_p, dtype=table.dtype
-    ) + p_hi_w * jax.nn.one_hot(p_hi_i, n_p, dtype=table.dtype)
+        p_lo_i, n_p, dtype=table.dtype, axis=0
+    ) + p_hi_w * jax.nn.one_hot(p_hi_i, n_p, dtype=table.dtype, axis=0)
     wte = None
     for idx_c, w_c in corners:
-      oh = w_c * jax.nn.one_hot(idx_c, n_te, dtype=table.dtype)
+      oh = w_c * jax.nn.one_hot(idx_c, n_te, dtype=table.dtype, axis=0)
       wte = oh if wte is None else wte + oh
     mid = jnp.einsum(
-        'cm,pmg->cpg',
-        wte,
+        'pmg,mc->pgc',
         table_pteg,
+        wte,
         precision=jax.lax.Precision.HIGHEST,
     )
     return jnp.einsum(
-        'cp,cpg->cg',
+        'pc,pgc->gc',
         wp,
         mid,
         precision=jax.lax.Precision.HIGHEST,
     )
 
-  out_z = jax.lax.map(
-      _one_level, (p_lo_i_z, p_lo_w_z, p_hi_i_z, p_hi_w_z, te_idx_w)
+  if n_blocks == 1:
+    first_corners = [(idx_b[0], w_b[0]) for idx_b, w_b in te_idx_w]
+    out_gc = _one_block((
+        p_lo_i_b[0], p_lo_w_b[0], p_hi_i_b[0], p_hi_w_b[0], first_corners
+    ))
+    return out_gc.T[:ncells].reshape(*cell_shape, width)
+
+  out_bgc = jax.lax.map(
+      _one_block, (p_lo_i_b, p_lo_w_b, p_hi_i_b, p_hi_w_b, te_idx_w)
   )
-  return jnp.moveaxis(out_z, 0, 1).reshape(*cell_shape, width)
+  out_flat = jnp.moveaxis(out_bgc, 1, 2).reshape(padded_cells, width)
+  if pad:
+    out_flat = out_flat[:ncells]
+  return out_flat.reshape(*cell_shape, width)
 
 
 def _interpolate_rows_tpm(
@@ -1215,29 +1264,29 @@ def _interpolate_rows_te_mxu(
     mix_for_t: dict[str, Interpolant],
     leading_idx: Array | None = None,
 ) -> Array:
-  """MXU four-corner interpolation of rows of a `(t, eta, n)` table."""
+  """Cell-minor MXU four-corner interpolation of rows of a `(t, eta, n)` table."""
   cell_shape = t_interp.interp_high.idx.shape
   ncells = math.prod(cell_shape)
   if leading_idx is None:
     n_t, n_eta, width = table.shape
     n_te = n_t * n_eta
-    flat_table = table.reshape(n_te, width)
+    flat_table_t = table.reshape(n_te, width).T
     w_oh = None
     for eta_side in _SIDES:
       for t_side in _SIDES:
         ti = getattr(t_interp, f'interp_{t_side}')
         mi = getattr(mix_for_t[t_side], f'interp_{eta_side}')
         idx = (ti.idx * n_eta + mi.idx).reshape(ncells)
-        w = (ti.weight * mi.weight).reshape(ncells, 1)
-        oh = w * jax.nn.one_hot(idx, n_te, dtype=table.dtype)
+        w = (ti.weight * mi.weight).reshape(1, ncells)
+        oh = w * jax.nn.one_hot(idx, n_te, dtype=table.dtype, axis=0)
         w_oh = oh if w_oh is None else w_oh + oh
     return jnp.matmul(
-        w_oh, flat_table, precision=jax.lax.Precision.HIGHEST
-    ).reshape(*cell_shape, width)
+        flat_table_t, w_oh, precision=jax.lax.Precision.HIGHEST
+    ).T.reshape(*cell_shape, width)
 
   n_lead, n_t, n_eta, width = table.shape
   n_lte = n_lead * n_t * n_eta
-  flat_table = table.reshape(n_lte, width)
+  flat_table_t = table.reshape(n_lte, width).T
   lead_flat = leading_idx.reshape(ncells)
   w_oh = None
   for eta_side in _SIDES:
@@ -1248,12 +1297,12 @@ def _interpolate_rows_te_mxu(
           (lead_flat * n_t + ti.idx.reshape(ncells)) * n_eta
           + mi.idx.reshape(ncells)
       )
-      w = (ti.weight * mi.weight).reshape(ncells, 1)
-      oh = w * jax.nn.one_hot(idx, n_lte, dtype=table.dtype)
+      w = (ti.weight * mi.weight).reshape(1, ncells)
+      oh = w * jax.nn.one_hot(idx, n_lte, dtype=table.dtype, axis=0)
       w_oh = oh if w_oh is None else w_oh + oh
   return jnp.matmul(
-      w_oh, flat_table, precision=jax.lax.Precision.HIGHEST
-  ).reshape(*cell_shape, width)
+      flat_table_t, w_oh, precision=jax.lax.Precision.HIGHEST
+  ).T.reshape(*cell_shape, width)
 
 
 def _interpolate_rows_te(

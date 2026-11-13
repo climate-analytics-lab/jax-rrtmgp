@@ -16,8 +16,9 @@
 
 from typing import TypeAlias
 
-import unittest
+import collections
 from pathlib import Path
+import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -688,6 +689,46 @@ class GasOpticsTest(unittest.TestCase):
     gt, gp = jax.grad(loss_fn, argnums=(0, 1))(temp, pres)
     self.assertTrue(bool(jnp.all(jnp.isfinite(gt))))
     self.assertTrue(bool(jnp.all(jnp.isfinite(gp))))
+
+    # Exercise both 128-lane-aligned multi-block (ncells = 24576 -> 2 blocks of
+    # 12288) and padded multi-block (ncells = 4995 -> padded to 16384) paths,
+    # plus 1D cell-minor MXU interpolation (`_interpolate_1d_mxu`).
+    for big_shape in ((16, 128, 12), (3, 37, 45)):
+      n_big = int(np.prod(big_shape))
+      t_big = jnp.linspace(195.0, 300.0, n_big, dtype=jnp.float32).reshape(
+          big_shape
+      )
+      p_big = jnp.geomspace(1.0e5, 80.0, n_big, dtype=jnp.float32).reshape(
+          big_shape
+      )
+      vmr_big = {lw.idx_h2o: jnp.full(big_shape, 2.5e-3, dtype=jnp.float32)}
+      ci_big = gas_optics.CellInterpolation(
+          lw, self.vmr_lib, t_big, p_big, vmr_big
+      )
+      mix_big = {
+          s: gas_optics._compute_relative_abundance_interpolant_mxu(
+              lw,
+              self.vmr_lib,
+              ci_big.tropo_idx,
+              getattr(ci_big.t_interp, f'interp_{s}').idx,
+              0,
+              True,
+              vmr_big,
+          )
+          for s in ('high', 'low')
+      }
+      ref_big = gas_optics._interpolate_rows_tpm(
+          lw.kmajor[..., :8], ci_big.t_interp, ci_big.p_interp, mix_big
+      )
+      mxu_big = gas_optics._interpolate_rows_tpm_mxu(
+          lw.kmajor[..., :8], ci_big.t_interp, ci_big.p_interp, mix_big
+      )
+      np.testing.assert_allclose(mxu_big, ref_big, rtol=2e-6, atol=1e-30)
+
+      fns_1d = collections.OrderedDict({'t': lambda: ci_big.t_interp})
+      ref_1d = optics_utils.interpolate_orig(lw.totplnk[0], fns_1d)
+      mxu_1d = optics_utils._interpolate_1d_mxu(lw.totplnk[0], fns_1d)
+      np.testing.assert_allclose(mxu_1d, ref_1d, rtol=2e-6, atol=1e-6)
 
 if __name__ == '__main__':
   unittest.main()
