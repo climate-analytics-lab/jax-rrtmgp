@@ -14,6 +14,7 @@
 
 """A library for solving the two-stream radiative transfer equation."""
 
+import dataclasses
 from collections.abc import Mapping
 from typing import Callable, TypeAlias, cast
 
@@ -22,10 +23,14 @@ import jax.numpy as jnp
 import numpy as np
 from rrtmgp import constants
 from rrtmgp import kernel_ops
+from rrtmgp import smooth_ops
 from rrtmgp.optics import atmospheric_state
+from rrtmgp.optics import lookup_cloud_optics
 from rrtmgp.optics import lookup_gas_optics_base
+from rrtmgp.optics import lookup_gas_optics_longwave
 from rrtmgp.optics import optics
 from rrtmgp.optics import optics_base
+from rrtmgp.optics import optics_utils
 from rrtmgp.rte import longwave_noscat
 from rrtmgp.rte import monochromatic_two_stream
 
@@ -436,10 +441,13 @@ def _lw_cell_properties(
 
 
 def _reindex_vmr_fields(
-    vmr_fields: dict[str, Array], gas_optics_lib: AbstractLookupGasOptics
+    vmr_fields: Mapping[str | int, Array], gas_optics_lib: AbstractLookupGasOptics
 ) -> dict[int, Array]:
   """Converts the chemical formulas of the gas species to RRTM indices."""
-  return {gas_optics_lib.idx_gases[k]: v for k, v in vmr_fields.items()}
+  return {
+      k if isinstance(k, int) else gas_optics_lib.idx_gases[k]: v
+      for k, v in vmr_fields.items()
+  }
 
 
 def solve_lw(
@@ -593,6 +601,39 @@ def solve_lw(
     # Convert the chemical formulas of the gas species to RRTM-consistent
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_lw)
+
+  if (
+      jax.default_backend() == 'tpu'
+      and hoist_gas_optics
+      and use_scan
+      and gpt_chunk > 1
+      and isinstance(optics_lib, optics.RRTMOptics)
+      and temperature.ndim == 3
+      and temperature.size > 0
+  ):
+    return _solve_lw_3d_via_zc(
+        pressure,
+        temperature,
+        molecules,
+        optics_lib,
+        atmos_state,
+        vmr_fields=vmr_fields,
+        sfc_temperature=sfc_temperature,
+        cloud_r_eff_liq=cloud_r_eff_liq,
+        cloud_path_liq=cloud_path_liq,
+        cloud_r_eff_ice=cloud_r_eff_ice,
+        cloud_path_ice=cloud_path_ice,
+        cloud_path_liq_per_gpt=cloud_path_liq_per_gpt,
+        cloud_path_ice_per_gpt=cloud_path_ice_per_gpt,
+        aerosol_optics=aerosol_optics,
+        gpt_chunk=gpt_chunk,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
+        with_clear_sky=with_clear_sky,
+        lw_solver=lw_solver,
+        lw_secant=lw_secant,
+        with_aerosol_free=with_aerosol_free,
+    )
 
   # The gas optics of every g-point, ahead of the spectral loop. Everything in
   # it is independent of the cloud, the aerosol and the g-point loop's order.
@@ -840,6 +881,10 @@ def _sw_sfc_albedo_by_band(
 # `solve_sw` so downstream callers can skip scalar-zenith shims.
 _SUPPORTS_2D_ZENITH = True
 
+# Capability flag advertising native column-minor `(nzh, nc)` TPU solvers
+# (`solve_lw_zc`, `solve_sw_zc`, `RRTMGP.compute_heating_rate_zc`).
+_SUPPORTS_TPU_COL_MINOR_SOLVE = True
+
 
 def solve_sw(
     pressure: Array,
@@ -976,6 +1021,38 @@ def solve_sw(
     # Convert the chemical formulas of the gas species to RRTM-consistent
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_sw)
+
+  if (
+      jax.default_backend() == 'tpu'
+      and hoist_gas_optics
+      and use_scan
+      and gpt_chunk > 1
+      and isinstance(optics_lib, optics.RRTMOptics)
+      and temperature.ndim == 3
+      and temperature.size > 0
+  ):
+    return _solve_sw_3d_via_zc(
+        pressure,
+        temperature,
+        molecules,
+        optics_lib,
+        atmos_state,
+        vmr_fields=vmr_fields,
+        cloud_r_eff_liq=cloud_r_eff_liq,
+        cloud_path_liq=cloud_path_liq,
+        cloud_r_eff_ice=cloud_r_eff_ice,
+        cloud_path_ice=cloud_path_ice,
+        cloud_path_liq_per_gpt=cloud_path_liq_per_gpt,
+        cloud_path_ice_per_gpt=cloud_path_ice_per_gpt,
+        aerosol_optics=aerosol_optics,
+        gpt_chunk=gpt_chunk,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
+        sfc_alb_dir=sfc_alb_dir,
+        sfc_alb_dif=sfc_alb_dif,
+        with_clear_sky=with_clear_sky,
+        with_aerosol_free=with_aerosol_free,
+    )
 
   # The gas optics of every g-point, ahead of the spectral loop (see `solve_lw`).
   gas_all_gpts = None
@@ -1252,3 +1329,1445 @@ def compute_heating_rate(
 
   # Compute the heating rate at the grid cell center in K/s.
   return constants.G * dflux / dp / cp
+
+
+# ---------------------------------------------------------------------------
+# Column-minor `(nzh, nc)` TPU solvers (`solve_lw_zc`, `solve_sw_zc`,
+# `compute_heating_rate_zc`).
+#
+# Keeping the column axis `nc` minor (`nc % 128 == 0` on standard Gaussian
+# grids) and `chunk` second-minor (`chunk % 8 == 0`) fills `(8, 128)` TPU tiles
+# at 100%, eliminates `moveaxis` transposes around vertical `lax.scan`s, fuses
+# the upward albedo and emission recurrences into a single scan, precomputes
+# WENO5 face temperatures, Planck `totplnk`, and cloud Mie tables once outside
+# the spectral loop, and replaces all per-chunk gathers with `dynamic_slice`
+# and tiny static band-projection matmuls.
+# ---------------------------------------------------------------------------
+
+
+def _tpu_gpt_chunk_plan(n_gpt: int, gpt_chunk: int) -> tuple[int, int, bool]:
+  """Choose an 8-aligned `chunk <= gpt_chunk` when `n_chunks` stays unchanged."""
+  chunk, n_chunks, needs_mask = _gpt_chunk_plan(n_gpt, gpt_chunk)
+  if n_chunks > 1:
+    even8 = ((-(-n_gpt // n_chunks) + 7) // 8) * 8
+    if even8 <= gpt_chunk and even8 * n_chunks >= n_gpt:
+      chunk = even8
+      needs_mask = n_chunks * chunk != n_gpt
+  return chunk, n_chunks, needs_mask
+
+
+def _reconstruct_face_values_zc(f_zc: Array, f_lower_bc_c: Array) -> Array:
+  """Reconstruct `f_bottom[1:]` (`(nz + 1, nc)`) on `(nzh, nc)` via WENO5-JS."""
+  nzh, _ = f_zc.shape
+  f = jnp.concatenate(
+      [f_lower_bc_c[jnp.newaxis, :], f_zc[1:-1, :], f_zc[-2:-1, :]],
+      axis=0,
+  )
+  f_m3 = jnp.roll(f, 3, axis=0)
+  f_m2 = jnp.roll(f, 2, axis=0)
+  f_m1 = jnp.roll(f, 1, axis=0)
+  f_p1 = jnp.roll(f, -1, axis=0)
+  f_p2 = jnp.roll(f, -2, axis=0)
+
+  beta1_p = (
+      13 / 12 * (f_m3 - 2 * f_m2 + f_m1) ** 2
+      + 1 / 4 * (f_m3 - 4 * f_m2 + 3 * f_m1) ** 2
+  )
+  beta2_p = 13 / 12 * (f_m2 - 2 * f_m1 + f) ** 2 + 1 / 4 * (f_m2 - f) ** 2
+  beta3_p = (
+      13 / 12 * (f_m1 - 2 * f + f_p1) ** 2
+      + 1 / 4 * (3 * f_m1 - 4 * f + f_p1) ** 2
+  )
+
+  beta1_m = (
+      13 / 12 * (f - 2 * f_p1 + f_p2) ** 2
+      + 1 / 4 * (3 * f - 4 * f_p1 + f_p2) ** 2
+  )
+  beta2_m = 13 / 12 * (f_m1 - 2 * f + f_p1) ** 2 + 1 / 4 * (f_m1 - f_p1) ** 2
+  beta3_m = (
+      13 / 12 * (f_m2 - 2 * f_m1 + f) ** 2
+      + 1 / 4 * (f_m2 - 4 * f_m1 + 3 * f) ** 2
+  )
+
+  c1, c2, c3 = 0.1, 0.6, 0.3
+  eps = 1e-5
+  a1_p = c1 / (beta1_p + eps) ** 2
+  a2_p = c2 / (beta2_p + eps) ** 2
+  a3_p = c3 / (beta3_p + eps) ** 2
+  a1_m = c1 / (beta1_m + eps) ** 2
+  a2_m = c2 / (beta2_m + eps) ** 2
+  a3_m = c3 / (beta3_m + eps) ** 2
+
+  mask_p = jnp.asarray((np.arange(nzh) != 2)[:, np.newaxis])
+  mask_m = jnp.asarray((np.arange(nzh) != (nzh - 2))[:, np.newaxis])
+  a1_p = jnp.where(mask_p, a1_p, jnp.zeros_like(a1_p))
+  a1_m = jnp.where(mask_m, a1_m, jnp.zeros_like(a1_m))
+
+  sum_p = a1_p + a2_p + a3_p
+  w1_p, w2_p, w3_p = a1_p / sum_p, a2_p / sum_p, a3_p / sum_p
+  sum_m = a1_m + a2_m + a3_m
+  w1_m, w2_m, w3_m = a1_m / sum_m, a2_m / sum_m, a3_m / sum_m
+
+  f1_p = 1 / 3 * f_m3 - 7 / 6 * f_m2 + 11 / 6 * f_m1
+  f2_p = -1 / 6 * f_m2 + 5 / 6 * f_m1 + 1 / 3 * f
+  f3_p = 1 / 3 * f_m1 + 5 / 6 * f - 1 / 6 * f_p1
+  f1_m = 11 / 6 * f - 7 / 6 * f_p1 + 1 / 3 * f_p2
+
+  face_p = w1_p * f1_p + w2_p * f2_p + w3_p * f3_p
+  face_m = w1_m * f1_m + w2_m * f3_p + w3_m * f2_p
+  face_m_tail = jnp.concatenate([face_m[1:-1, :], f[-2:-1, :]], axis=0)
+  return 0.5 * (face_p[1:, :] + face_m_tail)
+
+
+def _interp_1d_table_mxu(table_2d: Array, x: Array, ref_grid: Array) -> Array:
+  """1-D linear interpolation of all rows of `table_2d` `(n_rows, n_nodes)`."""
+  interp = optics_utils.create_linear_interpolant(x, ref_grid)
+  n_nodes = table_2d.shape[1]
+  ncells = x.size
+  oh = interp.interp_low.weight.reshape(1, ncells) * jax.nn.one_hot(
+      interp.interp_low.idx.reshape(ncells),
+      n_nodes,
+      dtype=table_2d.dtype,
+      axis=0,
+  ) + interp.interp_high.weight.reshape(1, ncells) * jax.nn.one_hot(
+      interp.interp_high.idx.reshape(ncells),
+      n_nodes,
+      dtype=table_2d.dtype,
+      axis=0,
+  )
+  return jnp.matmul(
+      table_2d, oh, precision=jax.lax.Precision.HIGHEST
+  ).reshape(table_2d.shape[0], *x.shape)
+
+
+def _planck_all_bands_mxu(
+    lookup: lookup_gas_optics_longwave.LookupGasOpticsLongwave,
+    t_face_zc: Array,
+    sfc_temp_c: Array,
+    t_lay_zc: Array | None = None,
+) -> tuple[Array, Array, Array | None]:
+  """Precompute `(b_face, b_sfc, b_lay)` across all LW bands in one matmul."""
+  n_face = t_face_zc.shape[0]
+  parts = [t_face_zc, sfc_temp_c[jnp.newaxis, :]]
+  if t_lay_zc is not None:
+    parts.append(t_lay_zc)
+  t_stack = jnp.concatenate(parts, axis=0)
+  b_all = optics_utils.floor_at_zero(
+      _interp_1d_table_mxu(lookup.totplnk, t_stack, lookup.t_planck)
+  )
+  b_face = b_all[:, :n_face, :]
+  b_sfc = b_all[:, n_face, :]
+  b_lay = None if t_lay_zc is None else b_all[:, n_face + 1 :, :]
+  return b_face, b_sfc, b_lay
+
+
+def _cloud_mie_tables_mxu(
+    cld_lkp: lookup_cloud_optics.LookupCloudOptics,
+    r_eff_liq_zc: Array | None,
+    r_eff_ice_zc: Array | None,
+    need_liq: bool,
+    need_ice: bool,
+    nz: int,
+    nc: int,
+    dtype: jnp.dtype,
+) -> tuple[tuple[Array, Array, Array] | None, tuple[Array, Array, Array] | None]:
+  """Precompute `(ext, ssa, asy)` `(n_bnd, nz, nc)` Mie tables in <=2 matmuls."""
+  n_bnd = cld_lkp.ext_liq.shape[0]
+  liq_tables = None
+  if need_liq:
+    r_liq = (
+        jnp.zeros((nz, nc), dtype=dtype)
+        if r_eff_liq_zc is None
+        else r_eff_liq_zc
+    )
+    size_liq = jnp.clip(
+        1.0e6 * r_liq, cld_lkp.radius_liq_lower, cld_lkp.radius_liq_upper
+    )
+    tbl_liq = jnp.concatenate(
+        [cld_lkp.ext_liq, cld_lkp.ssa_liq, cld_lkp.asy_liq], axis=0
+    )
+    grid_liq = jnp.linspace(
+        cld_lkp.radius_liq_lower,
+        cld_lkp.radius_liq_upper,
+        cld_lkp.n_size_liq,
+        dtype=tbl_liq.dtype,
+    )
+    mie_l = _interp_1d_table_mxu(tbl_liq, size_liq, grid_liq)
+    liq_tables = (
+        mie_l[:n_bnd],
+        mie_l[n_bnd : 2 * n_bnd],
+        mie_l[2 * n_bnd :],
+    )
+
+  ice_tables = None
+  if need_ice:
+    r_ice = (
+        jnp.zeros((nz, nc), dtype=dtype)
+        if r_eff_ice_zc is None
+        else r_eff_ice_zc
+    )
+    size_ice = jnp.clip(
+        2.0e6 * r_ice, cld_lkp.diameter_ice_lower, cld_lkp.diameter_ice_upper
+    )
+    rough = cld_lkp.ice_roughness.value
+    tbl_ice = jnp.concatenate(
+        [
+            cld_lkp.ext_ice[rough],
+            cld_lkp.ssa_ice[rough],
+            cld_lkp.asy_ice[rough],
+        ],
+        axis=0,
+    )
+    grid_ice = jnp.linspace(
+        cld_lkp.diameter_ice_lower,
+        cld_lkp.diameter_ice_upper,
+        cld_lkp.n_size_ice,
+        dtype=tbl_ice.dtype,
+    )
+    mie_i = _interp_1d_table_mxu(tbl_ice, size_ice, grid_ice)
+    ice_tables = (
+        mie_i[:n_bnd],
+        mie_i[n_bnd : 2 * n_bnd],
+        mie_i[2 * n_bnd :],
+    )
+  return liq_tables, ice_tables
+
+
+def _band_to_zgc(bnd_oh_chunk: Array, field_bzc: Array) -> Array:
+  """Project `(n_bnd, nz, nc)` to `(nz, chunk, nc)` keeping `nc` minor."""
+  n_bnd, nz, nc = field_bzc.shape
+  chunk = bnd_oh_chunk.shape[0]
+  out_gzc = jnp.matmul(
+      bnd_oh_chunk,
+      field_bzc.reshape(n_bnd, nz * nc),
+      precision=jax.lax.Precision.HIGHEST,
+  ).reshape(chunk, nz, nc)
+  return jnp.swapaxes(out_gzc, 0, 1)
+
+
+def _cloud_props_from_mie(
+    optics_lib: optics.RRTMOptics,
+    liq_tables: tuple[Array, Array, Array] | None,
+    ice_tables: tuple[Array, Array, Array] | None,
+    cpl: Array | None,
+    cpi: Array | None,
+    tau_scale_liq: Array | float | None,
+    tau_scale_ice: Array | float | None,
+    is_lw: bool,
+    bnd_oh_chunk: Array | None = None,
+) -> dict[str, Array]:
+  """Combine liquid + ice cloud optical properties on `(n_bnd|chunk)` layout."""
+  proj = (
+      (lambda x: x)
+      if bnd_oh_chunk is None
+      else (lambda x: _band_to_zgc(bnd_oh_chunk, x))
+  )
+  tau_l = tau_ssa_l = tau_ssa_g_l = None
+  if liq_tables is not None and cpl is not None:
+    ext_l, ssa_l, asy_l = liq_tables
+    cld_l = cpl * 1.0e3
+    mask_l = smooth_ops.smooth_gate(cld_l, 0.0, 2.0e-6)
+    tau_l = proj(ext_l) * cld_l * mask_l
+    tau_ssa_l = proj(ssa_l) * tau_l
+    tau_ssa_g_l = proj(asy_l) * tau_ssa_l
+
+  tau_i = tau_ssa_i = tau_ssa_g_i = None
+  if ice_tables is not None and cpi is not None:
+    ext_i, ssa_i, asy_i = ice_tables
+    cld_i = cpi * 1.0e3
+    mask_i = smooth_ops.smooth_gate(cld_i, 0.0, 2.0e-6)
+    tau_i = proj(ext_i) * cld_i * mask_i
+    tau_ssa_i = proj(ssa_i) * tau_i
+    tau_ssa_g_i = proj(asy_i) * tau_ssa_i
+
+  if tau_l is not None and tau_i is not None:
+    tau = tau_l + tau_i
+    tau_ssa = tau_ssa_l + tau_ssa_i
+    tau_ssa_g = tau_ssa_g_l + tau_ssa_g_i
+  elif tau_l is not None:
+    tau, tau_ssa, tau_ssa_g = tau_l, tau_ssa_l, tau_ssa_g_l
+  else:
+    assert tau_i is not None and tau_ssa_i is not None and tau_ssa_g_i is not None
+    tau, tau_ssa, tau_ssa_g = tau_i, tau_ssa_i, tau_ssa_g_i
+
+  tau_nz = tau != 0
+  tau_ssa_nz = tau_ssa != 0
+  safe_tau = jnp.where(tau_nz, tau, 1.0)
+  safe_tau_ssa = jnp.where(tau_ssa_nz, tau_ssa, 1.0)
+
+  optical_depth = tau
+  if tau_scale_liq is not None or tau_scale_ice is not None:
+    tl = jnp.zeros_like(tau) if tau_l is None else (
+        tau_l if tau_scale_liq is None else tau_scale_liq * tau_l
+    )
+    ti = jnp.zeros_like(tau) if tau_i is None else (
+        tau_i if tau_scale_ice is None else tau_scale_ice * tau_i
+    )
+    optical_depth = tl + ti
+
+  cld_props = {
+      'optical_depth': optical_depth,
+      'ssa': jnp.where(tau_nz, tau_ssa / safe_tau, 0.0),
+      'asymmetry_factor': jnp.where(tau_ssa_nz, tau_ssa_g / safe_tau_ssa, 0.0),
+  }
+  if not is_lw:
+    cld_props = optics_lib._apply_delta_scaling_for_cloud(cld_props)  # pylint: disable=protected-access
+  return cld_props
+
+
+def _pack_gpt_zc_to_chunks(
+    arr_gzc: Array, n_chunks: int, chunk: int
+) -> Array:
+  """Pack `(n_gpt, nz_or_nzh, nc)` into `(n_chunks, nz_or_nzh, chunk, nc)`."""
+  n_gpt, nz_dim, nc = arr_gzc.shape
+  pad_g = n_chunks * chunk - n_gpt
+  if pad_g:
+    arr_gzc = jnp.concatenate(
+        [arr_gzc, jnp.repeat(arr_gzc[-1:, :, :], pad_g, axis=0)], axis=0
+    )
+  return jnp.swapaxes(arr_gzc.reshape(n_chunks, chunk, nz_dim, nc), 1, 2)
+
+
+def _pack_per_gpt_cloud_zc(
+    arr: Array,
+    nz: int,
+    nzh: int,
+    n_chunks: int,
+    chunk: int,
+    per_gpt_axis: int,
+) -> Array:
+  """Pack per-g-point cloud path into `(n_chunks, nz, chunk, nc)`."""
+  if per_gpt_axis == 0:
+    if arr.shape[1] == nzh:
+      arr = arr[:, 1:-1, :]
+    return _pack_gpt_zc_to_chunks(arr, n_chunks, chunk)
+  # `per_gpt_axis == 1`: `(nz_or_nzh, n_gpt, nc)` -> `(n_chunks, nz, chunk, nc)`.
+  if arr.shape[0] == nzh:
+    arr = arr[1:-1, :, :]
+  _, n_gpt, nc = arr.shape
+  pad_g = n_chunks * chunk - n_gpt
+  if pad_g:
+    arr = jnp.concatenate(
+        [arr, jnp.repeat(arr[:, -1:, :], pad_g, axis=1)], axis=1
+    )
+  return jnp.swapaxes(arr.reshape(nz, n_chunks, chunk, nc), 0, 1)
+
+
+def _interior_zc(arr: Array | None, nz: int, nzh: int) -> Array | None:
+  """Slice optional `(nzh, nc)` or `(nz, nc)` field to interior `(nz, nc)`."""
+  if arr is None:
+    return None
+  if arr.shape[0] == nzh:
+    return arr[1:-1, :]
+  assert arr.shape[0] == nz
+  return arr
+
+
+def _interior_bzc(arr: Array, nz: int, nzh: int) -> Array:
+  """Slice `(n_bnd, nzh, nc)` or `(n_bnd, nz, nc)` field to `(n_bnd, nz, nc)`."""
+  if arr.shape[1] == nzh:
+    return arr[:, 1:-1, :]
+  assert arr.shape[1] == nz
+  return arr
+
+
+def _scale_to_interior(
+    scale: Array | float | None,
+    nz: int,
+    nzh: int,
+    nc: int,
+    with_middle_axis: bool,
+) -> Array | float | None:
+  """Normalize `cloud_tau_scale_{liq,ice}` to broadcast cleanly against cloud."""
+  if scale is None or jnp.ndim(scale) == 0:
+    return scale
+  s = jnp.asarray(scale)
+  if s.ndim == 1:
+    s = jnp.broadcast_to(s, (nc,))[jnp.newaxis, :]
+  elif s.shape[0] == nzh:
+    s = s[1:-1, :]
+  elif s.shape[0] not in (1, nz):
+    s = jnp.broadcast_to(s, (nz, nc))
+  if with_middle_axis:
+    return s[:, jnp.newaxis, :]
+  return s[jnp.newaxis, :, :]
+
+
+def _to_1c(val: Array | float, nc: int, dtype: jnp.dtype) -> Array:
+  """Convert scalar or `(nc,)` surface/TOA field to `(1, nc)`."""
+  v = jnp.asarray(val, dtype=dtype)
+  if v.ndim == 0:
+    return v.reshape(1, 1)
+  return jnp.broadcast_to(v, (nc,)).reshape(1, nc)
+
+
+def _band_oh_packed(
+    g_point_to_bnd: Array, n_bnd: int, n_chunks: int, chunk: int, dtype: jnp.dtype
+) -> Array:
+  """Static `(n_chunks, chunk, n_bnd)` band-projection matrix."""
+  g2b = np.asarray(g_point_to_bnd)
+  n_gpt = g2b.shape[0]
+  padded = np.minimum(np.arange(n_chunks * chunk), n_gpt - 1)
+  bnds = g2b[padded]
+  oh = np.eye(n_bnd, dtype=np.float32)[bnds]
+  return jnp.asarray(oh, dtype=dtype).reshape(n_chunks, chunk, n_bnd)
+
+
+def _solve_rte_2stream_zc(
+    t_diff: Array,
+    r_diff: Array,
+    src_up: Array,
+    src_down: Array,
+    toa_flux_down: Array,
+    sfc_emission: Array,
+    sfc_reflectance: Array,
+) -> dict[str, Array]:
+  """Fused two-stream transport on interior `(nz, chunk, nc)` arrays.
+
+  Returns `(nz + 1, chunk, nc)` face fluxes from the surface face (`0`) to the
+  TOA face (`nz`). Bottom-halo face (`0` in `(nzh, nc)`) is identically zero and
+  prepended once after the spectral sum.
+  """
+  def upward_op(carry, inputs):
+    alb_below, emiss_below = carry
+    t, r, sup, sdn = inputs
+    beta = 1.0 / (1.0 - r * alb_below)
+    alb_next = r + t * t * beta * alb_below
+    emiss_next = sup + t * beta * (emiss_below + sdn * alb_below)
+    return (alb_next, emiss_next), (alb_below, emiss_below, beta)
+
+  (alb_toa, emiss_toa), (alb_below, emiss_below, beta) = jax.lax.scan(
+      upward_op,
+      (sfc_reflectance, sfc_emission),
+      (t_diff, r_diff, src_up, src_down),
+  )
+
+  def downward_op(fdn_above, inputs):
+    t, r, sdn, emiss_b, b = inputs
+    fdn = (t * fdn_above + r * emiss_b + sdn) * b
+    return fdn, fdn
+
+  _, fdn_int = jax.lax.scan(
+      downward_op,
+      toa_flux_down,
+      (t_diff, r_diff, src_down, emiss_below, beta),
+      reverse=True,
+  )
+
+  flux_down_faces = jnp.concatenate(
+      [fdn_int, toa_flux_down[jnp.newaxis, :, :]], axis=0
+  )
+  alb_faces = jnp.concatenate(
+      [alb_below, alb_toa[jnp.newaxis, :, :]], axis=0
+  )
+  emiss_faces = jnp.concatenate(
+      [emiss_below, emiss_toa[jnp.newaxis, :, :]], axis=0
+  )
+  flux_up_faces = flux_down_faces * alb_faces + emiss_faces
+  return {
+      'flux_up': flux_up_faces,
+      'flux_down': flux_down_faces,
+      'flux_net': flux_up_faces - flux_down_faces,
+  }
+
+
+def _lw_noscat_transport_zc(
+    optical_depth: Array,
+    ssa: Array,
+    planck_src: Array,
+    planck_src_top: Array,
+    planck_src_bottom: Array,
+    toa_flux_down: Array,
+    sfc_src: Array,
+    sfc_emissivity: Array,
+    secant: float | Array = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
+    weight: float = longwave_noscat.LW_NOSCAT_DEFAULT_WEIGHT,
+) -> dict[str, Array]:
+  """No-scattering LW transport on interior `(nz, chunk, nc)` arrays."""
+  tau_abs = jnp.maximum(optical_depth * (1.0 - ssa), 0.0)
+  trans, source_up, source_down = longwave_noscat.lw_noscat_layer_sources(
+      secant * tau_abs, planck_src, planck_src_top, planck_src_bottom
+  )
+  flux_scale = np.pi * weight
+  source_up = flux_scale * source_up
+  source_down = flux_scale * source_down
+
+  def fdn_op(fdn_above, inputs):
+    tr, sdn = inputs
+    out = tr * fdn_above + sdn
+    return out, out
+
+  sfc_flux_down, fdn_int = jax.lax.scan(
+      fdn_op, toa_flux_down, (trans, source_down), reverse=True
+  )
+  sfc_flux_up = (1.0 - sfc_emissivity) * sfc_flux_down + (
+      sfc_emissivity * flux_scale * sfc_src
+  )
+
+  def fup_op(fup_below, inputs):
+    tr, sup = inputs
+    out = tr * fup_below + sup
+    return out, out
+
+  _, fup_int = jax.lax.scan(fup_op, sfc_flux_up, (trans, source_up))
+  flux_down_faces = jnp.concatenate(
+      [fdn_int, toa_flux_down[jnp.newaxis, :, :]], axis=0
+  )
+  flux_up_faces = jnp.concatenate(
+      [sfc_flux_up[jnp.newaxis, :, :], fup_int], axis=0
+  )
+  return {
+      'flux_up': flux_up_faces,
+      'flux_down': flux_down_faces,
+      'flux_net': flux_up_faces - flux_down_faces,
+  }
+
+
+def solve_lw_zc(
+    pressure: Array,
+    temperature: Array,
+    molecules: Array,
+    optics_lib: optics.RRTMOptics,
+    atmos_state: AtmosphericState,
+    vmr_fields: Mapping[str | int, Array] | None = None,
+    sfc_temperature: Array | float | None = None,
+    cloud_r_eff_liq: Array | None = None,
+    cloud_path_liq: Array | None = None,
+    cloud_r_eff_ice: Array | None = None,
+    cloud_path_ice: Array | None = None,
+    cloud_path_liq_per_gpt: Array | None = None,
+    cloud_path_ice_per_gpt: Array | None = None,
+    aerosol_optics: Mapping[str, Array] | None = None,
+    gpt_chunk: int = 64,
+    cloud_tau_scale_liq: Array | float | None = None,
+    cloud_tau_scale_ice: Array | float | None = None,
+    with_clear_sky: bool = False,
+    lw_solver: str = LW_SOLVER_TWO_STREAM,
+    lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
+    with_aerosol_free: bool = False,
+    *,
+    per_gpt_axis: int = 1,
+) -> dict[str, Array]:
+  """Column-minor `(nzh, nc)` longwave radiative transfer solver for TPU."""
+  if lw_solver not in LW_SOLVERS:
+    raise ValueError(
+        f'lw_solver must be one of {LW_SOLVERS}, got {lw_solver!r}.'
+    )
+  assert sfc_temperature is not None, 'sfc_temperature is required.'
+  nzh, nc = temperature.shape
+  nz = nzh - 2
+  dtype = temperature.dtype
+  lookup_lw = cast(
+      lookup_gas_optics_longwave.LookupGasOpticsLongwave,
+      optics_lib.gas_optics_lw,
+  )
+  n_gpt = optics_lib.n_gpt_lw
+  n_bnd = lookup_lw.n_bnd
+  chunk, n_chunks, needs_mask = _tpu_gpt_chunk_plan(n_gpt, gpt_chunk)
+
+  vmr_idx = (
+      None
+      if vmr_fields is None
+      else _reindex_vmr_fields(vmr_fields, lookup_lw)
+  )
+  gas_all = optics_lib.compute_gas_optics_all_gpts_zc(
+      pressure, temperature, molecules, vmr_idx, is_lw=True
+  )
+  tau_packed = _pack_gpt_zc_to_chunks(
+      gas_all['optical_depth'][:, 1:-1, :], n_chunks, chunk
+  )
+  pfrac_packed = _pack_gpt_zc_to_chunks(
+      gas_all['planck_fraction'], n_chunks, chunk
+  )
+
+  sfc_temp_c = jnp.broadcast_to(
+      jnp.asarray(sfc_temperature, dtype=dtype), (nc,)
+  )
+  t_face_zc = _reconstruct_face_values_zc(temperature, sfc_temp_c)
+  need_lay_src = lw_solver == LW_SOLVER_NOSCAT
+  b_face, b_sfc, b_lay = _planck_all_bands_mxu(
+      lookup_lw,
+      t_face_zc,
+      sfc_temp_c,
+      t_lay_zc=temperature[1:-1, :] if need_lay_src else None,
+  )
+  bnd_oh_packed = _band_oh_packed(
+      lookup_lw.g_point_to_bnd, n_bnd, n_chunks, chunk, dtype
+  )
+
+  has_liq = cloud_path_liq_per_gpt is not None or cloud_path_liq is not None
+  has_ice = cloud_path_ice_per_gpt is not None or cloud_path_ice is not None
+  has_cloud = has_liq or has_ice
+  per_gpt_cloud = (
+      cloud_path_liq_per_gpt is not None or cloud_path_ice_per_gpt is not None
+  )
+
+  liq_mie = ice_mie = None
+  cld_props_by_band = None
+  cpl_packed = cpi_packed = None
+  cpl_int_z1c = cpi_int_z1c = None
+  scale_liq_z1c = scale_ice_z1c = None
+
+  if has_cloud:
+    assert optics_lib.cloud_optics_lw is not None
+    liq_mie, ice_mie = _cloud_mie_tables_mxu(
+        optics_lib.cloud_optics_lw,
+        _interior_zc(cloud_r_eff_liq, nz, nzh),
+        _interior_zc(cloud_r_eff_ice, nz, nzh),
+        has_liq,
+        has_ice,
+        nz,
+        nc,
+        dtype,
+    )
+    if per_gpt_cloud:
+      scale_liq_z1c = _scale_to_interior(
+          cloud_tau_scale_liq, nz, nzh, nc, with_middle_axis=True
+      )
+      scale_ice_z1c = _scale_to_interior(
+          cloud_tau_scale_ice, nz, nzh, nc, with_middle_axis=True
+      )
+      if cloud_path_liq_per_gpt is not None:
+        cpl_packed = _pack_per_gpt_cloud_zc(
+            cloud_path_liq_per_gpt, nz, nzh, n_chunks, chunk, per_gpt_axis
+        )
+      elif cloud_path_liq is not None:
+        cpl_int_z1c = _interior_zc(cloud_path_liq, nz, nzh)[:, jnp.newaxis, :]
+      if cloud_path_ice_per_gpt is not None:
+        cpi_packed = _pack_per_gpt_cloud_zc(
+            cloud_path_ice_per_gpt, nz, nzh, n_chunks, chunk, per_gpt_axis
+        )
+      elif cloud_path_ice is not None:
+        cpi_int_z1c = _interior_zc(cloud_path_ice, nz, nzh)[:, jnp.newaxis, :]
+    else:
+      cpl_b = (
+          None
+          if cloud_path_liq is None
+          else _interior_zc(cloud_path_liq, nz, nzh)[jnp.newaxis, :, :]
+      )
+      cpi_b = (
+          None
+          if cloud_path_ice is None
+          else _interior_zc(cloud_path_ice, nz, nzh)[jnp.newaxis, :, :]
+      )
+      cld_props_by_band = _cloud_props_from_mie(
+          optics_lib,
+          liq_mie,
+          ice_mie,
+          cpl_b,
+          cpi_b,
+          _scale_to_interior(
+              cloud_tau_scale_liq, nz, nzh, nc, with_middle_axis=False
+          ),
+          _scale_to_interior(
+              cloud_tau_scale_ice, nz, nzh, nc, with_middle_axis=False
+          ),
+          is_lw=True,
+      )
+
+  aer_int = (
+      None
+      if aerosol_optics is None
+      else {k: _interior_bzc(v, nz, nzh) for k, v in aerosol_optics.items()}
+  )
+
+  toa_flux_down_chunk = jnp.broadcast_to(
+      _to_1c(atmos_state.toa_flux_lw / n_gpt, nc, dtype), (chunk, nc)
+  )
+  sfc_emis_chunk = jnp.broadcast_to(
+      _to_1c(atmos_state.sfc_emis, nc, dtype), (chunk, nc)
+  )
+  sfc_refl_chunk = 1.0 - sfc_emis_chunk
+
+  valid_mask_4d = None
+  if needs_mask:
+    valid_np = (np.arange(n_chunks * chunk) < n_gpt).astype(np.float32)
+    valid_mask_4d = jnp.asarray(valid_np, dtype=dtype).reshape(
+        n_chunks, 1, chunk, 1
+    )
+
+  def step_fn(ichunk, cumulative):
+    bnd_oh = jax.lax.dynamic_index_in_dim(
+        bnd_oh_packed, ichunk, axis=0, keepdims=False
+    )
+    tau_g = jax.lax.dynamic_index_in_dim(
+        tau_packed, ichunk, axis=0, keepdims=False
+    )
+    pfrac = jax.lax.dynamic_index_in_dim(
+        pfrac_packed, ichunk, axis=0, keepdims=False
+    )
+
+    b_face_g = _band_to_zgc(bnd_oh, b_face)
+    psrc_top = pfrac[:-1] * b_face_g
+    psrc_bot_next = pfrac[1:] * b_face_g
+    prod = psrc_top * psrc_bot_next
+    pos = prod > 0.0
+    level_src = jnp.where(pos, jnp.sqrt(jnp.where(pos, prod, 1.0)), 0.0)
+    level_src_bottom = level_src[:-1]
+    level_src_top = level_src[1:]
+
+    b_sfc_g = jnp.matmul(
+        bnd_oh, b_sfc, precision=jax.lax.Precision.HIGHEST
+    )
+    sfc_src = pfrac[1] * b_sfc_g
+    lay_src = None
+    if need_lay_src:
+      assert b_lay is not None
+      lay_src = pfrac[1:-1] * _band_to_zgc(bnd_oh, b_lay)
+
+    zeros_g = jnp.zeros_like(tau_g)
+    gas_props = {
+        'optical_depth': tau_g,
+        'ssa': zeros_g,
+        'asymmetry_factor': zeros_g,
+    }
+    all_sky_props = gas_props
+    if has_cloud:
+      if per_gpt_cloud:
+        cpl_c = (
+            cpl_int_z1c
+            if cpl_packed is None
+            else jax.lax.dynamic_index_in_dim(
+                cpl_packed, ichunk, axis=0, keepdims=False
+            )
+        )
+        cpi_c = (
+            cpi_int_z1c
+            if cpi_packed is None
+            else jax.lax.dynamic_index_in_dim(
+                cpi_packed, ichunk, axis=0, keepdims=False
+            )
+        )
+        cld_props = _cloud_props_from_mie(
+            optics_lib,
+            liq_mie,
+            ice_mie,
+            cpl_c,
+            cpi_c,
+            scale_liq_z1c,
+            scale_ice_z1c,
+            is_lw=True,
+            bnd_oh_chunk=bnd_oh,
+        )
+      else:
+        assert cld_props_by_band is not None
+        cld_props = {
+            k: _band_to_zgc(bnd_oh, v) for k, v in cld_props_by_band.items()
+        }
+      all_sky_props = optics_lib.combine_optical_properties(
+          gas_props, cld_props
+      )
+
+    aer_chunk = (
+        None
+        if aer_int is None
+        else {k: _band_to_zgc(bnd_oh, v) for k, v in aer_int.items()}
+    )
+
+    def solve_one(props, aer):
+      if aer is not None:
+        props = optics_lib.combine_optical_properties(props, aer)
+      if lw_solver == LW_SOLVER_NOSCAT:
+        assert lay_src is not None
+        return _lw_noscat_transport_zc(
+            props['optical_depth'],
+            props['ssa'],
+            lay_src,
+            level_src_top,
+            level_src_bottom,
+            toa_flux_down_chunk,
+            sfc_src,
+            sfc_emis_chunk,
+            secant=lw_secant,
+        )
+      cell = monochromatic_two_stream.lw_cell_source_and_properties(
+          props['optical_depth'],
+          props['ssa'],
+          level_src_bottom,
+          level_src_top,
+          props['asymmetry_factor'],
+      )
+      sfc_emission = np.pi * sfc_emis_chunk * sfc_src
+      return _solve_rte_2stream_zc(
+          cell['t_diff'],
+          cell['r_diff'],
+          cell['src_up'],
+          cell['src_down'],
+          toa_flux_down_chunk,
+          sfc_emission,
+          sfc_refl_chunk,
+      )
+
+    per_chunk = _solve_problems(
+        solve_one,
+        all_sky_props,
+        gas_props if with_clear_sky else None,
+        aer_chunk,
+        with_clear_sky,
+        with_aerosol_free,
+    )
+    mask_g = (
+        None
+        if valid_mask_4d is None
+        else jax.lax.dynamic_index_in_dim(
+            valid_mask_4d, ichunk, axis=0, keepdims=False
+        )
+    )
+
+    def reduce_add(chunked: Array, acc: Array) -> Array:
+      if mask_g is not None:
+        chunked = chunked * mask_g
+      return jnp.sum(chunked, axis=1) + acc
+
+    return jax.tree.map(reduce_add, per_chunk, cumulative)
+
+  flux_keys = [
+      f'{prefix}{key}'
+      for prefix in _problem_prefixes(with_clear_sky, with_aerosol_free)
+      for key in ('flux_up', 'flux_down', 'flux_net')
+  ]
+  init_faces = {
+      key: jnp.zeros((nz + 1, nc), dtype=dtype) for key in flux_keys
+  }
+  summed_faces = jax.lax.fori_loop(0, n_chunks, step_fn, init_faces)
+  zero_halo = jnp.zeros((1, nc), dtype=dtype)
+  return {
+      key: jnp.concatenate([zero_halo, val], axis=0)
+      for key, val in summed_faces.items()
+  }
+
+
+def _sw_sfc_albedo_by_band_zc(
+    albedo: Array | float,
+    nc: int,
+    n_bnd: int,
+    name: str,
+    dtype: jnp.dtype,
+) -> Array | None:
+  """Resolve SW surface albedo into `(n_bnd, nc)` when per-band, else `None`."""
+  shape = tuple(np.shape(albedo))
+  if len(shape) == 0 or shape in ((nc,), (1,)):
+    return None
+  if len(shape) == 2 and shape[0] == n_bnd and shape[1] in (1, nc):
+    return jnp.broadcast_to(jnp.asarray(albedo, dtype=dtype), (n_bnd, nc))
+  if (
+      len(shape) >= 1
+      and shape[-1] == n_bnd
+      and np.broadcast_shapes(shape[:-1], (nc,)) == (nc,)
+  ):
+    return jnp.broadcast_to(jnp.asarray(albedo, dtype=dtype), (nc, n_bnd)).T
+  raise ValueError(
+      f'{name} has shape {shape}, incompatible with nc={nc}, n_bnd_sw={n_bnd}.'
+  )
+
+
+def solve_sw_zc(
+    pressure: Array,
+    temperature: Array,
+    molecules: Array,
+    optics_lib: optics.RRTMOptics,
+    atmos_state: AtmosphericState,
+    vmr_fields: Mapping[str | int, Array] | None = None,
+    cloud_r_eff_liq: Array | None = None,
+    cloud_path_liq: Array | None = None,
+    cloud_r_eff_ice: Array | None = None,
+    cloud_path_ice: Array | None = None,
+    cloud_path_liq_per_gpt: Array | None = None,
+    cloud_path_ice_per_gpt: Array | None = None,
+    aerosol_optics: Mapping[str, Array] | None = None,
+    gpt_chunk: int = 64,
+    cloud_tau_scale_liq: Array | float | None = None,
+    cloud_tau_scale_ice: Array | float | None = None,
+    sfc_alb_dir: Array | float | None = None,
+    sfc_alb_dif: Array | float | None = None,
+    with_clear_sky: bool = False,
+    with_aerosol_free: bool = False,
+    *,
+    per_gpt_axis: int = 1,
+) -> dict[str, Array]:
+  """Column-minor `(nzh, nc)` shortwave radiative transfer solver for TPU."""
+  nzh, nc = temperature.shape
+  nz = nzh - 2
+  dtype = temperature.dtype
+  lookup_sw = optics_lib.gas_optics_sw
+  assert lookup_sw is not None
+  n_gpt = optics_lib.n_gpt_sw
+  n_bnd = lookup_sw.n_bnd
+  chunk, n_chunks, needs_mask = _tpu_gpt_chunk_plan(n_gpt, gpt_chunk)
+
+  alb_dir_by_band = (
+      None
+      if sfc_alb_dir is None
+      else _sw_sfc_albedo_by_band_zc(
+          sfc_alb_dir, nc, n_bnd, 'sfc_alb_dir', dtype
+      )
+  )
+  alb_dif_by_band = (
+      None
+      if sfc_alb_dif is None
+      else _sw_sfc_albedo_by_band_zc(
+          sfc_alb_dif, nc, n_bnd, 'sfc_alb_dif', dtype
+      )
+  )
+
+  vmr_idx = (
+      None
+      if vmr_fields is None
+      else {
+          k: _interior_zc(v, nz, nzh)
+          for k, v in _reindex_vmr_fields(vmr_fields, lookup_sw).items()
+      }
+  )
+  # Nothing in `solve_sw` ever reads the z halos: evaluate SW gas optics on
+  # interior `(nz, nc)` cells directly.
+  gas_all = optics_lib.compute_gas_optics_all_gpts_zc(
+      pressure[1:-1, :],
+      temperature[1:-1, :],
+      molecules[1:-1, :],
+      vmr_idx,
+      is_lw=False,
+  )
+  tau_packed = _pack_gpt_zc_to_chunks(gas_all['optical_depth'], n_chunks, chunk)
+  rayl_packed = _pack_gpt_zc_to_chunks(gas_all['rayleigh'], n_chunks, chunk)
+
+  bnd_oh_packed = _band_oh_packed(
+      lookup_sw.g_point_to_bnd, n_bnd, n_chunks, chunk, dtype
+  )
+  pad_g = n_chunks * chunk - n_gpt
+  sfrac = jnp.asarray(optics_lib.solar_fraction_by_gpt, dtype=dtype)
+  if pad_g:
+    sfrac = jnp.concatenate([sfrac, jnp.repeat(sfrac[-1:], pad_g)], axis=0)
+  solar_frac_packed = sfrac.reshape(n_chunks, chunk, 1)
+  irrad_1c = _to_1c(atmos_state.irrad, nc, dtype)
+
+  zenith = atmos_state.zenith
+  if jnp.ndim(zenith) > 0:
+    zenith = jnp.broadcast_to(jnp.asarray(zenith, dtype=dtype), (nc,))
+  night = zenith >= 0.5 * jnp.pi
+  safe_zenith = jnp.where(
+      night, jnp.zeros_like(jnp.asarray(zenith, dtype=dtype)), zenith
+  )
+  if jnp.ndim(safe_zenith) > 0:
+    safe_zenith_3d = safe_zenith.reshape(1, 1, nc)
+    mu_1c = jnp.cos(safe_zenith).reshape(1, nc)
+    mu_z1c = mu_1c[jnp.newaxis, :, :]
+  else:
+    safe_zenith_3d = safe_zenith
+    mu_1c = jnp.cos(safe_zenith)
+    mu_z1c = mu_1c
+
+  sfc_alb_default = jnp.broadcast_to(
+      _to_1c(atmos_state.sfc_alb, nc, dtype), (chunk, nc)
+  )
+  alb_dir_const = (
+      sfc_alb_default
+      if sfc_alb_dir is None
+      else (
+          None
+          if alb_dir_by_band is not None
+          else jnp.broadcast_to(_to_1c(sfc_alb_dir, nc, dtype), (chunk, nc))
+      )
+  )
+  alb_dif_const = (
+      sfc_alb_default
+      if sfc_alb_dif is None
+      else (
+          None
+          if alb_dif_by_band is not None
+          else jnp.broadcast_to(_to_1c(sfc_alb_dif, nc, dtype), (chunk, nc))
+      )
+  )
+
+  has_liq = cloud_path_liq_per_gpt is not None or cloud_path_liq is not None
+  has_ice = cloud_path_ice_per_gpt is not None or cloud_path_ice is not None
+  has_cloud = has_liq or has_ice
+  per_gpt_cloud = (
+      cloud_path_liq_per_gpt is not None or cloud_path_ice_per_gpt is not None
+  )
+
+  liq_mie = ice_mie = None
+  cld_props_by_band = None
+  cpl_packed = cpi_packed = None
+  cpl_int_z1c = cpi_int_z1c = None
+  scale_liq_z1c = scale_ice_z1c = None
+
+  if has_cloud:
+    assert optics_lib.cloud_optics_sw is not None
+    liq_mie, ice_mie = _cloud_mie_tables_mxu(
+        optics_lib.cloud_optics_sw,
+        _interior_zc(cloud_r_eff_liq, nz, nzh),
+        _interior_zc(cloud_r_eff_ice, nz, nzh),
+        has_liq,
+        has_ice,
+        nz,
+        nc,
+        dtype,
+    )
+    if per_gpt_cloud:
+      scale_liq_z1c = _scale_to_interior(
+          cloud_tau_scale_liq, nz, nzh, nc, with_middle_axis=True
+      )
+      scale_ice_z1c = _scale_to_interior(
+          cloud_tau_scale_ice, nz, nzh, nc, with_middle_axis=True
+      )
+      if cloud_path_liq_per_gpt is not None:
+        cpl_packed = _pack_per_gpt_cloud_zc(
+            cloud_path_liq_per_gpt, nz, nzh, n_chunks, chunk, per_gpt_axis
+        )
+      elif cloud_path_liq is not None:
+        cpl_int_z1c = _interior_zc(cloud_path_liq, nz, nzh)[:, jnp.newaxis, :]
+      if cloud_path_ice_per_gpt is not None:
+        cpi_packed = _pack_per_gpt_cloud_zc(
+            cloud_path_ice_per_gpt, nz, nzh, n_chunks, chunk, per_gpt_axis
+        )
+      elif cloud_path_ice is not None:
+        cpi_int_z1c = _interior_zc(cloud_path_ice, nz, nzh)[:, jnp.newaxis, :]
+    else:
+      cpl_b = (
+          None
+          if cloud_path_liq is None
+          else _interior_zc(cloud_path_liq, nz, nzh)[jnp.newaxis, :, :]
+      )
+      cpi_b = (
+          None
+          if cloud_path_ice is None
+          else _interior_zc(cloud_path_ice, nz, nzh)[jnp.newaxis, :, :]
+      )
+      cld_props_by_band = _cloud_props_from_mie(
+          optics_lib,
+          liq_mie,
+          ice_mie,
+          cpl_b,
+          cpi_b,
+          _scale_to_interior(
+              cloud_tau_scale_liq, nz, nzh, nc, with_middle_axis=False
+          ),
+          _scale_to_interior(
+              cloud_tau_scale_ice, nz, nzh, nc, with_middle_axis=False
+          ),
+          is_lw=False,
+      )
+
+  aer_int = (
+      None
+      if aerosol_optics is None
+      else {k: _interior_bzc(v, nz, nzh) for k, v in aerosol_optics.items()}
+  )
+
+  zeros_chunk = jnp.zeros((chunk, nc), dtype=dtype)
+  valid_mask_4d = valid_mask_3d = None
+  if needs_mask:
+    valid_np = (np.arange(n_chunks * chunk) < n_gpt).astype(np.float32)
+    valid_arr = jnp.asarray(valid_np, dtype=dtype)
+    valid_mask_4d = valid_arr.reshape(n_chunks, 1, chunk, 1)
+    valid_mask_3d = valid_arr.reshape(n_chunks, chunk, 1)
+
+  def step_fn(ichunk, cumulative):
+    bnd_oh = jax.lax.dynamic_index_in_dim(
+        bnd_oh_packed, ichunk, axis=0, keepdims=False
+    )
+    tau_abs = jax.lax.dynamic_index_in_dim(
+        tau_packed, ichunk, axis=0, keepdims=False
+    )
+    rayl = jax.lax.dynamic_index_in_dim(
+        rayl_packed, ichunk, axis=0, keepdims=False
+    )
+    solar_frac = jax.lax.dynamic_index_in_dim(
+        solar_frac_packed, ichunk, axis=0, keepdims=False
+    )
+    toa_flux = jnp.broadcast_to(irrad_1c * solar_frac, (chunk, nc))
+    flux_down_direct_bc = toa_flux * mu_1c
+
+    sfc_albedo_dir = (
+        alb_dir_const
+        if alb_dir_const is not None
+        else jnp.matmul(
+            bnd_oh, alb_dir_by_band, precision=jax.lax.Precision.HIGHEST
+        )
+    )
+    sfc_albedo_dif = (
+        alb_dif_const
+        if alb_dif_const is not None
+        else jnp.matmul(
+            bnd_oh, alb_dif_by_band, precision=jax.lax.Precision.HIGHEST
+        )
+    )
+
+    gas_props = optics_lib._sw_gas_properties(tau_abs, rayl)  # pylint: disable=protected-access
+    all_sky_props = gas_props
+    if has_cloud:
+      if per_gpt_cloud:
+        cpl_c = (
+            cpl_int_z1c
+            if cpl_packed is None
+            else jax.lax.dynamic_index_in_dim(
+                cpl_packed, ichunk, axis=0, keepdims=False
+            )
+        )
+        cpi_c = (
+            cpi_int_z1c
+            if cpi_packed is None
+            else jax.lax.dynamic_index_in_dim(
+                cpi_packed, ichunk, axis=0, keepdims=False
+            )
+        )
+        cld_props = _cloud_props_from_mie(
+            optics_lib,
+            liq_mie,
+            ice_mie,
+            cpl_c,
+            cpi_c,
+            scale_liq_z1c,
+            scale_ice_z1c,
+            is_lw=False,
+            bnd_oh_chunk=bnd_oh,
+        )
+      else:
+        assert cld_props_by_band is not None
+        cld_props = {
+            k: _band_to_zgc(bnd_oh, v) for k, v in cld_props_by_band.items()
+        }
+      all_sky_props = optics_lib.combine_optical_properties(
+          gas_props, cld_props
+      )
+
+    aer_chunk = (
+        None
+        if aer_int is None
+        else {k: _band_to_zgc(bnd_oh, v) for k, v in aer_int.items()}
+    )
+
+    def solve_one(props, aer):
+      if aer is not None:
+        props = optics_lib.combine_optical_properties(props, aer)
+      cell = monochromatic_two_stream.sw_cell_properties(
+          safe_zenith_3d,
+          props['optical_depth'],
+          props['ssa'],
+          props['asymmetry_factor'],
+      )
+      tau_pos = jnp.maximum(props['optical_depth'], 0.0)
+      t_noscat = jnp.exp(-tau_pos / mu_z1c)
+
+      def direct_op(carry_above, w):
+        below = w * carry_above
+        return below, (below, carry_above)
+
+      flux_down_sfc, (fdir_int, fdir_above) = jax.lax.scan(
+          direct_op, flux_down_direct_bc, t_noscat, reverse=True
+      )
+      src_up = cell['r_dir'] * fdir_above
+      src_down = cell['t_dir'] * fdir_above
+      sfc_src = sfc_albedo_dir * flux_down_sfc
+
+      diff_fluxes = _solve_rte_2stream_zc(
+          cell['t_diff'],
+          cell['r_diff'],
+          src_up,
+          src_down,
+          zeros_chunk,
+          sfc_src,
+          sfc_albedo_dif,
+      )
+      fdir_faces = jnp.concatenate(
+          [fdir_int, flux_down_direct_bc[jnp.newaxis, :, :]], axis=0
+      )
+      flux_up = diff_fluxes['flux_up']
+      flux_down = diff_fluxes['flux_down'] + fdir_faces
+      return {
+          'flux_up': flux_up,
+          'flux_down': flux_down,
+          'flux_net': flux_up - flux_down,
+          'flux_down_dir_sfc': flux_down_sfc,
+      }
+
+    per_chunk = _solve_problems(
+        solve_one,
+        all_sky_props,
+        gas_props if with_clear_sky else None,
+        aer_chunk,
+        with_clear_sky,
+        with_aerosol_free,
+    )
+    mask_4d = (
+        None
+        if valid_mask_4d is None
+        else jax.lax.dynamic_index_in_dim(
+            valid_mask_4d, ichunk, axis=0, keepdims=False
+        )
+    )
+    mask_3d = (
+        None
+        if valid_mask_3d is None
+        else jax.lax.dynamic_index_in_dim(
+            valid_mask_3d, ichunk, axis=0, keepdims=False
+        )
+    )
+
+    def reduce_add(chunked: Array, acc: Array) -> Array:
+      if chunked.ndim == 3:
+        if mask_4d is not None:
+          chunked = chunked * mask_4d
+        return jnp.sum(chunked, axis=1) + acc
+      if mask_3d is not None:
+        chunked = chunked * mask_3d
+      return jnp.sum(chunked, axis=0) + acc
+
+    return jax.tree.map(reduce_add, per_chunk, cumulative)
+
+  init_faces = {}
+  for prefix in _problem_prefixes(with_clear_sky, with_aerosol_free):
+    for key in ('flux_up', 'flux_down', 'flux_net'):
+      init_faces[f'{prefix}{key}'] = jnp.zeros((nz + 1, nc), dtype=dtype)
+    init_faces[f'{prefix}flux_down_dir_sfc'] = jnp.zeros((nc,), dtype=dtype)
+
+  summed = jax.lax.fori_loop(0, n_chunks, step_fn, init_faces)
+  zero_halo = jnp.zeros((1, nc), dtype=dtype)
+  out = {}
+  for key, val in summed.items():
+    if val.ndim == 2:
+      val = jnp.concatenate([zero_halo, val], axis=0)
+    mask_n = night[jnp.newaxis, :] if (jnp.ndim(night) == 1 and val.ndim == 2) else night
+    out[key] = jnp.where(mask_n, jnp.zeros_like(val), val)
+  return out
+
+
+def compute_heating_rate_zc(
+    flux_net_zc: Array,
+    pressure_zc: Array,
+    q_v_zc: Array | None = None,
+) -> Array:
+  """Column-minor `(nzh, nc)` counterpart of `compute_heating_rate`."""
+  dp = 0.5 * (
+      jnp.roll(pressure_zc, -1, axis=0) - jnp.roll(pressure_zc, 1, axis=0)
+  )
+  dflux = jnp.roll(flux_net_zc, -1, axis=0) - flux_net_zc
+  cp = constants.CP_D
+  if q_v_zc is not None:
+    cp = cp + (constants.CP_V - constants.CP_D) * q_v_zc
+  return constants.G * dflux / dp / cp
+
+
+def _atmos_state_3d_to_c(
+    atmos_state: AtmosphericState, nx: int, ny: int
+) -> AtmosphericState:
+  """Flatten any non-scalar `(nx, ny)` fields on `atmos_state` to `(nx * ny,)`."""
+  nc = nx * ny
+  updates = {}
+  for field_name in ('zenith', 'irrad', 'sfc_alb', 'sfc_emis', 'toa_flux_lw'):
+    val = getattr(atmos_state, field_name)
+    if jnp.ndim(val) > 0:
+      updates[field_name] = jnp.broadcast_to(jnp.asarray(val), (nx, ny)).reshape(nc)
+  return dataclasses.replace(atmos_state, **updates) if updates else atmos_state
+
+
+def _to_zc_3d(x: Array | None, nx: int, ny: int, nzh: int) -> Array | None:
+  """Transpose `(nx, ny, nzh)` (or broadcastable) to `(nzh, nx * ny)`."""
+  if x is None:
+    return None
+  if x.shape != (nx, ny, nzh):
+    x = jnp.broadcast_to(x, (nx, ny, nzh))
+  return jnp.moveaxis(x, 2, 0).reshape(nzh, nx * ny)
+
+
+def _scale_3d_to_zc(
+    scale: Array | float | None, nx: int, ny: int, nzh: int
+) -> Array | float | None:
+  if scale is None or jnp.ndim(scale) == 0:
+    return scale
+  return _to_zc_3d(jnp.asarray(scale), nx, ny, nzh)
+
+
+def _solve_lw_3d_via_zc(
+    pressure: Array,
+    temperature: Array,
+    molecules: Array,
+    optics_lib: optics.RRTMOptics,
+    atmos_state: AtmosphericState,
+    *,
+    vmr_fields: dict[int, Array] | None,
+    sfc_temperature: Array | float | None,
+    cloud_r_eff_liq: Array | None,
+    cloud_path_liq: Array | None,
+    cloud_r_eff_ice: Array | None,
+    cloud_path_ice: Array | None,
+    cloud_path_liq_per_gpt: Array | None,
+    cloud_path_ice_per_gpt: Array | None,
+    aerosol_optics: dict[str, Array] | None,
+    gpt_chunk: int,
+    cloud_tau_scale_liq: Array | float | None,
+    cloud_tau_scale_ice: Array | float | None,
+    with_clear_sky: bool,
+    lw_solver: str,
+    lw_secant: float,
+    with_aerosol_free: bool,
+) -> dict[str, Array]:
+  """Bridge 3-D `(nx, ny, nzh)` `solve_lw` onto `solve_lw_zc`."""
+  nx, ny, nzh = temperature.shape
+  nc = nx * ny
+  sfc_t = (
+      sfc_temperature
+      if sfc_temperature is None or jnp.ndim(sfc_temperature) == 0
+      else jnp.broadcast_to(jnp.asarray(sfc_temperature), (nx, ny)).reshape(nc)
+  )
+  vmr_zc = (
+      None
+      if vmr_fields is None
+      else {k: _to_zc_3d(v, nx, ny, nzh) for k, v in vmr_fields.items()}
+  )
+  cpl_pg = (
+      None
+      if cloud_path_liq_per_gpt is None
+      else jnp.moveaxis(cloud_path_liq_per_gpt, 3, 1).reshape(
+          cloud_path_liq_per_gpt.shape[0], nzh, nc
+      )
+  )
+  cpi_pg = (
+      None
+      if cloud_path_ice_per_gpt is None
+      else jnp.moveaxis(cloud_path_ice_per_gpt, 3, 1).reshape(
+          cloud_path_ice_per_gpt.shape[0], nzh, nc
+      )
+  )
+  aer_zc = (
+      None
+      if aerosol_optics is None
+      else {
+          k: jnp.moveaxis(v, 3, 1).reshape(v.shape[0], nzh, nc)
+          for k, v in aerosol_optics.items()
+      }
+  )
+  out_zc = solve_lw_zc(
+      _to_zc_3d(pressure, nx, ny, nzh),
+      _to_zc_3d(temperature, nx, ny, nzh),
+      _to_zc_3d(molecules, nx, ny, nzh),
+      optics_lib,
+      _atmos_state_3d_to_c(atmos_state, nx, ny),
+      vmr_fields=vmr_zc,
+      sfc_temperature=sfc_t,
+      cloud_r_eff_liq=_to_zc_3d(cloud_r_eff_liq, nx, ny, nzh),
+      cloud_path_liq=_to_zc_3d(cloud_path_liq, nx, ny, nzh),
+      cloud_r_eff_ice=_to_zc_3d(cloud_r_eff_ice, nx, ny, nzh),
+      cloud_path_ice=_to_zc_3d(cloud_path_ice, nx, ny, nzh),
+      cloud_path_liq_per_gpt=cpl_pg,
+      cloud_path_ice_per_gpt=cpi_pg,
+      aerosol_optics=aer_zc,
+      gpt_chunk=gpt_chunk,
+      cloud_tau_scale_liq=_scale_3d_to_zc(cloud_tau_scale_liq, nx, ny, nzh),
+      cloud_tau_scale_ice=_scale_3d_to_zc(cloud_tau_scale_ice, nx, ny, nzh),
+      with_clear_sky=with_clear_sky,
+      lw_solver=lw_solver,
+      lw_secant=lw_secant,
+      with_aerosol_free=with_aerosol_free,
+      per_gpt_axis=0,
+  )
+  return {
+      k: jnp.moveaxis(v.reshape(nzh, nx, ny), 0, 2) for k, v in out_zc.items()
+  }
+
+
+def _solve_sw_3d_via_zc(
+    pressure: Array,
+    temperature: Array,
+    molecules: Array,
+    optics_lib: optics.RRTMOptics,
+    atmos_state: AtmosphericState,
+    *,
+    vmr_fields: dict[int, Array] | None,
+    cloud_r_eff_liq: Array | None,
+    cloud_path_liq: Array | None,
+    cloud_r_eff_ice: Array | None,
+    cloud_path_ice: Array | None,
+    cloud_path_liq_per_gpt: Array | None,
+    cloud_path_ice_per_gpt: Array | None,
+    aerosol_optics: dict[str, Array] | None,
+    gpt_chunk: int,
+    cloud_tau_scale_liq: Array | float | None,
+    cloud_tau_scale_ice: Array | float | None,
+    sfc_alb_dir: Array | float | None,
+    sfc_alb_dif: Array | float | None,
+    with_clear_sky: bool,
+    with_aerosol_free: bool,
+) -> dict[str, Array]:
+  """Bridge 3-D `(nx, ny, nzh)` `solve_sw` onto `solve_sw_zc`."""
+  nx, ny, nzh = temperature.shape
+  nc = nx * ny
+  plane = (nx, ny)
+  alb_dir_by_band = (
+      None
+      if sfc_alb_dir is None
+      else _sw_sfc_albedo_by_band(sfc_alb_dir, plane, optics_lib, 'sfc_alb_dir')
+  )
+  alb_dif_by_band = (
+      None
+      if sfc_alb_dif is None
+      else _sw_sfc_albedo_by_band(sfc_alb_dif, plane, optics_lib, 'sfc_alb_dif')
+  )
+
+  def _resolve_alb_arg(alb, by_band):
+    if alb is None:
+      return None
+    if by_band is not None:
+      return by_band.reshape(by_band.shape[0], nc)
+    if jnp.ndim(alb) == 0:
+      return alb
+    return jnp.broadcast_to(jnp.asarray(alb), plane).reshape(nc)
+
+  vmr_zc = (
+      None
+      if vmr_fields is None
+      else {k: _to_zc_3d(v, nx, ny, nzh) for k, v in vmr_fields.items()}
+  )
+  cpl_pg = (
+      None
+      if cloud_path_liq_per_gpt is None
+      else jnp.moveaxis(cloud_path_liq_per_gpt, 3, 1).reshape(
+          cloud_path_liq_per_gpt.shape[0], nzh, nc
+      )
+  )
+  cpi_pg = (
+      None
+      if cloud_path_ice_per_gpt is None
+      else jnp.moveaxis(cloud_path_ice_per_gpt, 3, 1).reshape(
+          cloud_path_ice_per_gpt.shape[0], nzh, nc
+      )
+  )
+  aer_zc = (
+      None
+      if aerosol_optics is None
+      else {
+          k: jnp.moveaxis(v, 3, 1).reshape(v.shape[0], nzh, nc)
+          for k, v in aerosol_optics.items()
+      }
+  )
+  out_zc = solve_sw_zc(
+      _to_zc_3d(pressure, nx, ny, nzh),
+      _to_zc_3d(temperature, nx, ny, nzh),
+      _to_zc_3d(molecules, nx, ny, nzh),
+      optics_lib,
+      _atmos_state_3d_to_c(atmos_state, nx, ny),
+      vmr_fields=vmr_zc,
+      cloud_r_eff_liq=_to_zc_3d(cloud_r_eff_liq, nx, ny, nzh),
+      cloud_path_liq=_to_zc_3d(cloud_path_liq, nx, ny, nzh),
+      cloud_r_eff_ice=_to_zc_3d(cloud_r_eff_ice, nx, ny, nzh),
+      cloud_path_ice=_to_zc_3d(cloud_path_ice, nx, ny, nzh),
+      cloud_path_liq_per_gpt=cpl_pg,
+      cloud_path_ice_per_gpt=cpi_pg,
+      aerosol_optics=aer_zc,
+      gpt_chunk=gpt_chunk,
+      cloud_tau_scale_liq=_scale_3d_to_zc(cloud_tau_scale_liq, nx, ny, nzh),
+      cloud_tau_scale_ice=_scale_3d_to_zc(cloud_tau_scale_ice, nx, ny, nzh),
+      sfc_alb_dir=_resolve_alb_arg(sfc_alb_dir, alb_dir_by_band),
+      sfc_alb_dif=_resolve_alb_arg(sfc_alb_dif, alb_dif_by_band),
+      with_clear_sky=with_clear_sky,
+      with_aerosol_free=with_aerosol_free,
+      per_gpt_axis=0,
+  )
+  return {
+      k: (
+          v.reshape(nx, ny)
+          if v.ndim == 1
+          else jnp.moveaxis(v.reshape(nzh, nx, ny), 0, 2)
+      )
+      for k, v in out_zc.items()
+  }

@@ -261,6 +261,19 @@ def recurrent_op_with_halos(
   else:
     carry, output = recurrent_op(f, init, inputs, forward, fence_chain)
 
+  if jax.default_backend() == 'tpu':
+    # Restore halo layers via concatenation rather than `.at[...].set(...)` so
+    # `vmap` never lowers halo updates into indexed scatters on TPU.
+    zeros_halo = jnp.zeros_like(init)[..., jnp.newaxis]
+    init_halo = init[..., jnp.newaxis]
+    if forward:
+      output = jnp.concatenate([init_halo, output, zeros_halo], axis=-1)
+    else:
+      output = jnp.concatenate([zeros_halo, output, init_halo], axis=-1)
+    if use_scan:
+      return carry, output
+    return jax.lax.optimization_barrier((carry, output))
+
   # Step 3. Pad result with halo layers that were removed so the output shape
   # matches the input shape. The values in the halos are set to be zero.
   output = jnp.pad(

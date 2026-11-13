@@ -52,11 +52,20 @@ def reconstruct_face_values(f: Array, f_lower_bc: Array) -> tuple[Array, Array]:
   # f is f_ccc.
   # Use WENO5.
 
-  # Set halo value to the BC wall value.
-  f = f.at[:, :, 0].set(f_lower_bc)
+  if jax.default_backend() == 'tpu':
+    # Set lower halo to the BC wall value and upper halo to Neumann BC via
+    # concatenation rather than `.at[...].set(...)` so `vmap` never lowers halo
+    # updates into indexed scatters on TPU.
+    f = jnp.concatenate(
+        [f_lower_bc[..., jnp.newaxis], f[:, :, 1:-1], f[:, :, -2:-1]],
+        axis=2,
+    )
+  else:
+    # Set halo value to the BC wall value.
+    f = f.at[:, :, 0].set(f_lower_bc)
 
-  # Enforce Neumann BC on the upper halo value.
-  f = f.at[:, :, -1].set(f[:, :, -2])
+    # Enforce Neumann BC on the upper halo value.
+    f = f.at[:, :, -1].set(f[:, :, -2])
 
   f_face_plus, f_face_minus = interpolation.weno5_node_to_face_for_rrtmgp(
       f, dim=2, f_lower_bc=f_lower_bc, neumann_upper_bc=True
@@ -68,10 +77,16 @@ def reconstruct_face_values(f: Array, f_lower_bc: Array) -> tuple[Array, Array]:
   # Use centered interpolation: UNSTABLE.
   # f_bottom_ccf = interpolation.z_c_to_f(f)
 
-  f_top = _shift_down(f_bottom_ccf)
-  # Update the f_top face (wall) value.
-  # Look into what is the appropriate BC here.
-  f_top = f_top.at[:, :, -1].set(f_top[:, :, -2])
+  if jax.default_backend() == 'tpu':
+    f_top = jnp.concatenate(
+        [f_bottom_ccf[:, :, 1:], f_bottom_ccf[:, :, -1:]],
+        axis=2,
+    )
+  else:
+    f_top = _shift_down(f_bottom_ccf)
+    # Update the f_top face (wall) value.
+    # Look into what is the appropriate BC here.
+    f_top = f_top.at[:, :, -1].set(f_top[:, :, -2])
   return f_bottom_ccf, f_top
 
 

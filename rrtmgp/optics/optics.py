@@ -469,6 +469,71 @@ class RRTMOptics(optics_base.OpticsScheme):
         'asymmetry_factor': jnp.zeros_like(ssa),
     }
 
+  def compute_gas_optics_all_gpts_zc(
+      self,
+      pressure: Array,
+      temperature: Array,
+      molecules: Array,
+      vmr_fields: dict[int, Array] | None = None,
+      *,
+      is_lw: bool,
+  ) -> dict[str, Array]:
+    """Column-minor `(nz_or_nzh, nc)` gas optics of every g-point in one pass."""
+    lookup = self.gas_optics_lw if is_lw else self.gas_optics_sw
+    interp = gas_optics.CellInterpolation(
+        lookup, self.vmr_lib, temperature, pressure, vmr_fields
+    )
+    with jax.named_scope('gas_optics'):
+      if (
+          not is_lw
+          and jax.default_backend() == 'tpu'
+          and temperature.ndim > 0
+          and temperature.size > 0
+      ):
+        tau, rayl = gas_optics.compute_sw_optical_and_rayleigh_all_gpts_mxu(
+            lookup,
+            self.vmr_lib,
+            molecules,
+            temperature,
+            pressure,
+            vmr_fields,
+            interp=interp,
+        )
+        return {'optical_depth': tau, 'rayleigh': rayl}
+      out = {}
+      with jax.named_scope('tau'):
+        out['optical_depth'] = gas_optics.compute_optical_depth_all_gpts(
+            lookup,
+            self.vmr_lib,
+            molecules,
+            temperature,
+            pressure,
+            vmr_fields,
+            interp=interp,
+        )
+      if is_lw:
+        with jax.named_scope('planck'):
+          out['planck_fraction'] = gas_optics.compute_planck_fraction_all_gpts(
+              lookup,
+              self.vmr_lib,
+              pressure,
+              temperature,
+              vmr_fields,
+              interp=interp,
+          )
+      else:
+        with jax.named_scope('rayleigh'):
+          out['rayleigh'] = gas_optics.compute_rayleigh_optical_depth_all_gpts(
+              lookup,
+              self.vmr_lib,
+              molecules,
+              temperature,
+              pressure,
+              vmr_fields,
+              interp=interp,
+          )
+    return out
+
   def compute_gas_optics_all_gpts(
       self,
       pressure: Array,
@@ -508,30 +573,40 @@ class RRTMOptics(optics_base.OpticsScheme):
       absorption optical depth alone, as `compute_gas_optical_properties`
       forms the Rayleigh sum itself.
     """
-    lookup = self.gas_optics_lw if is_lw else self.gas_optics_sw
-    interp = gas_optics.CellInterpolation(
-        lookup, self.vmr_lib, temperature, pressure, vmr_fields
+    if (
+        jax.default_backend() == 'tpu'
+        and temperature.ndim == 3
+        and temperature.size > 0
+    ):
+      nx, ny, nzh = temperature.shape
+      nc = nx * ny
+
+      def _to_zc(x: Array) -> Array:
+        if jnp.ndim(x) == 0:
+          return x
+        if x.shape != (nx, ny, nzh):
+          x = jnp.broadcast_to(x, (nx, ny, nzh))
+        return jnp.moveaxis(x, 2, 0).reshape(nzh, nc)
+
+      vmr_zc = (
+          None
+          if vmr_fields is None
+          else {k: _to_zc(v) for k, v in vmr_fields.items()}
+      )
+      out_zc = self.compute_gas_optics_all_gpts_zc(
+          _to_zc(pressure),
+          _to_zc(temperature),
+          _to_zc(molecules),
+          vmr_zc,
+          is_lw=is_lw,
+      )
+      return {
+          k: jnp.moveaxis(v.reshape(v.shape[0], nzh, nx, ny), 1, -1)
+          for k, v in out_zc.items()
+      }
+    return self.compute_gas_optics_all_gpts_zc(
+        pressure, temperature, molecules, vmr_fields, is_lw=is_lw
     )
-    with jax.named_scope('gas_optics'):
-      out = {}
-      with jax.named_scope('tau'):
-        out['optical_depth'] = gas_optics.compute_optical_depth_all_gpts(
-            lookup, self.vmr_lib, molecules, temperature, pressure, vmr_fields,
-            interp=interp,
-        )
-      if is_lw:
-        with jax.named_scope('planck'):
-          out['planck_fraction'] = gas_optics.compute_planck_fraction_all_gpts(
-              lookup, self.vmr_lib, pressure, temperature, vmr_fields,
-              interp=interp,
-          )
-      else:
-        with jax.named_scope('rayleigh'):
-          out['rayleigh'] = gas_optics.compute_rayleigh_optical_depth_all_gpts(
-              lookup, self.vmr_lib, molecules, temperature, pressure,
-              vmr_fields, interp=interp,
-          )
-    return out
 
   def gas_optical_properties_from_all_gpts(
       self, gas_optics_all_gpts: Mapping[str, Array], igpt: Array, is_lw: bool
