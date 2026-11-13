@@ -66,7 +66,7 @@ def _load_data(
       data['temperature_ref_min'],
       data['temperature_ref_max'],
       data['n_t_plnk'],
-      dtype=jnp.float_,
+      dtype=float,
   )
   data['totplnk'] = tables['totplnk']
   return data

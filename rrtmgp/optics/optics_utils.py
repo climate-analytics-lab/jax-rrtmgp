@@ -243,7 +243,7 @@ def floor_idx(f: Array, reference_values: Array) -> Array:
   delta = reference_values[1] - reference_values[0]
   size = reference_values.shape[0]
   truncated_div = jnp.floor_divide(f - reference_values[0], delta)
-  truncated_div = truncated_div.astype(jnp.int_)
+  truncated_div = truncated_div.astype(int)
   return jnp.clip(truncated_div, 0, size - 1)
 
 
@@ -298,7 +298,7 @@ def _interval_idx(f: Array, reference_values: Array) -> Array:
   delta = reference_values[1] - reference_values[0]
   size = reference_values.shape[0]
   truncated_div = jnp.floor_divide(f - reference_values[0], delta)
-  truncated_div = truncated_div.astype(jnp.int_)
+  truncated_div = truncated_div.astype(int)
   return jnp.clip(truncated_div, 0, size - 2)
 
 

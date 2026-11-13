@@ -88,7 +88,7 @@ def _mixing_fraction_interpolant(
   other gas-optics axes.
   """
   return optics_utils.create_linear_interpolant(
-      f, jnp.linspace(0.0, 1.0, n_mixing_fraction, dtype=jnp.float_)
+      f, jnp.linspace(0.0, 1.0, n_mixing_fraction, dtype=float)
   )
 
 
@@ -147,7 +147,7 @@ def get_vmr(
     vmr_gm[idx_gases[k]] = v
 
   vmr = optics_utils.lookup_values(
-      jnp.stack(vmr_gm, dtype=jnp.float_), (species_idx,)
+      jnp.stack(vmr_gm, dtype=float), (species_idx,)
   )
 
   # Overwrite with available precomputed vmr.

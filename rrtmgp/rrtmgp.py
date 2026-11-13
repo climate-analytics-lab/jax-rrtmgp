@@ -79,7 +79,8 @@ def _horiz_mean(f: Array) -> Array:
   Returns:
     The horizontal mean of `f`.
   """
-  return jnp.mean(f, axis=(0, 1), dtype=jnp.float64).astype(jnp.float32)
+  acc_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+  return jnp.mean(f, axis=(0, 1), dtype=acc_dtype).astype(jnp.float32)
 
 
 def _horiz_mean_zc(f_zc: Array) -> Array:

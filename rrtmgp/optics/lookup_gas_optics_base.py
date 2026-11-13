@@ -182,7 +182,7 @@ def _create_rrtm_consistent_minor_gas_index(
     for i, g in enumerate(arr):
       if g:
         idx[i] = idx_gases[g]
-    return jnp.array(idx, dtype=jnp.int_)
+    return jnp.array(idx, dtype=int)
 
   idx_minor = idx_tensor(gases_minor_arr)
   idx_scale = idx_tensor(scaling_gases_arr)
@@ -239,10 +239,10 @@ def _minor_gas_mappings(
         + 1
     )
   return (
-      jnp.array(minor_bnd, dtype=jnp.int_),
-      jnp.array(minor_bnd_start, dtype=jnp.int_),
-      jnp.array(minor_bnd_end, dtype=jnp.int_),
-      jnp.array(minor_gpt_shift, dtype=jnp.int_),
+      jnp.array(minor_bnd, dtype=int),
+      jnp.array(minor_bnd_start, dtype=int),
+      jnp.array(minor_bnd_end, dtype=int),
+      jnp.array(minor_gpt_shift, dtype=int),
   )
 
 

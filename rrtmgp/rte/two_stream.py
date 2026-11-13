@@ -1713,6 +1713,26 @@ def _band_oh_packed(
   return jnp.asarray(oh, dtype=dtype).reshape(n_chunks, chunk, n_bnd)
 
 
+def _upward_op_zc(carry, inputs):
+  alb_below, emiss_below = carry
+  t, r, sup, sdn = inputs
+  beta = 1.0 / (1.0 - r * alb_below)
+  alb_next = r + t * t * beta * alb_below
+  emiss_next = sup + t * beta * (emiss_below + sdn * alb_below)
+  return (alb_next, emiss_next), (alb_below, emiss_below, beta)
+
+
+def _downward_op_zc(fdn_above, inputs):
+  t, r, sdn, emiss_b, b = inputs
+  fdn = (t * fdn_above + r * emiss_b + sdn) * b
+  return fdn, fdn
+
+
+def _direct_op_zc(carry_above, w):
+  below = w * carry_above
+  return below, (below, carry_above)
+
+
 def _solve_rte_2stream_zc(
     t_diff: Array,
     r_diff: Array,
@@ -1728,27 +1748,14 @@ def _solve_rte_2stream_zc(
   TOA face (`nz`). Bottom-halo face (`0` in `(nzh, nc)`) is identically zero and
   prepended once after the spectral sum.
   """
-  def upward_op(carry, inputs):
-    alb_below, emiss_below = carry
-    t, r, sup, sdn = inputs
-    beta = 1.0 / (1.0 - r * alb_below)
-    alb_next = r + t * t * beta * alb_below
-    emiss_next = sup + t * beta * (emiss_below + sdn * alb_below)
-    return (alb_next, emiss_next), (alb_below, emiss_below, beta)
-
   (alb_toa, emiss_toa), (alb_below, emiss_below, beta) = jax.lax.scan(
-      upward_op,
+      _upward_op_zc,
       (sfc_reflectance, sfc_emission),
       (t_diff, r_diff, src_up, src_down),
   )
 
-  def downward_op(fdn_above, inputs):
-    t, r, sdn, emiss_b, b = inputs
-    fdn = (t * fdn_above + r * emiss_b + sdn) * b
-    return fdn, fdn
-
   _, fdn_int = jax.lax.scan(
-      downward_op,
+      _downward_op_zc,
       toa_flux_down,
       (t_diff, r_diff, src_down, emiss_below, beta),
       reverse=True,
@@ -2449,12 +2456,8 @@ def solve_sw_zc(
       tau_pos = jnp.maximum(props['optical_depth'], 0.0)
       t_noscat = jnp.exp(-tau_pos / mu_z1c)
 
-      def direct_op(carry_above, w):
-        below = w * carry_above
-        return below, (below, carry_above)
-
       flux_down_sfc, (fdir_int, fdir_above) = jax.lax.scan(
-          direct_op, flux_down_direct_bc, t_noscat, reverse=True
+          _direct_op_zc, flux_down_direct_bc, t_noscat, reverse=True
       )
       src_up = cell['r_dir'] * fdir_above
       src_down = cell['t_dir'] * fdir_above
