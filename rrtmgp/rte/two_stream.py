@@ -1345,12 +1345,31 @@ def compute_heating_rate(
 # ---------------------------------------------------------------------------
 
 
-def _tpu_gpt_chunk_plan(n_gpt: int, gpt_chunk: int) -> tuple[int, int, bool]:
-  """Choose an 8-aligned `chunk <= gpt_chunk` when `n_chunks` stays unchanged."""
-  chunk, n_chunks, needs_mask = _gpt_chunk_plan(n_gpt, gpt_chunk)
+_SUPPORTS_CLOUD_MASK_PER_GPT = True
+
+
+def _tpu_gpt_chunk_plan(
+    n_gpt: int,
+    gpt_chunk: int,
+    *,
+    nz: int | None = None,
+    nc: int | None = None,
+) -> tuple[int, int, bool]:
+  """Choose an 8-aligned VMEM-resident `chunk <= gpt_chunk`."""
+  eff_chunk = gpt_chunk
+  if (
+      jax.default_backend() == 'tpu'
+      and nz is not None
+      and nc is not None
+      and eff_chunk > 8
+  ):
+    bytes_per_gpt = max(nz * nc * 4, 1)
+    max_vmem_chunk = max(8, ((32 * 1024 * 1024) // bytes_per_gpt // 8) * 8)
+    eff_chunk = min(eff_chunk, max_vmem_chunk)
+  chunk, n_chunks, needs_mask = _gpt_chunk_plan(n_gpt, eff_chunk)
   if n_chunks > 1:
     even8 = ((-(-n_gpt // n_chunks) + 7) // 8) * 8
-    if even8 <= gpt_chunk and even8 * n_chunks >= n_gpt:
+    if even8 <= eff_chunk and even8 * n_chunks >= n_gpt:
       chunk = even8
       needs_mask = n_chunks * chunk != n_gpt
   return chunk, n_chunks, needs_mask
@@ -1433,19 +1452,32 @@ def _interp_1d_table_mxu(table_2d: Array, x: Array, ref_grid: Array) -> Array:
         interp.interp_high.weight.reshape(ncells, 1)
     )
     return (lo + hi).T.reshape(n_rows, *x.shape)
-  oh = interp.interp_low.weight.reshape(1, ncells) * jax.nn.one_hot(
+
+  def _eval_flat(idx_lo_1d: Array, w_lo_1d: Array, w_hi_1d: Array) -> Array:
+    m = idx_lo_1d.shape[0]
+    oh_lo = jax.nn.one_hot(
+        idx_lo_1d, n_nodes - 1, dtype=table_2d.dtype, axis=0
+    )
+    oh = jnp.pad(w_lo_1d.reshape(1, m) * oh_lo, ((0, 1), (0, 0))) + jnp.pad(
+        w_hi_1d.reshape(1, m) * oh_lo, ((1, 0), (0, 0))
+    )
+    return jnp.matmul(table_2d, oh, precision=jax.lax.Precision.HIGHEST)
+
+  if x.ndim == 2 and n_nodes * ncells * 4 > 16 * 1024 * 1024:
+    mapped = jax.lax.map(
+        lambda s: _eval_flat(s[0], s[1], s[2]),
+        (
+            interp.interp_low.idx,
+            interp.interp_low.weight,
+            interp.interp_high.weight,
+        ),
+    )
+    return jnp.swapaxes(mapped, 0, 1)
+
+  return _eval_flat(
       interp.interp_low.idx.reshape(ncells),
-      n_nodes,
-      dtype=table_2d.dtype,
-      axis=0,
-  ) + interp.interp_high.weight.reshape(1, ncells) * jax.nn.one_hot(
-      interp.interp_high.idx.reshape(ncells),
-      n_nodes,
-      dtype=table_2d.dtype,
-      axis=0,
-  )
-  return jnp.matmul(
-      table_2d, oh, precision=jax.lax.Precision.HIGHEST
+      interp.interp_low.weight.reshape(ncells),
+      interp.interp_high.weight.reshape(ncells),
   ).reshape(n_rows, *x.shape)
 
 
@@ -1542,18 +1574,26 @@ def _cloud_mie_tables_mxu(
   return liq_tables, ice_tables
 
 
+def _band_zbc_to_zgc(bnd_oh_chunk: Array, field_zbc: Array) -> Array:
+  """Project `(nz, n_bnd, nc)` to `(nz, chunk, nc)` keeping `nc` minor."""
+  if jnp.issubdtype(bnd_oh_chunk.dtype, jnp.integer):
+    return field_zbc[:, bnd_oh_chunk, :]
+  nz_dim = field_zbc.shape[0]
+  lhs = jnp.broadcast_to(
+      bnd_oh_chunk[jnp.newaxis, :, :],
+      (nz_dim, bnd_oh_chunk.shape[0], bnd_oh_chunk.shape[1]),
+  )
+  return jax.lax.dot_general(
+      lhs,
+      field_zbc,
+      dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+      precision=jax.lax.Precision.HIGHEST,
+  )
+
+
 def _band_to_zgc(bnd_oh_chunk: Array, field_bzc: Array) -> Array:
   """Project `(n_bnd, nz, nc)` to `(nz, chunk, nc)` keeping `nc` minor."""
-  if jnp.issubdtype(bnd_oh_chunk.dtype, jnp.integer):
-    return jnp.swapaxes(field_bzc, 0, 1)[:, bnd_oh_chunk, :]
-  n_bnd, nz, nc = field_bzc.shape
-  chunk = bnd_oh_chunk.shape[0]
-  out_gzc = jnp.matmul(
-      bnd_oh_chunk,
-      field_bzc.reshape(n_bnd, nz * nc),
-      precision=jax.lax.Precision.HIGHEST,
-  ).reshape(chunk, nz, nc)
-  return jnp.swapaxes(out_gzc, 0, 1)
+  return _band_zbc_to_zgc(bnd_oh_chunk, jnp.swapaxes(field_bzc, 0, 1))
 
 
 def _band_to_gc(bnd_oh_chunk: Array, field_bc: Array) -> Array:
@@ -1646,6 +1686,19 @@ def _pack_gpt_zc_to_chunks(
         [arr_gzc, jnp.repeat(arr_gzc[-1:, :, :], pad_g, axis=0)], axis=0
     )
   return jnp.swapaxes(arr_gzc.reshape(n_chunks, chunk, nz_dim, nc), 1, 2)
+
+
+def _pack_zgc_to_chunks(
+    arr_zgc: Array, n_chunks: int, chunk: int
+) -> Array:
+  """Pack `(nz_or_nzh, n_gpt, nc)` into `(n_chunks, nz_or_nzh, chunk, nc)`."""
+  nz_dim, n_gpt, nc = arr_zgc.shape
+  pad_g = n_chunks * chunk - n_gpt
+  if pad_g:
+    arr_zgc = jnp.concatenate(
+        [arr_zgc, jnp.repeat(arr_zgc[:, -1:, :], pad_g, axis=1)], axis=1
+    )
+  return jnp.swapaxes(arr_zgc.reshape(nz_dim, n_chunks, chunk, nc), 0, 1)
 
 
 def _pack_per_gpt_cloud_zc(
@@ -1755,6 +1808,77 @@ def _direct_op_zc(carry_above, w):
   return below, (below, carry_above)
 
 
+def _scan_zc(
+    fn,
+    init,
+    xs,
+    *,
+    reverse: bool = False,
+    pad_vals=None,
+    block: int = 8,
+):
+  """Block-stepped vertical `lax.scan` on TPU using TOA vacuum-layer padding."""
+  leaves = jax.tree.leaves(xs)
+  nz = leaves[0].shape[0]
+  if (
+      jax.default_backend() != 'tpu'
+      or pad_vals is None
+      or block <= 1
+      or nz < 2 * block
+  ):
+    return jax.lax.scan(fn, init, xs, reverse=reverse)
+
+  pad_z = (-nz) % block
+  if pad_z:
+    xs_padded = jax.tree.map(
+        lambda a, pv: jnp.pad(
+            a,
+            ((0, pad_z),) + ((0, 0),) * (a.ndim - 1),
+            constant_values=jnp.asarray(pv, dtype=a.dtype),
+        ),
+        xs,
+        pad_vals,
+    )
+  else:
+    xs_padded = xs
+
+  nz_pad = nz + pad_z
+  n_blocks = nz_pad // block
+  xs_blk = jax.tree.map(
+      lambda a: a.reshape(n_blocks, block, *a.shape[1:]), xs_padded
+  )
+
+  if not reverse:
+    def block_fwd(carry, x_blk):
+      ys_blk = []
+      c = carry
+      for k in range(block):
+        xk = jax.tree.map(lambda a, idx=k: a[idx], x_blk)
+        c, yk = fn(c, xk)
+        ys_blk.append(yk)
+      return c, jax.tree.map(lambda *p: jnp.stack(p, axis=0), *ys_blk)
+
+    carry, ys_blk_all = jax.lax.scan(block_fwd, init, xs_blk)
+  else:
+    def block_rev(carry, x_blk):
+      ys_blk_rev = []
+      cur = carry
+      for k in range(block - 1, -1, -1):
+        xk = jax.tree.map(lambda a, idx=k: a[idx], x_blk)
+        cur, yk = fn(cur, xk)
+        ys_blk_rev.append(yk)
+      return cur, jax.tree.map(
+          lambda *p: jnp.stack(p, axis=0), *reversed(ys_blk_rev)
+      )
+
+    carry, ys_blk_all = jax.lax.scan(block_rev, init, xs_blk, reverse=True)
+
+  ys_all = jax.tree.map(
+      lambda a: a.reshape(nz_pad, *a.shape[2:])[:nz], ys_blk_all
+  )
+  return carry, ys_all
+
+
 def _solve_rte_2stream_zc(
     t_diff: Array,
     r_diff: Array,
@@ -1770,17 +1894,19 @@ def _solve_rte_2stream_zc(
   TOA face (`nz`). Bottom-halo face (`0` in `(nzh, nc)`) is identically zero and
   prepended once after the spectral sum.
   """
-  (alb_toa, emiss_toa), (alb_below, emiss_below, beta) = jax.lax.scan(
+  (alb_toa, emiss_toa), (alb_below, emiss_below, beta) = _scan_zc(
       _upward_op_zc,
       (sfc_reflectance, sfc_emission),
       (t_diff, r_diff, src_up, src_down),
+      pad_vals=(1.0, 0.0, 0.0, 0.0),
   )
 
-  _, fdn_int = jax.lax.scan(
+  _, fdn_int = _scan_zc(
       _downward_op_zc,
       toa_flux_down,
       (t_diff, r_diff, src_down, emiss_below, beta),
       reverse=True,
+      pad_vals=(1.0, 0.0, 0.0, 0.0, 1.0),
   )
 
   flux_down_faces = jnp.concatenate(
@@ -1793,6 +1919,54 @@ def _solve_rte_2stream_zc(
       [emiss_below, emiss_toa[jnp.newaxis, :, :]], axis=0
   )
   flux_up_faces = flux_down_faces * alb_faces + emiss_faces
+  return {
+      'flux_up': flux_up_faces,
+      'flux_down': flux_down_faces,
+      'flux_net': flux_up_faces - flux_down_faces,
+  }
+
+
+def _pure_abs_fdn_op_zc(fdn_above, inputs):
+  t, sdn = inputs
+  fdn = t * fdn_above + sdn
+  return fdn, fdn
+
+
+def _pure_abs_fup_op_zc(fup_below, inputs):
+  t, sup = inputs
+  fup = t * fup_below + sup
+  return fup, fup
+
+
+def _solve_rte_pure_abs_zc(
+    t_diff: Array,
+    src_up: Array,
+    src_down: Array,
+    toa_flux_down: Array,
+    sfc_emission: Array,
+    sfc_reflectance: Array,
+) -> dict[str, Array]:
+  """Exact `r_diff == 0` two-stream transport on interior `(nz, chunk, nc)`."""
+  sfc_flux_down, fdn_int = _scan_zc(
+      _pure_abs_fdn_op_zc,
+      toa_flux_down,
+      (t_diff, src_down),
+      reverse=True,
+      pad_vals=(1.0, 0.0),
+  )
+  sfc_flux_up = sfc_reflectance * sfc_flux_down + sfc_emission
+  _, fup_int = _scan_zc(
+      _pure_abs_fup_op_zc,
+      sfc_flux_up,
+      (t_diff, src_up),
+      pad_vals=(1.0, 0.0),
+  )
+  flux_down_faces = jnp.concatenate(
+      [fdn_int, toa_flux_down[jnp.newaxis, :, :]], axis=0
+  )
+  flux_up_faces = jnp.concatenate(
+      [sfc_flux_up[jnp.newaxis, :, :], fup_int], axis=0
+  )
   return {
       'flux_up': flux_up_faces,
       'flux_down': flux_down_faces,
@@ -1826,8 +2000,12 @@ def _lw_noscat_transport_zc(
     out = tr * fdn_above + sdn
     return out, out
 
-  sfc_flux_down, fdn_int = jax.lax.scan(
-      fdn_op, toa_flux_down, (trans, source_down), reverse=True
+  sfc_flux_down, fdn_int = _scan_zc(
+      fdn_op,
+      toa_flux_down,
+      (trans, source_down),
+      reverse=True,
+      pad_vals=(1.0, 0.0),
   )
   sfc_flux_up = (1.0 - sfc_emissivity) * sfc_flux_down + (
       sfc_emissivity * flux_scale * sfc_src
@@ -1838,7 +2016,9 @@ def _lw_noscat_transport_zc(
     out = tr * fup_below + sup
     return out, out
 
-  _, fup_int = jax.lax.scan(fup_op, sfc_flux_up, (trans, source_up))
+  _, fup_int = _scan_zc(
+      fup_op, sfc_flux_up, (trans, source_up), pad_vals=(1.0, 0.0)
+  )
   flux_down_faces = jnp.concatenate(
       [fdn_int, toa_flux_down[jnp.newaxis, :, :]], axis=0
   )
@@ -1876,6 +2056,7 @@ def solve_lw_zc(
     with_aerosol_free: bool = False,
     *,
     per_gpt_axis: int = 1,
+    cloud_mask_per_gpt: Array | None = None,
 ) -> dict[str, Array]:
   """Column-minor `(nzh, nc)` longwave radiative transfer solver for TPU."""
   if lw_solver not in LW_SOLVERS:
@@ -1892,7 +2073,9 @@ def solve_lw_zc(
   )
   n_gpt = optics_lib.n_gpt_lw
   n_bnd = lookup_lw.n_bnd
-  chunk, n_chunks, needs_mask = _tpu_gpt_chunk_plan(n_gpt, gpt_chunk)
+  chunk, n_chunks, needs_mask = _tpu_gpt_chunk_plan(
+      n_gpt, gpt_chunk, nz=nz, nc=nc
+  )
 
   vmr_idx = (
       None
@@ -1900,12 +2083,17 @@ def solve_lw_zc(
       else _reindex_vmr_fields(vmr_fields, lookup_lw)
   )
   gas_all = optics_lib.compute_gas_optics_all_gpts_zc(
-      pressure, temperature, molecules, vmr_idx, is_lw=True
+      pressure,
+      temperature,
+      molecules,
+      vmr_idx,
+      is_lw=True,
+      z_leading_output=True,
   )
-  tau_packed = _pack_gpt_zc_to_chunks(
-      gas_all['optical_depth'][:, 1:-1, :], n_chunks, chunk
+  tau_packed = _pack_zgc_to_chunks(
+      gas_all['optical_depth'][1:-1, :, :], n_chunks, chunk
   )
-  pfrac_packed = _pack_gpt_zc_to_chunks(
+  pfrac_packed = _pack_zgc_to_chunks(
       gas_all['planck_fraction'], n_chunks, chunk
   )
 
@@ -1920,6 +2108,8 @@ def solve_lw_zc(
       sfc_temp_c,
       t_lay_zc=temperature[1:-1, :] if need_lay_src else None,
   )
+  b_face_zbc = jnp.swapaxes(b_face, 0, 1)
+  b_lay_zbc = None if b_lay is None else jnp.swapaxes(b_lay, 0, 1)
   bnd_oh_packed = _band_oh_packed(
       lookup_lw.g_point_to_bnd, n_bnd, n_chunks, chunk, dtype
   )
@@ -1932,7 +2122,8 @@ def solve_lw_zc(
   )
 
   liq_mie = ice_mie = None
-  cld_props_by_band = None
+  cld_props_zbc = None
+  cloud_mask_packed = None
   cpl_packed = cpi_packed = None
   cpl_int_z1c = cpi_int_z1c = None
   scale_liq_z1c = scale_ice_z1c = None
@@ -1993,11 +2184,26 @@ def solve_lw_zc(
           ),
           is_lw=True,
       )
+      cld_props_zbc = {
+          k: jnp.swapaxes(v, 0, 1) for k, v in cld_props_by_band.items()
+      }
+      if cloud_mask_per_gpt is not None:
+        cloud_mask_packed = _pack_per_gpt_cloud_zc(
+            jnp.asarray(cloud_mask_per_gpt, dtype=jnp.bool_),
+            nz,
+            nzh,
+            n_chunks,
+            chunk,
+            per_gpt_axis,
+        )
 
-  aer_int = (
+  aer_zbc = (
       None
       if aerosol_optics is None
-      else {k: _interior_bzc(v, nz, nzh) for k, v in aerosol_optics.items()}
+      else {
+          k: jnp.swapaxes(_interior_bzc(v, nz, nzh), 0, 1)
+          for k, v in aerosol_optics.items()
+      }
   )
 
   toa_flux_down_chunk = jnp.broadcast_to(
@@ -2026,7 +2232,7 @@ def solve_lw_zc(
         pfrac_packed, ichunk, axis=0, keepdims=False
     )
 
-    b_face_g = _band_to_zgc(bnd_oh, b_face)
+    b_face_g = _band_zbc_to_zgc(bnd_oh, b_face_zbc)
     psrc_top = pfrac[:-1] * b_face_g
     psrc_bot_next = pfrac[1:] * b_face_g
     prod = psrc_top * psrc_bot_next
@@ -2039,8 +2245,8 @@ def solve_lw_zc(
     sfc_src = pfrac[1] * b_sfc_g
     lay_src = None
     if need_lay_src:
-      assert b_lay is not None
-      lay_src = pfrac[1:-1] * _band_to_zgc(bnd_oh, b_lay)
+      assert b_lay_zbc is not None
+      lay_src = pfrac[1:-1] * _band_zbc_to_zgc(bnd_oh, b_lay_zbc)
 
     zeros_g = jnp.zeros_like(tau_g)
     gas_props = {
@@ -2077,21 +2283,31 @@ def solve_lw_zc(
             bnd_oh_chunk=bnd_oh,
         )
       else:
-        assert cld_props_by_band is not None
+        assert cld_props_zbc is not None
         cld_props = {
-            k: _band_to_zgc(bnd_oh, v) for k, v in cld_props_by_band.items()
+            k: _band_zbc_to_zgc(bnd_oh, v) for k, v in cld_props_zbc.items()
         }
+        if cloud_mask_packed is not None:
+          mask_c = jax.lax.dynamic_index_in_dim(
+              cloud_mask_packed, ichunk, axis=0, keepdims=False
+          )
+          cld_props = {
+              k: jnp.where(mask_c, v, jnp.zeros_like(v))
+              for k, v in cld_props.items()
+          }
       all_sky_props = optics_lib.combine_optical_properties(
           gas_props, cld_props
       )
 
     aer_chunk = (
         None
-        if aer_int is None
-        else {k: _band_to_zgc(bnd_oh, v) for k, v in aer_int.items()}
+        if aer_zbc is None
+        else {k: _band_zbc_to_zgc(bnd_oh, v) for k, v in aer_zbc.items()}
     )
+    sfc_emission = np.pi * sfc_emis_chunk * sfc_src
 
     def solve_one(props, aer):
+      is_pure_gas = props is gas_props and aer is None
       if aer is not None:
         props = optics_lib.combine_optical_properties(props, aer)
       if lw_solver == LW_SOLVER_NOSCAT:
@@ -2107,6 +2323,20 @@ def solve_lw_zc(
             sfc_emis_chunk,
             secant=lw_secant,
         )
+      if is_pure_gas:
+        cell = monochromatic_two_stream.lw_pure_absorption_two_stream_cell(
+            props['optical_depth'],
+            level_src_bottom,
+            level_src_top,
+        )
+        return _solve_rte_pure_abs_zc(
+            cell['t_diff'],
+            cell['src_up'],
+            cell['src_down'],
+            toa_flux_down_chunk,
+            sfc_emission,
+            sfc_refl_chunk,
+        )
       cell = monochromatic_two_stream.lw_cell_source_and_properties(
           props['optical_depth'],
           props['ssa'],
@@ -2114,7 +2344,6 @@ def solve_lw_zc(
           level_src_top,
           props['asymmetry_factor'],
       )
-      sfc_emission = np.pi * sfc_emis_chunk * sfc_src
       return _solve_rte_2stream_zc(
           cell['t_diff'],
           cell['r_diff'],
@@ -2211,6 +2440,7 @@ def solve_sw_zc(
     with_aerosol_free: bool = False,
     *,
     per_gpt_axis: int = 1,
+    cloud_mask_per_gpt: Array | None = None,
 ) -> dict[str, Array]:
   """Column-minor `(nzh, nc)` shortwave radiative transfer solver for TPU."""
   nzh, nc = temperature.shape
@@ -2220,7 +2450,9 @@ def solve_sw_zc(
   assert lookup_sw is not None
   n_gpt = optics_lib.n_gpt_sw
   n_bnd = lookup_sw.n_bnd
-  chunk, n_chunks, needs_mask = _tpu_gpt_chunk_plan(n_gpt, gpt_chunk)
+  chunk, n_chunks, needs_mask = _tpu_gpt_chunk_plan(
+      n_gpt, gpt_chunk, nz=nz, nc=nc
+  )
 
   alb_dir_by_band = (
       None
@@ -2253,9 +2485,10 @@ def solve_sw_zc(
       molecules[1:-1, :],
       vmr_idx,
       is_lw=False,
+      z_leading_output=True,
   )
-  tau_packed = _pack_gpt_zc_to_chunks(gas_all['optical_depth'], n_chunks, chunk)
-  rayl_packed = _pack_gpt_zc_to_chunks(gas_all['rayleigh'], n_chunks, chunk)
+  tau_packed = _pack_zgc_to_chunks(gas_all['optical_depth'], n_chunks, chunk)
+  rayl_packed = _pack_zgc_to_chunks(gas_all['rayleigh'], n_chunks, chunk)
 
   bnd_oh_packed = _band_oh_packed(
       lookup_sw.g_point_to_bnd, n_bnd, n_chunks, chunk, dtype
@@ -2313,7 +2546,8 @@ def solve_sw_zc(
   )
 
   liq_mie = ice_mie = None
-  cld_props_by_band = None
+  cld_props_zbc = None
+  cloud_mask_packed = None
   cpl_packed = cpi_packed = None
   cpl_int_z1c = cpi_int_z1c = None
   scale_liq_z1c = scale_ice_z1c = None
@@ -2374,11 +2608,26 @@ def solve_sw_zc(
           ),
           is_lw=False,
       )
+      cld_props_zbc = {
+          k: jnp.swapaxes(v, 0, 1) for k, v in cld_props_by_band.items()
+      }
+      if cloud_mask_per_gpt is not None:
+        cloud_mask_packed = _pack_per_gpt_cloud_zc(
+            jnp.asarray(cloud_mask_per_gpt, dtype=jnp.bool_),
+            nz,
+            nzh,
+            n_chunks,
+            chunk,
+            per_gpt_axis,
+        )
 
-  aer_int = (
+  aer_zbc = (
       None
       if aerosol_optics is None
-      else {k: _interior_bzc(v, nz, nzh) for k, v in aerosol_optics.items()}
+      else {
+          k: jnp.swapaxes(_interior_bzc(v, nz, nzh), 0, 1)
+          for k, v in aerosol_optics.items()
+      }
   )
 
   zeros_chunk = jnp.zeros((chunk, nc), dtype=dtype)
@@ -2446,18 +2695,26 @@ def solve_sw_zc(
             bnd_oh_chunk=bnd_oh,
         )
       else:
-        assert cld_props_by_band is not None
+        assert cld_props_zbc is not None
         cld_props = {
-            k: _band_to_zgc(bnd_oh, v) for k, v in cld_props_by_band.items()
+            k: _band_zbc_to_zgc(bnd_oh, v) for k, v in cld_props_zbc.items()
         }
+        if cloud_mask_packed is not None:
+          mask_c = jax.lax.dynamic_index_in_dim(
+              cloud_mask_packed, ichunk, axis=0, keepdims=False
+          )
+          cld_props = {
+              k: jnp.where(mask_c, v, jnp.zeros_like(v))
+              for k, v in cld_props.items()
+          }
       all_sky_props = optics_lib.combine_optical_properties(
           gas_props, cld_props
       )
 
     aer_chunk = (
         None
-        if aer_int is None
-        else {k: _band_to_zgc(bnd_oh, v) for k, v in aer_int.items()}
+        if aer_zbc is None
+        else {k: _band_zbc_to_zgc(bnd_oh, v) for k, v in aer_zbc.items()}
     )
 
     def solve_one(props, aer):
@@ -2468,12 +2725,17 @@ def solve_sw_zc(
           props['optical_depth'],
           props['ssa'],
           props['asymmetry_factor'],
+          cos_zenith=mu_z1c,
+          return_t_noscat=True,
       )
-      tau_pos = jnp.maximum(props['optical_depth'], 0.0)
-      t_noscat = jnp.exp(-tau_pos / mu_z1c)
+      t_noscat = cell['t_noscat']
 
-      flux_down_sfc, (fdir_int, fdir_above) = jax.lax.scan(
-          _direct_op_zc, flux_down_direct_bc, t_noscat, reverse=True
+      flux_down_sfc, (fdir_int, fdir_above) = _scan_zc(
+          _direct_op_zc,
+          flux_down_direct_bc,
+          t_noscat,
+          reverse=True,
+          pad_vals=1.0,
       )
       src_up = cell['r_dir'] * fdir_above
       src_down = cell['t_dir'] * fdir_above

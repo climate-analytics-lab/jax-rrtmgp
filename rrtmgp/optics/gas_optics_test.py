@@ -19,6 +19,7 @@ from typing import TypeAlias
 import collections
 from pathlib import Path
 import unittest
+from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -729,6 +730,143 @@ class GasOpticsTest(unittest.TestCase):
       ref_1d = optics_utils.interpolate_orig(lw.totplnk[0], fns_1d)
       mxu_1d = optics_utils._interpolate_1d_mxu(lw.totplnk[0], fns_1d)
       np.testing.assert_allclose(mxu_1d, ref_1d, rtol=2e-6, atol=1e-6)
+
+  def test_all_gpts_mxu_lw_and_sw_match_reference_and_differentiate(self):
+    """Band-grouped TPU MXU gas optics match reference on windowed & fallback."""
+    lw = lookup_gas_optics_longwave.from_nc_file(
+        root / 'rrtmgp/optics/rrtmgp_data/rrtmgp-gas-lw-g128.nc'
+    )
+    sw = lookup_gas_optics_shortwave.from_nc_file(
+        root / 'rrtmgp/optics/rrtmgp_data/rrtmgp-gas-sw-g112.nc'
+    )
+
+    # Profile 1: realistic 2D `(nz, nc)` monotone profile (`can_window = True`).
+    nz, nc = 12, 16
+    p_win = jnp.broadcast_to(
+        jnp.geomspace(1.0e5, 50.0, nz, dtype=jnp.float32)[:, None], (nz, nc)
+    )
+    t_win = (
+        jnp.linspace(295.0, 210.0, nz, dtype=jnp.float32)[:, None]
+        + jnp.linspace(-3.0, 3.0, nc, dtype=jnp.float32)[None, :]
+    )
+    mol_win = jnp.full((nz, nc), 1.0e24, dtype=jnp.float32)
+
+    # Profile 2: single-level wide-pressure profile (`can_window = False`).
+    p_fb = jnp.geomspace(1.0e5, 10.0, nc, dtype=jnp.float32)[None, :]
+    t_fb = jnp.linspace(300.0, 200.0, nc, dtype=jnp.float32)[None, :]
+    mol_fb = jnp.full((1, nc), 1.0e24, dtype=jnp.float32)
+
+    for p_in, t_in, mol_in in ((p_win, t_win, mol_win), (p_fb, t_fb, mol_fb)):
+      vmr_lw = {
+          lw.idx_h2o: jnp.full_like(p_in, 2.5e-3),
+          lw.idx_o3: jnp.full_like(p_in, 1.5e-6),
+      }
+      vmr_sw = {
+          sw.idx_h2o: jnp.full_like(p_in, 2.5e-3),
+          sw.idx_o3: jnp.full_like(p_in, 1.5e-6),
+      }
+      ref_lw_tau = gas_optics.compute_optical_depth_all_gpts(
+          lw, self.vmr_lib, mol_in, t_in, p_in, vmr_lw
+      )
+      ref_lw_pf = gas_optics.compute_planck_fraction_all_gpts(
+          lw, self.vmr_lib, p_in, t_in, vmr_lw
+      )
+      ref_sw_tau = gas_optics.compute_optical_depth_all_gpts(
+          sw, self.vmr_lib, mol_in, t_in, p_in, vmr_sw
+      )
+      ref_sw_rayl = gas_optics.compute_rayleigh_optical_depth_all_gpts(
+          sw, self.vmr_lib, mol_in, t_in, p_in, vmr_sw
+      )
+
+      with mock.patch.object(jax, 'default_backend', return_value='tpu'):
+        for z_lead in (False, True):
+          got_lw_tau, got_lw_pf = (
+              gas_optics.compute_lw_optical_and_planck_all_gpts_mxu(
+                  lw,
+                  self.vmr_lib,
+                  mol_in,
+                  t_in,
+                  p_in,
+                  vmr_lw,
+                  z_leading_output=z_lead,
+              )
+          )
+          got_sw_tau, got_sw_rayl = (
+              gas_optics.compute_sw_optical_and_rayleigh_all_gpts_mxu(
+                  sw,
+                  self.vmr_lib,
+                  mol_in,
+                  t_in,
+                  p_in,
+                  vmr_sw,
+                  z_leading_output=z_lead,
+              )
+          )
+          if z_lead:
+            got_lw_tau = jnp.swapaxes(got_lw_tau, 0, 1)
+            got_lw_pf = jnp.swapaxes(got_lw_pf, 0, 1)
+            got_sw_tau = jnp.swapaxes(got_sw_tau, 0, 1)
+            got_sw_rayl = jnp.swapaxes(got_sw_rayl, 0, 1)
+
+          np.testing.assert_allclose(
+              got_lw_tau, ref_lw_tau, rtol=2e-5, atol=1e-12
+          )
+          np.testing.assert_allclose(
+              got_lw_pf, ref_lw_pf, rtol=2e-5, atol=1e-12
+          )
+          np.testing.assert_allclose(
+              got_sw_tau, ref_sw_tau, rtol=2e-5, atol=1e-12
+          )
+          np.testing.assert_allclose(
+              got_sw_rayl, ref_sw_rayl, rtol=2e-5, atol=1e-12
+          )
+
+        mlir_lw = str(
+            jax.jit(
+                lambda t, p, h2o: (
+                    gas_optics.compute_lw_optical_and_planck_all_gpts_mxu(
+                        lw,
+                        self.vmr_lib,
+                        mol_in,
+                        t,
+                        p,
+                        {lw.idx_h2o: h2o},
+                        z_leading_output=True,
+                    )
+                )
+            )
+            .lower(t_in, p_in, vmr_lw[lw.idx_h2o])
+            .compiler_ir(dialect='stablehlo')
+        )
+        self.assertEqual(mlir_lw.count('stablehlo.gather'), 0)
+        self.assertEqual(mlir_lw.count('stablehlo.scatter'), 0)
+
+        def loss_both(t, p, h2o):
+          lt, lpf = gas_optics.compute_lw_optical_and_planck_all_gpts_mxu(
+              lw,
+              self.vmr_lib,
+              mol_in,
+              t,
+              p,
+              {lw.idx_h2o: h2o},
+              z_leading_output=True,
+          )
+          st, sr = gas_optics.compute_sw_optical_and_rayleigh_all_gpts_mxu(
+              sw,
+              self.vmr_lib,
+              mol_in,
+              t,
+              p,
+              {sw.idx_h2o: h2o},
+              z_leading_output=True,
+          )
+          return jnp.sum(lt) + jnp.sum(lpf) + jnp.sum(st) + jnp.sum(sr)
+
+        grads = jax.grad(loss_both, argnums=(0, 1, 2))(
+            t_in, p_in, vmr_lw[lw.idx_h2o]
+        )
+        for g in grads:
+          self.assertTrue(bool(jnp.all(jnp.isfinite(g))))
 
 if __name__ == '__main__':
   unittest.main()

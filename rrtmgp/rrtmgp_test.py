@@ -956,6 +956,112 @@ class RRTMGPTPUColumnMinorTest(unittest.TestCase):
     self.assertEqual(mlir.count('stablehlo.scatter'), 0)
     self.assertEqual(mlir.count('stablehlo.optimization_barrier'), 0)
 
+  def test_cloud_mask_per_gpt_matches_per_gpt_paths_and_differentiates(self):
+    """2D `cloud_path_{liq,ice}` + `bool` McICA masks match 3D per-gpt paths."""
+    rt, _, kwargs_zc, nc = self._setup_problem()
+    nzh = kwargs_zc['temperature'].shape[0]
+    nz = nzh - 2
+    n_gpt_lw = rt.optics_lib.n_gpt_lw
+    n_gpt_sw = rt.optics_lib.n_gpt_sw
+
+    rng = np.random.default_rng(19)
+    lwp_2d = jnp.asarray(rng.uniform(0.0, 0.05, (nz, nc)).astype(np.float32))
+    iwp_2d = jnp.asarray(rng.uniform(0.0, 0.02, (nz, nc)).astype(np.float32))
+    mask_lw = jnp.asarray(rng.uniform(size=(nz, n_gpt_lw, nc)) < 0.35)
+    mask_sw = jnp.asarray(rng.uniform(size=(nz, n_gpt_sw, nc)) < 0.35)
+
+    kw_base = {
+        k: v
+        for k, v in kwargs_zc.items()
+        if not k.startswith('cloud_path_') and k != 'aerosol_optics_lw'
+    }
+    kw_paths = {
+        **kw_base,
+        'aerosol_optics_lw': None,
+        'aerosol_free_fluxes': False,
+        'cloud_path_liq_lw_per_gpt': jnp.where(
+            mask_lw, lwp_2d[:, None, :], 0.0
+        ),
+        'cloud_path_ice_lw_per_gpt': jnp.where(
+            mask_lw, iwp_2d[:, None, :], 0.0
+        ),
+        'cloud_path_liq_sw_per_gpt': jnp.where(
+            mask_sw, lwp_2d[:, None, :], 0.0
+        ),
+        'cloud_path_ice_sw_per_gpt': jnp.where(
+            mask_sw, iwp_2d[:, None, :], 0.0
+        ),
+    }
+    kw_masked = {
+        **kw_base,
+        'aerosol_optics_lw': None,
+        'aerosol_free_fluxes': False,
+        'cloud_path_liq': lwp_2d,
+        'cloud_path_ice': iwp_2d,
+        'cloud_mask_lw_per_gpt': mask_lw,
+        'cloud_mask_sw_per_gpt': mask_sw,
+    }
+
+    ref_cpu = rt.compute_heating_rate_zc(
+        **kw_paths, lw_solver='two_stream', gpt_chunk=16
+    )
+    got_cpu = rt.compute_heating_rate_zc(
+        **kw_masked, lw_solver='two_stream', gpt_chunk=16
+    )
+    with mock.patch.object(jax, 'default_backend', return_value='tpu'):
+      got_tpu = rt.compute_heating_rate_zc(
+          **kw_masked, lw_solver='two_stream', gpt_chunk=16
+      )
+      mlir = str(
+          jax.jit(
+              functools.partial(
+                  rt.compute_heating_rate_zc,
+                  lw_solver='two_stream',
+                  gpt_chunk=16,
+                  clear_sky_fluxes=True,
+                  aerosol_free_fluxes=False,
+              )
+          )
+          .lower(**{
+              k: v
+              for k, v in kw_masked.items()
+              if k not in ('clear_sky_fluxes', 'aerosol_free_fluxes')
+          })
+          .compiler_ir(dialect='stablehlo')
+      )
+      g_lwp, g_iwp = jax.grad(
+          lambda lwp, iwp: jnp.sum(
+              rt.compute_heating_rate_zc(
+                  **{**kw_masked, 'cloud_path_liq': lwp, 'cloud_path_ice': iwp},
+                  lw_solver='two_stream',
+                  gpt_chunk=16,
+              )['rad_heat_src'][1:-1, :]
+          ),
+          argnums=(0, 1),
+      )(lwp_2d, iwp_2d)
+
+    self.assertEqual(mlir.count('stablehlo.gather'), 0)
+    self.assertEqual(mlir.count('stablehlo.scatter'), 0)
+    self.assertTrue(bool(jnp.all(jnp.isfinite(g_lwp))))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(g_iwp))))
+    for key, val in ref_cpu.items():
+      v_ref = np.asarray(val)
+      valid = ~np.isnan(v_ref)
+      np.testing.assert_allclose(
+          np.asarray(got_cpu[key])[valid],
+          v_ref[valid],
+          rtol=1e-5,
+          atol=1e-5,
+          err_msg=f'cpu {key}',
+      )
+      np.testing.assert_allclose(
+          np.asarray(got_tpu[key])[valid],
+          v_ref[valid],
+          rtol=1e-4,
+          atol=2e-4,
+          err_msg=f'tpu {key}',
+      )
+
 
 if __name__ == '__main__':
   unittest.main()

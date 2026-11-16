@@ -477,6 +477,7 @@ class RRTMOptics(optics_base.OpticsScheme):
       vmr_fields: dict[int, Array] | None = None,
       *,
       is_lw: bool,
+      z_leading_output: bool = False,
   ) -> dict[str, Array]:
     """Column-minor `(nz_or_nzh, nc)` gas optics of every g-point in one pass."""
     lookup = self.gas_optics_lw if is_lw else self.gas_optics_sw
@@ -485,11 +486,22 @@ class RRTMOptics(optics_base.OpticsScheme):
     )
     with jax.named_scope('gas_optics'):
       if (
-          not is_lw
-          and jax.default_backend() == 'tpu'
+          jax.default_backend() == 'tpu'
           and temperature.ndim > 0
           and temperature.size > 0
       ):
+        if is_lw:
+          tau, pfrac = gas_optics.compute_lw_optical_and_planck_all_gpts_mxu(
+              lookup,
+              self.vmr_lib,
+              molecules,
+              temperature,
+              pressure,
+              vmr_fields,
+              interp=interp,
+              z_leading_output=z_leading_output,
+          )
+          return {'optical_depth': tau, 'planck_fraction': pfrac}
         tau, rayl = gas_optics.compute_sw_optical_and_rayleigh_all_gpts_mxu(
             lookup,
             self.vmr_lib,
@@ -498,6 +510,7 @@ class RRTMOptics(optics_base.OpticsScheme):
             pressure,
             vmr_fields,
             interp=interp,
+            z_leading_output=z_leading_output,
         )
         return {'optical_depth': tau, 'rayleigh': rayl}
       out = {}
@@ -532,6 +545,8 @@ class RRTMOptics(optics_base.OpticsScheme):
               vmr_fields,
               interp=interp,
           )
+      if z_leading_output and temperature.ndim == 2:
+        out = {k: jnp.swapaxes(v, 0, 1) for k, v in out.items()}
     return out
 
   def compute_gas_optics_all_gpts(

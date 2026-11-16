@@ -202,6 +202,14 @@ def _hyperbolics(x2: Array) -> tuple[Array, Array, Array, Array]:
   )
 
 
+def _hyperbolics_r_t_only(x2: Array) -> tuple[Array, Array]:
+  """`sinh(x)/x` and `cosh(x)` only, when diffuse source terms are unused."""
+  n = _series_order(_eps_of(x2))
+  sinhc_c = [1.0 / math.factorial(2 * i + 1) for i in range(n + 1)]
+  cosh_c = [1.0 / math.factorial(2 * i) for i in range(n + 1)]
+  return _horner(x2, sinhc_c), _horner(x2, cosh_c)
+
+
 def _k_squared(gamma1: Array, gamma2: Array) -> Array:
   """``k^2 = (gamma1+gamma2)(gamma1-gamma2)`` (Meador & Weaver 1980).
 
@@ -250,6 +258,8 @@ def _direct_quantities(
     tau: Array,
     ssa: Array,
     zenith: float | Array,
+    *,
+    cos_zenith: float | Array | None = None,
 ) -> StatesMap:
   """Direct-beam reflectance and transmittance (MW80 eqs 14-15), f32-stable.
 
@@ -294,10 +304,11 @@ def _direct_quantities(
   ``exp(-tau/mu0)``; as before, only the diffusely-transmitted part is
   returned (the direct beam is handled separately in ``sw_cell_source``).
   """
-  mu0 = jnp.cos(zenith)
+  mu0 = jnp.cos(zenith) if cos_zenith is None else cos_zenith
   k = _k_fn(gamma1, gamma2)
   k_mu = k * mu0
   one_plus_kmu = 1.0 + k_mu
+  is_tpu = jax.default_backend() == 'tpu'
 
   # These exponentials come in two families and neither can be rebuilt from
   # the other, so each is evaluated in the form it is used in. `exp` carries a
@@ -307,13 +318,20 @@ def _direct_quantities(
   # departure from 1 that `exp` rounds away entirely for a thin layer.
   e2m1 = jnp.expm1(-2.0 * k * tau)                # exp(-2 k tau) - 1
   denom = k * (2.0 + e2m1) - gamma1 * e2m1        # diffuse denominator D
-  etm1 = jnp.expm1(-(k + 1.0 / mu0) * tau)        # exp(-(k + 1/mu0) tau) - 1
+  if is_tpu:
+    inv_mu0 = 1.0 / mu0
+    inv_one_plus_kmu = 1.0 / one_plus_kmu
+    etm1 = jnp.expm1(-(k + inv_mu0) * tau)
+    t0 = jnp.exp(-tau * inv_mu0)
+    tau_p = tau * inv_mu0 * inv_one_plus_kmu
+  else:
+    etm1 = jnp.expm1(-(k + 1.0 / mu0) * tau)      # exp(-(k + 1/mu0) tau) - 1
+    t0 = jnp.exp(-tau / mu0)
+    tau_p = tau / (mu0 * one_plus_kmu)
   e_ktmu = 1.0 + etm1                             # exp(-(k + 1/mu0) tau)
   e_kt = jnp.exp(-k * tau)
-  t0 = jnp.exp(-tau / mu0)
 
   eta = 1.0 - k_mu * k_mu
-  tau_p = tau / (mu0 * one_plus_kmu)
   x = eta * tau_p
   factored = jnp.abs(x) < 1.0
   # Safe operands: clip the factored-form argument (its phi/tau' pieces are
@@ -339,15 +357,25 @@ def _direct_quantities(
   )
 
   a2 = alpha2 - k * gamma3
-  r_dir = (ssa / denom) * (
-      -a2 * (e2m1 / one_plus_kmu + 2.0 * k_mu * pair_r)
-      - 2.0 * k * gamma3 * etm1 / one_plus_kmu
-  )
   c = alpha1 + k * gamma4
   d = alpha1 - k * gamma4
-  t_dir = (ssa / denom) * (
-      -c * one_plus_kmu * pair_t + d * e_kt * etm1 / one_plus_kmu
-  )
+  if is_tpu:
+    ssa_over_denom = ssa / denom
+    r_dir = ssa_over_denom * (
+        -a2 * (e2m1 * inv_one_plus_kmu + 2.0 * k_mu * pair_r)
+        - 2.0 * k * gamma3 * etm1 * inv_one_plus_kmu
+    )
+    t_dir = ssa_over_denom * (
+        -c * one_plus_kmu * pair_t + d * e_kt * etm1 * inv_one_plus_kmu
+    )
+  else:
+    r_dir = (ssa / denom) * (
+        -a2 * (e2m1 / one_plus_kmu + 2.0 * k_mu * pair_r)
+        - 2.0 * k * gamma3 * etm1 / one_plus_kmu
+    )
+    t_dir = (ssa / denom) * (
+        -c * one_plus_kmu * pair_t + d * e_kt * etm1 / one_plus_kmu
+    )
   # `1 - exp(-tau/mu0)` is the energy-conservation cap the caller clamps
   # against. Return it from here rather than have the caller evaluate the same
   # exponential a second time. (The subtraction does cancel for a thin layer,
@@ -355,10 +383,17 @@ def _direct_quantities(
   # another transcendental, and for no observable gain: a cap that small is far
   # inside `_SW_CLIP_SHARPNESS`, so the smooth clamp drives r_dir and t_dir to
   # zero there whether or not the cap itself is resolved.)
-  return {'r_dir': r_dir, 't_dir': t_dir, 'one_minus_t0': 1.0 - t0}
+  return {
+      'r_dir': r_dir,
+      't_dir': t_dir,
+      'one_minus_t0': 1.0 - t0,
+      't_noscat': t0,
+  }
 
 
-def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
+def _diffuse_quantities(
+    gamma1: Array, gamma2: Array, tau: Array, *, need_sources: bool = True
+) -> StatesMap:
   """Diffuse two-stream quantities (MW80 eqs 25-26), float32-stable.
 
   Two algebraically exact evaluations are blended at ``k*tau = 1``:
@@ -405,8 +440,54 @@ def _diffuse_quantities(gamma1: Array, gamma2: Array, tau: Array) -> StatesMap:
   # adjoint) is used only by the large branch.
   x2 = k2 * jnp.square(tau)
   small = x2 < _KTAU_SWITCH**2
-  gsum = jnp.maximum(gamma1 + gamma2, eps)
+  if jax.default_backend() == 'tpu':
+    x2c = jnp.where(small, x2, _KTAU_SWITCH**2)
+    ktau_big = jnp.where(small, _KTAU_SWITCH, k * tau)
+    e1 = jnp.exp(-ktau_big)
+    e2 = jnp.square(e1)
+    a = 1.0 - e2
+    d_big = k * (1.0 + e2) + gamma1 * a
+    inv_d_big = 1.0 / d_big
+    r_big = gamma2 * a * inv_d_big
+    t_big = 2.0 * k * e1 * inv_d_big
 
+    if not need_sources:
+      shc, ch = _hyperbolics_r_t_only(x2c)
+      inv_c_small = 1.0 / (ch + gamma1 * tau * shc)
+      r_small = gamma2 * tau * shc * inv_c_small
+      t_small = inv_c_small
+      return {
+          'r_diff': jnp.where(small, r_small, r_big),
+          't_diff': jnp.where(small, t_small, t_big),
+      }
+
+    gsum = jnp.maximum(gamma1 + gamma2, eps)
+    shc, shc_half, shc_m1, ch = _hyperbolics(x2c)
+    c_small = ch + gamma1 * tau * shc
+    inv_c_small = 1.0 / c_small
+    r_small = gamma2 * tau * shc * inv_c_small
+    t_small = inv_c_small
+    omrt_small = (
+        tau
+        * (0.5 * k2 * tau * jnp.square(shc_half) + (gamma1 - gamma2) * shc)
+        * inv_c_small
+    )
+    gmt_small = (
+        0.5 * k2 * tau * jnp.square(shc_half) / gsum + shc_m1
+    ) * inv_c_small
+    em1 = e1 - 1.0
+    omrt_big = (k * jnp.square(em1) + (gamma1 - gamma2) * a) * inv_d_big
+    tau_big = jnp.where(small, 1.0, tau)
+    g_big = (k * jnp.square(em1) + gsum * a) * inv_d_big / (tau_big * gsum)
+    gmt_big = g_big - t_big
+    return {
+        'r_diff': jnp.where(small, r_small, r_big),
+        't_diff': jnp.where(small, t_small, t_big),
+        'one_minus_r_minus_t': jnp.where(small, omrt_small, omrt_big),
+        'g_minus_t': jnp.where(small, gmt_small, gmt_big),
+    }
+
+  gsum = jnp.maximum(gamma1 + gamma2, eps)
   # --- small-k*tau branch (safe operand: the argument is clipped to the switch
   # point when this branch is *not* the selected one, both so the truncated
   # series stay inside the interval they are accurate on and so their leading
@@ -540,8 +621,60 @@ def lw_cell_source_and_properties(
   }
 
 
+def _pure_abs_gmt_order(eps: float) -> int:
+  """Terms needed for `m / (m + 1)! <= eps` on `[0, 1]`."""
+  m = 1
+  while m / math.factorial(m + 1) > eps:
+    m += 1
+  return m
+
+
+def lw_pure_absorption_two_stream_cell(
+    optical_depth: Array,
+    level_src_bottom: Array,
+    level_src_top: Array,
+) -> StatesMap:
+  """Exact `ssa == 0` specialization of `lw_cell_source_and_properties`.
+
+  When single-scattering albedo is identically zero (e.g. clear-sky longwave
+  gas optics without scattering aerosols), `gamma1 = 1.66`, `gamma2 = 0`, and
+  `r_diff = 0` identically. The two-stream cell quantities reduce algebraically
+  to `t_diff = exp(-x)`, `1 - R - T = -expm1(-x)`, and
+  `G - T = (1 - exp(-x)) / x - exp(-x)` with `x = 1.66 * max(tau, 0)`.
+  """
+  x = _LW_DIFFUSIVE_FACTOR * jnp.maximum(optical_depth, 0.0)
+  t_diff = jnp.exp(-x)
+  omrt = -jnp.expm1(-x)
+  small = x < _KTAU_SWITCH
+  xc = jnp.where(small, x, _KTAU_SWITCH)
+  m_max = _pure_abs_gmt_order(_eps_of(x))
+  gmt_coeffs = [
+      ((-1.0) ** (m - 1)) * m / math.factorial(m + 1)
+      for m in range(1, m_max + 1)
+  ]
+  gmt_small = xc * _horner(xc, gmt_coeffs)
+  x_safe = jnp.where(small, _KTAU_SWITCH, x)
+  gmt_big = omrt / x_safe - t_diff
+  gmt = jnp.where(small, gmt_small, gmt_big)
+
+  delta_src = level_src_bottom - level_src_top
+  src_up = math.pi * (level_src_top * omrt + delta_src * gmt)
+  src_down = math.pi * (level_src_bottom * omrt - delta_src * gmt)
+  return {
+      't_diff': t_diff,
+      'src_up': src_up,
+      'src_down': src_down,
+  }
+
+
 def sw_cell_properties(
-    zenith: float | Array, optical_depth: Array, ssa: Array, asymmetry_factor: Array
+    zenith: float | Array,
+    optical_depth: Array,
+    ssa: Array,
+    asymmetry_factor: Array,
+    *,
+    cos_zenith: float | Array | None = None,
+    return_t_noscat: bool = False,
 ) -> StatesMap:
   """Compute shortwave reflectance and transmittance.
 
@@ -555,13 +688,14 @@ def sw_cell_properties(
     optical_depth: A 3D variable containing the pointwise optical depth.
     ssa: A 3D variable containing the pointwise single-scattering albedo.
     asymmetry_factor: A 3D variable containing the pointwise asymmetry factor.
+    cos_zenith: Optional precomputed `cos(zenith)` matching or broadcastable to
+      `optical_depth` to avoid recomputing `jnp.cos` per spectral chunk.
+    return_t_noscat: When `True`, also include `'t_noscat'` (`exp(-tau / mu0)`)
+      in the returned mapping so callers do not recompute that exponential.
 
   Returns:
-    A dictionary containing the following items:
-    't_diff': A 3D variable containing the diffuse transmittance.
-    'r_diff': A 3D variable containing the diffuse reflectance.
-    't_dir': A 3D variable containing the direct transmittance.
-    'r_dir': A 3D variable containing the direct reflectance.
+    A dictionary containing `'t_diff'`, `'r_diff'`, `'t_dir'`, `'r_dir'`, and
+    optionally `'t_noscat'`.
   """
   # Clamp to the physical range: negative halo/edge optical depths would make
   # the `exp(-tau * k)` and `exp(-tau / cos(zenith))` terms overflow to `+inf`
@@ -569,22 +703,34 @@ def sw_cell_properties(
   # fluxes -- poison the reverse-mode cotangents. See the longwave counterpart
   # in `lw_cell_source_and_properties` for details.
   optical_depth = jnp.maximum(optical_depth, 0.0)
-  if jnp.ndim(zenith) > 0 and jnp.ndim(zenith) < optical_depth.ndim:
-    zenith = jnp.broadcast_to(
-        jnp.asarray(zenith), optical_depth.shape[:-1]
-    )[..., jnp.newaxis]
+  if cos_zenith is None:
+    if jnp.ndim(zenith) > 0 and jnp.ndim(zenith) < optical_depth.ndim:
+      zenith = jnp.broadcast_to(
+          jnp.asarray(zenith), optical_depth.shape[:-1]
+      )[..., jnp.newaxis]
+    mu0_g3 = jnp.cos(zenith)
+    mu0_direct = mu0_g3 if jax.default_backend() == 'tpu' else None
+  else:
+    mu0_g3 = cos_zenith
+    if jnp.ndim(mu0_g3) > 0 and jnp.ndim(mu0_g3) < optical_depth.ndim:
+      mu0_g3 = jnp.broadcast_to(
+          jnp.asarray(mu0_g3), optical_depth.shape[:-1]
+      )[..., jnp.newaxis]
+    mu0_direct = mu0_g3
 
   # Exchange rate coefficients from Zdunkowski et al. (1980).
   g = asymmetry_factor
   gamma1 = 0.25 * (8 - ssa * (5 + 3 * g))
   gamma2 = 0.25 * 3 * ssa * (1 - g)
-  gamma3 = 0.25 * (2 - 3 * jnp.cos(zenith) * g)
+  gamma3 = 0.25 * (2 - 3 * mu0_g3 * g)
   gamma4 = 1 - gamma3
   alpha1 = gamma1 * gamma4 + gamma2 * gamma3
   alpha2 = gamma1 * gamma3 + gamma2 * gamma4
 
   # Diffuse reflectance and transmittance.
-  diffuse = _diffuse_quantities(gamma1, gamma2, optical_depth)
+  diffuse = _diffuse_quantities(
+      gamma1, gamma2, optical_depth, need_sources=False
+  )
   r_diff = diffuse['r_diff']
   t_diff = diffuse['t_diff']
 
@@ -594,8 +740,16 @@ def sw_cell_properties(
   # cell (`ssa == 0`, e.g. a pure-absorption g-point or a halo layer) yields
   # an exact 0 with a finite adjoint — no safe-divide masking is needed.
   direct = _direct_quantities(
-      gamma1, gamma2, gamma3, gamma4, alpha1, alpha2, optical_depth, ssa,
+      gamma1,
+      gamma2,
+      gamma3,
+      gamma4,
+      alpha1,
+      alpha2,
+      optical_depth,
+      ssa,
       zenith,
+      cos_zenith=mu0_direct,
   )
   r_dir_unconstrained = direct['r_dir']
   t_dir_unconstrained = direct['t_dir']
@@ -638,12 +792,15 @@ def sw_cell_properties(
       0.0,
   )
 
-  return {
+  out = {
       't_diff': t_diff,
       'r_diff': r_diff,
       't_dir': t_dir,
       'r_dir': r_dir,
   }
+  if return_t_noscat:
+    out['t_noscat'] = direct['t_noscat']
+  return out
 
 
 def sw_cell_source(

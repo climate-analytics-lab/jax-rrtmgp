@@ -429,6 +429,68 @@ class MonochromaticTwoStreamTest(unittest.TestCase):
         sw_flux_net, expected_sw_flux_net, rtol=1.2e-5, atol=0
     )
 
+  def test_lw_pure_absorption_two_stream_cell_and_sw_cos_zenith(self):
+    """Pure-absorption LW helper and SW `cos_zenith`/`return_t_noscat` match."""
+    rng = np.random.default_rng(2026)
+    tau = jnp.asarray(10.0 ** rng.uniform(-8, 2, 256), jnp.float32)
+    s_bot = jnp.asarray(rng.uniform(5.0, 40.0, 256), jnp.float32)
+    s_top = s_bot * jnp.asarray(rng.uniform(0.9, 1.1, 256), jnp.float32)
+    zeros = jnp.zeros_like(tau)
+
+    pure = monochromatic_two_stream.lw_pure_absorption_two_stream_cell(
+        tau, s_bot, s_top
+    )
+    gen = monochromatic_two_stream.lw_cell_source_and_properties(
+        tau, zeros, s_bot, s_top, zeros
+    )
+    for key in ('t_diff', 'src_up', 'src_down'):
+      np.testing.assert_allclose(pure[key], gen[key], rtol=5e-6, atol=1e-6)
+
+    zero_cell = monochromatic_two_stream.lw_pure_absorption_two_stream_cell(
+        jnp.zeros((1,), jnp.float32),
+        jnp.array([20.0], jnp.float32),
+        jnp.array([19.0], jnp.float32),
+    )
+    self.assertEqual(float(zero_cell['t_diff'][0]), 1.0)
+    self.assertEqual(float(zero_cell['src_up'][0]), 0.0)
+    self.assertEqual(float(zero_cell['src_down'][0]), 0.0)
+
+    tau_deg = jnp.array([0.0, 1e-8, 1e-4, 0.5, 100.0], jnp.float32)
+    sb_deg = jnp.full_like(tau_deg, 20.0)
+    st_deg = jnp.full_like(tau_deg, 19.0)
+    grads = jax.grad(
+        lambda t, b, u: sum(
+            jnp.sum(v)
+            for v in monochromatic_two_stream.lw_pure_absorption_two_stream_cell(
+                t, b, u
+            ).values()
+        ),
+        argnums=(0, 1, 2),
+    )(tau_deg, sb_deg, st_deg)
+    for grad in grads:
+      self.assertTrue(bool(jnp.isfinite(grad).all()))
+
+    zen = jnp.float32(0.42)
+    ssa = jnp.asarray(rng.uniform(0.0, 0.99, 256), jnp.float32)
+    asy = jnp.asarray(rng.uniform(0.0, 0.85, 256), jnp.float32)
+    sw_ref = monochromatic_two_stream.sw_cell_properties(zen, tau, ssa, asy)
+    sw_opt = monochromatic_two_stream.sw_cell_properties(
+        zen,
+        tau,
+        ssa,
+        asy,
+        cos_zenith=jnp.cos(zen),
+        return_t_noscat=True,
+    )
+    for key in ('r_diff', 't_diff', 'r_dir', 't_dir'):
+      np.testing.assert_allclose(sw_opt[key], sw_ref[key], rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(
+        sw_opt['t_noscat'],
+        jnp.exp(-tau / jnp.cos(zen)),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
 
 if __name__ == '__main__':
   unittest.main()

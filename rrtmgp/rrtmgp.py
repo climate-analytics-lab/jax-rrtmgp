@@ -580,10 +580,14 @@ class RRTMGP:
       dz_zc: float | Array | None = None,
       zenith: float | Array | None = None,
       irrad: float | Array | None = None,
+      cloud_path_liq: Array | None = None,
+      cloud_path_ice: Array | None = None,
       cloud_path_liq_lw_per_gpt: Array | None = None,
       cloud_path_ice_lw_per_gpt: Array | None = None,
       cloud_path_liq_sw_per_gpt: Array | None = None,
       cloud_path_ice_sw_per_gpt: Array | None = None,
+      cloud_mask_lw_per_gpt: Array | None = None,
+      cloud_mask_sw_per_gpt: Array | None = None,
       vmr_fields: dict[str, Array] | None = None,
       aerosol_optics_lw: dict[str, Array] | None = None,
       aerosol_optics_sw: dict[str, Array] | None = None,
@@ -655,11 +659,11 @@ class RRTMGP:
     with_aerosol_free = aerosol_free_fluxes
 
     h = self._dz if dz_zc is None else dz_zc
-    liq_water_path = None
-    if q_liq is not None and rho_zc is not None:
+    liq_water_path = cloud_path_liq
+    if liq_water_path is None and q_liq is not None and rho_zc is not None:
       liq_water_path = rho_zc * jnp.clip(q_liq, 0.0, None) * h
-    ice_water_path = None
-    if q_ice is not None and rho_zc is not None:
+    ice_water_path = cloud_path_ice
+    if ice_water_path is None and q_ice is not None and rho_zc is not None:
       ice_water_path = rho_zc * jnp.clip(q_ice, 0.0, None) * h
 
     with jax.named_scope('lw'):
@@ -686,6 +690,7 @@ class RRTMGP:
           lw_secant=lw_secant,
           with_aerosol_free=with_aerosol_free,
           per_gpt_axis=per_gpt_axis,
+          cloud_mask_per_gpt=cloud_mask_lw_per_gpt,
       )
     with jax.named_scope('sw'):
       sw_fluxes = two_stream.solve_sw_zc(
@@ -710,6 +715,7 @@ class RRTMGP:
           with_clear_sky=with_clear_sky,
           with_aerosol_free=with_aerosol_free,
           per_gpt_axis=per_gpt_axis,
+          cloud_mask_per_gpt=cloud_mask_sw_per_gpt,
       )
 
     extra: dict[str, tuple[dict[str, Array], dict[str, Array]]] = {}
