@@ -603,8 +603,7 @@ def solve_lw(
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_lw)
 
   if (
-      jax.default_backend() == 'tpu'
-      and hoist_gas_optics
+      hoist_gas_optics
       and use_scan
       and gpt_chunk > 1
       and isinstance(optics_lib, optics.RRTMOptics)
@@ -881,9 +880,11 @@ def _sw_sfc_albedo_by_band(
 # `solve_sw` so downstream callers can skip scalar-zenith shims.
 _SUPPORTS_2D_ZENITH = True
 
-# Capability flag advertising native column-minor `(nzh, nc)` TPU solvers
-# (`solve_lw_zc`, `solve_sw_zc`, `RRTMGP.compute_heating_rate_zc`).
+# Capability flags advertising native column-minor `(nzh, nc)` solvers
+# (`solve_lw_zc`, `solve_sw_zc`, `RRTMGP.compute_heating_rate_zc`) across TPU,
+# CPU, and GPU backends.
 _SUPPORTS_TPU_COL_MINOR_SOLVE = True
+_SUPPORTS_COL_MINOR_SOLVE = True
 
 
 def solve_sw(
@@ -1023,8 +1024,7 @@ def solve_sw(
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_sw)
 
   if (
-      jax.default_backend() == 'tpu'
-      and hoist_gas_optics
+      hoist_gas_optics
       and use_scan
       and gpt_chunk > 1
       and isinstance(optics_lib, optics.RRTMOptics)
@@ -1422,8 +1422,17 @@ def _reconstruct_face_values_zc(f_zc: Array, f_lower_bc_c: Array) -> Array:
 def _interp_1d_table_mxu(table_2d: Array, x: Array, ref_grid: Array) -> Array:
   """1-D linear interpolation of all rows of `table_2d` `(n_rows, n_nodes)`."""
   interp = optics_utils.create_linear_interpolant(x, ref_grid)
-  n_nodes = table_2d.shape[1]
+  n_rows, n_nodes = table_2d.shape
   ncells = x.size
+  if jax.default_backend() != 'tpu':
+    tbl_t = table_2d.T
+    lo = tbl_t[interp.interp_low.idx.reshape(ncells)] * (
+        interp.interp_low.weight.reshape(ncells, 1)
+    )
+    hi = tbl_t[interp.interp_high.idx.reshape(ncells)] * (
+        interp.interp_high.weight.reshape(ncells, 1)
+    )
+    return (lo + hi).T.reshape(n_rows, *x.shape)
   oh = interp.interp_low.weight.reshape(1, ncells) * jax.nn.one_hot(
       interp.interp_low.idx.reshape(ncells),
       n_nodes,
@@ -1437,7 +1446,7 @@ def _interp_1d_table_mxu(table_2d: Array, x: Array, ref_grid: Array) -> Array:
   )
   return jnp.matmul(
       table_2d, oh, precision=jax.lax.Precision.HIGHEST
-  ).reshape(table_2d.shape[0], *x.shape)
+  ).reshape(n_rows, *x.shape)
 
 
 def _planck_all_bands_mxu(
@@ -1535,6 +1544,8 @@ def _cloud_mie_tables_mxu(
 
 def _band_to_zgc(bnd_oh_chunk: Array, field_bzc: Array) -> Array:
   """Project `(n_bnd, nz, nc)` to `(nz, chunk, nc)` keeping `nc` minor."""
+  if jnp.issubdtype(bnd_oh_chunk.dtype, jnp.integer):
+    return jnp.swapaxes(field_bzc, 0, 1)[:, bnd_oh_chunk, :]
   n_bnd, nz, nc = field_bzc.shape
   chunk = bnd_oh_chunk.shape[0]
   out_gzc = jnp.matmul(
@@ -1543,6 +1554,15 @@ def _band_to_zgc(bnd_oh_chunk: Array, field_bzc: Array) -> Array:
       precision=jax.lax.Precision.HIGHEST,
   ).reshape(chunk, nz, nc)
   return jnp.swapaxes(out_gzc, 0, 1)
+
+
+def _band_to_gc(bnd_oh_chunk: Array, field_bc: Array) -> Array:
+  """Project `(n_bnd, nc)` to `(chunk, nc)` keeping `nc` minor."""
+  if jnp.issubdtype(bnd_oh_chunk.dtype, jnp.integer):
+    return field_bc[bnd_oh_chunk, :]
+  return jnp.matmul(
+      bnd_oh_chunk, field_bc, precision=jax.lax.Precision.HIGHEST
+  )
 
 
 def _cloud_props_from_mie(
@@ -1704,11 +1724,13 @@ def _to_1c(val: Array | float, nc: int, dtype: jnp.dtype) -> Array:
 def _band_oh_packed(
     g_point_to_bnd: Array, n_bnd: int, n_chunks: int, chunk: int, dtype: jnp.dtype
 ) -> Array:
-  """Static `(n_chunks, chunk, n_bnd)` band-projection matrix."""
+  """Static band-to-g-point selector (`int32` indices or TPU one-hot matrix)."""
   g2b = np.asarray(g_point_to_bnd)
   n_gpt = g2b.shape[0]
   padded = np.minimum(np.arange(n_chunks * chunk), n_gpt - 1)
   bnds = g2b[padded]
+  if jax.default_backend() != 'tpu':
+    return jnp.asarray(bnds, dtype=jnp.int32).reshape(n_chunks, chunk)
   oh = np.eye(n_bnd, dtype=np.float32)[bnds]
   return jnp.asarray(oh, dtype=dtype).reshape(n_chunks, chunk, n_bnd)
 
@@ -2013,9 +2035,7 @@ def solve_lw_zc(
     level_src_bottom = level_src[:-1]
     level_src_top = level_src[1:]
 
-    b_sfc_g = jnp.matmul(
-        bnd_oh, b_sfc, precision=jax.lax.Precision.HIGHEST
-    )
+    b_sfc_g = _band_to_gc(bnd_oh, b_sfc)
     sfc_src = pfrac[1] * b_sfc_g
     lay_src = None
     if need_lay_src:
@@ -2388,16 +2408,12 @@ def solve_sw_zc(
     sfc_albedo_dir = (
         alb_dir_const
         if alb_dir_const is not None
-        else jnp.matmul(
-            bnd_oh, alb_dir_by_band, precision=jax.lax.Precision.HIGHEST
-        )
+        else _band_to_gc(bnd_oh, alb_dir_by_band)
     )
     sfc_albedo_dif = (
         alb_dif_const
         if alb_dif_const is not None
-        else jnp.matmul(
-            bnd_oh, alb_dif_by_band, precision=jax.lax.Precision.HIGHEST
-        )
+        else _band_to_gc(bnd_oh, alb_dif_by_band)
     )
 
     gas_props = optics_lib._sw_gas_properties(tau_abs, rayl)  # pylint: disable=protected-access

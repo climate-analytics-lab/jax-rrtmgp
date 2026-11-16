@@ -132,9 +132,7 @@ def get_vmr(
     the pointwise volume mixing ratios of the corresponding gas species at that
     pressure level.
   """
-  if jax.default_backend() == 'tpu' and isinstance(
-      species_idx, (int, np.integer)
-  ):
+  if isinstance(species_idx, (int, np.integer)):
     return _get_vmr_static(
         lookup_gas_optics, vmr_lib, int(species_idx), vmr_fields
     )
