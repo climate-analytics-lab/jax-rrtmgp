@@ -22,6 +22,7 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from rrtmgp import backend
 from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import gas_optics
 from rrtmgp.optics import lookup_gas_optics_longwave
@@ -622,11 +623,28 @@ class GasOpticsTest(unittest.TestCase):
     temp = jnp.linspace(120.0, 380.0, n, dtype=jnp.float32).reshape(shape)
     interp = optics_utils.create_linear_interpolant(temp, lw.t_planck)
     fns = collections.OrderedDict({'t': lambda: interp})
+    want = optics_utils.interpolate_orig(lw.totplnk[0], fns)
+    with backend.tpu_kernels(True):
+      got = optics_utils.interpolate(lw.totplnk[0], fns)
+      # Every band's row at once, and a column-minor array big enough to be
+      # contracted a level at a time.
+      rows = optics_utils.interpolate_rows_1d(lw.totplnk, interp)
+      temp_zc = jnp.linspace(150.0, 340.0, 49 * 9216).reshape(49, 9216)
+      interp_zc = optics_utils.create_linear_interpolant(temp_zc, lw.t_planck)
+      rows_zc = optics_utils.interpolate_rows_1d(lw.totplnk[:2], interp_zc)
+    rows_zc_want = optics_utils.interpolate_rows_1d(lw.totplnk[:2], interp_zc)
+    np.testing.assert_allclose(rows_zc, rows_zc_want, rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(
-        optics_utils._interpolate_1d_mxu(lw.totplnk[0], fns),
-        optics_utils.interpolate_orig(lw.totplnk[0], fns),
+        rows[0],
+        want,
         # Beyond the table the two weights have opposite signs and partly
         # cancel, which costs a few ulp.
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        got,
+        want,
         rtol=1e-5,
         atol=1e-6,
     )
@@ -648,8 +666,8 @@ class GasOpticsTest(unittest.TestCase):
   def test_all_gpts_mxu_matches_the_gather_form(self):
     """The TPU all-g-point gas optics equal the gather form, on every path.
 
-    The level-at-a-time pressure window, the blocked fallback the window falls
-    back to (a level spanning more of the pressure table than it), and the
+    The level-at-a-time pressure window, a level spanning more of the
+    pressure table than the window (which reads the whole table), and the
     multi-block solve of cells that are not `(n_levels, n_columns)`; with the
     pressure varying across each level's columns, temperatures beyond both
     ends of the table, and both output layouts.

@@ -536,39 +536,60 @@ def interpolate_optimized(
   return weighted_sum
 
 
-def _interpolate_1d_mxu(
-    coeffs: Array,
-    interpolant_fns: collections.OrderedDict[str, Callable[..., Interpolant]],
-) -> Array:
-  """Cell-minor 1D MXU table interpolation with IEEE float32 precision."""
-  fn = next(iter(interpolant_fns.values()))
-  interp = fn()
-  n_nodes = coeffs.shape[0]
-  cell_shape = (
-      interp.idx.shape
-      if isinstance(interp, IndexAndWeight)
-      else interp.interp_high.idx.shape
-  )
-  ncells = math.prod(cell_shape)
-  if isinstance(interp, IndexAndWeight):
-    oh = interp.weight.reshape(1, ncells) * jax.nn.one_hot(
-        interp.idx.reshape(ncells), n_nodes, dtype=coeffs.dtype, axis=0
+# Size of the one-hot weights above which `interpolate_rows_1d`, with the TPU
+# kernels, contracts a 2D cell array one leading-axis slice at a time instead
+# of all of it at once.
+_TPU_ONE_HOT_BLOCK_BYTES = 16 * 1024 * 1024
+
+
+def interpolate_rows_1d(table: Array, interp: Interpolant) -> Array:
+  """Linear interpolation of every row of a `(n_rows, n_nodes)` table.
+
+  Each row is a 1D table on the nodes `interp` was built against, and each is
+  interpolated as `interpolate` interpolates a 1D table, all rows in one pass:
+  a row gather on CPU/GPU, and with the TPU kernels (`rrtmgp.backend`) a
+  contraction of the table with the cells' one-hot interpolation weights at
+  `Precision.HIGHEST`, the cells on the minor axis. A 2D cell array whose
+  one-hot weights would exceed `_TPU_ONE_HOT_BLOCK_BYTES` is contracted a
+  leading-axis slice (a level of a column-minor array) at a time.
+
+  Args:
+    table: `(n_rows, n_nodes)`.
+    interp: The cells' interpolant on the `n_nodes` nodes.
+
+  Returns:
+    `(n_rows, *cell_shape)`.
+  """
+  lo, hi = interp.interp_low, interp.interp_high
+  cell_shape = lo.idx.shape
+  n_rows, n_nodes = table.shape
+  n_cells = math.prod(cell_shape)
+  if not backend.use_tpu_kernels():
+    rows = table.T
+    out = rows[lo.idx.reshape(n_cells)] * lo.weight.reshape(n_cells, 1) + (
+        rows[hi.idx.reshape(n_cells)] * hi.weight.reshape(n_cells, 1)
     )
-  else:
-    oh = interp.interp_low.weight.reshape(1, ncells) * jax.nn.one_hot(
-        interp.interp_low.idx.reshape(ncells),
-        n_nodes,
-        dtype=coeffs.dtype,
-        axis=0,
-    ) + interp.interp_high.weight.reshape(1, ncells) * jax.nn.one_hot(
-        interp.interp_high.idx.reshape(ncells),
-        n_nodes,
-        dtype=coeffs.dtype,
-        axis=0,
+    return out.T.reshape(n_rows, *cell_shape)
+
+  def contract(idx_lo: Array, w_lo: Array, w_hi: Array) -> Array:
+    m = idx_lo.shape[0]
+    one_hot = jax.nn.one_hot(idx_lo, n_nodes - 1, dtype=table.dtype, axis=0)
+    weights = jnp.pad(w_lo.reshape(1, m) * one_hot, ((0, 1), (0, 0))) + (
+        jnp.pad(w_hi.reshape(1, m) * one_hot, ((1, 0), (0, 0)))
     )
-  return jnp.einsum(
-      "a,ac->c", coeffs, oh, precision=jax.lax.Precision.HIGHEST
-  ).reshape(cell_shape)
+    return jnp.matmul(table, weights, precision=jax.lax.Precision.HIGHEST)
+
+  one_hot_bytes = n_nodes * n_cells * table.dtype.itemsize
+  if len(cell_shape) == 2 and one_hot_bytes > _TPU_ONE_HOT_BLOCK_BYTES:
+    out = jax.lax.map(
+        lambda args: contract(*args), (lo.idx, lo.weight, hi.weight)
+    )
+    return jnp.swapaxes(out, 0, 1)
+  return contract(
+      lo.idx.reshape(n_cells),
+      lo.weight.reshape(n_cells),
+      hi.weight.reshape(n_cells),
+  ).reshape(n_rows, *cell_shape)
 
 
 def interpolate(
@@ -628,9 +649,11 @@ def interpolate(
         and len(interpolant_fns) == 1
         and not _LOOKUP_IMPL_EXPLICIT
     ):
-      # 1D tables (cloud Mie curves, Planck totplnk) contract cleanly on the
-      # TPU MXU as (n_nodes,) @ (n_nodes, ncells) with ncells on the minor axis.
-      return _interpolate_1d_mxu(coeffs, interpolant_fns)
+      # A 1D table (a cloud Mie curve, the Planck `totplnk`) is a single
+      # contraction on the TPU matrix unit, with no gather.
+      interp = next(iter(interpolant_fns.values()))()
+      if isinstance(interp, Interpolant):
+        return interpolate_rows_1d(coeffs[jnp.newaxis], interp)[0]
     # interpolate_orig routes through evaluate_weighted_lookup, which honours
     # the direct-indexing gather backend selected above.
     return interpolate_orig(coeffs, interpolant_fns)

@@ -19,19 +19,20 @@ import functools
 from pathlib import Path
 from typing import TypeAlias
 
-from unittest import mock
 import unittest
 import jax
 import jax.numpy as jnp
 import netCDF4 as nc
 import numpy as np
 from parameterized import parameterized
+from rrtmgp import backend
 from rrtmgp import constants
 from rrtmgp import rrtmgp
 from rrtmgp import rrtmgp_common
 from rrtmgp import test_util
 from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import lookup_volume_mixing_ratio
+from rrtmgp.rte import two_stream
 
 Array: TypeAlias = jax.Array
 
@@ -492,23 +493,29 @@ class RRTMGPAerosolFreeTest(unittest.TestCase):
   _STEMS = ('sw_flux_up', 'sw_flux_down', 'lw_flux_up', 'lw_flux_down')
 
   @parameterized.expand([
-      ('per_gpt', dict()),
+      ('per_gpt', dict(), None),
       # jax-gcm's production placement: hoisted gas optics, scanned
-      # recurrences, 64 g-points per chunk.
+      # recurrences, 64 g-points per chunk, solved column-minor; and the
+      # level-minor solve of the same placement.
       ('all_gpts', dict(gas_optics_mode='all_gpts', gpt_chunk=64,
-                        use_scan=True)),
+                        use_scan=True), None),
+      ('all_gpts_level_minor', dict(gas_optics_mode='all_gpts', gpt_chunk=64,
+                                    use_scan=True), False),
   ])
-  def test_twins_are_the_solve_without_aerosol(self, _, placement):
+  def test_twins_are_the_solve_without_aerosol(
+      self, _, placement, column_minor
+  ):
     """Each twin equals the same call with the aerosol arguments left out."""
     inputs, aerosol = self._inputs()
     rt = self._rt()
-    got = rt.compute_heating_rate(
-        **inputs, **aerosol, clear_sky_fluxes=True, aerosol_free_fluxes=True,
-        **placement,
-    )
-    want = rt.compute_heating_rate(
-        **inputs, clear_sky_fluxes=True, **placement
-    )
+    with two_stream._column_minor(column_minor):  # pylint: disable=protected-access
+      got = rt.compute_heating_rate(
+          **inputs, **aerosol, clear_sky_fluxes=True,
+          aerosol_free_fluxes=True, **placement,
+      )
+      want = rt.compute_heating_rate(
+          **inputs, clear_sky_fluxes=True, **placement
+      )
     for stem in self._STEMS:
       for tag, want_tag in (('aerosolfree', ''),
                             ('aerosolfree_clearsky', 'clearsky_')):
@@ -685,382 +692,363 @@ class RRTMGPAerosolTest(unittest.TestCase):
     )
 
 
-class RRTMGPTPUColumnMinorTest(unittest.TestCase):
-  """Parity, AD, and StableHLO checks for TPU column-minor (`_zc`) solvers."""
+def _varied_columns(nx: int = 6, ny: int = 7, seed: int = 1234):
+  """An `(nx, ny)` grid of distinct, horizontally varying columns.
+
+  The 42 columns of `cloudysky_as.nc` with the surface pressure scaled by
+  0.75-1.02 in a hybrid-sigma-like way (so one model level spans several
+  pressure-table nodes across the grid), liquid and ice cloud with random
+  effective radii, per-band LW and SW aerosol, per-band direct and diffuse SW
+  albedos, a 2D emissivity, surface temperature, ozone and zenith (with a
+  horizon and a night column), and per-phase cloud optical-depth scaling.
+
+  Returns:
+    The radiative transfer object, the keyword arguments of
+    `compute_heating_rate` (3D, `(nx, ny, nz + 2)`) and of
+    `compute_heating_rate_zc` (`(nz + 2, nx * ny)`), and the McICA inputs of
+    each layout.
+  """
+  cfg = dataclasses.replace(
+      _build_radiative_transfer_cfg(), save_lw_sw_heating_rates=True
+  )
+  diagnostics = (
+      'surf_lw_flux_down_2d_xy', 'surf_lw_flux_up_2d_xy',
+      'surf_sw_flux_down_2d_xy', 'surf_sw_flux_up_2d_xy',
+      'surf_sw_flux_down_dir_2d_xy',
+      'toa_sw_flux_incoming_2d_xy', 'toa_sw_flux_outgoing_2d_xy',
+      'toa_lw_flux_outgoing_2d_xy',
+      'toa_sw_flux_outgoing_clearsky_2d_xy',
+      'toa_lw_flux_outgoing_clearsky_2d_xy',
+      'toa_sw_flux_outgoing_aerosolfree_2d_xy',
+      'toa_lw_flux_outgoing_aerosolfree_2d_xy',
+      'rad_heat_lw_1d_z', 'rad_heat_sw_1d_z',
+  )
+  rt = rrtmgp.RRTMGP(cfg, dz=500.0, diagnostic_fields=diagnostics)
+  olib = rt.optics_lib
+  n_bnd_lw, n_bnd_sw = olib.gas_optics_lw.n_bnd, olib.gas_optics_sw.n_bnd
+  n_gpt_lw, n_gpt_sw = olib.n_gpt_lw, olib.n_gpt_sw
+
+  ds = nc.Dataset(root / _ATMOSPHERIC_STATE_FILENAME, 'r')
+  p_lay = np.asarray(ds['p_lay'][:].data).T
+  t_lay = np.asarray(ds['t_lay'][:].data).T
+  t_lev = np.asarray(ds['t_lev'][:].data).T
+  h2o = np.asarray(ds['vmr_h2o'][:].data).T
+  o3 = np.asarray(ds['vmr_o3'][:].data).T
+  t_sfc = np.asarray(ds['t_sfc'][:].data)
+  ncol, nz = p_lay.shape
+  assert ncol == nx * ny
+  rng = np.random.default_rng(seed)
+  pscale = rng.uniform(0.75, 1.02, ncol)[:, None]
+  p_lay = p_lay * (1.0 + (pscale - 1.0) * p_lay / p_lay.max(axis=1, keepdims=True))
+
+  def pad_edge(a):
+    return np.concatenate([a[..., :1], a, a[..., -1:]], axis=-1)
+
+  p = pad_edge(p_lay)
+  temp = np.zeros((ncol, nz + 2))
+  temp[:, 1:-1] = t_lay
+  temp[:, 0] = 2 * t_lev[:, 0] - t_lay[:, 0]
+  temp[:, -1] = 2 * t_lev[:, -1] - t_lay[:, -1]
+  vh2o = pad_edge(h2o)
+  q_v = vh2o / (vh2o + constants.R_V / constants.R_D)
+  rho = p / (constants.R_D * temp)
+  q_liq = np.where((p > 6e4) & (p < 9.5e4), rng.uniform(0, 3e-4, p.shape), 0.0)
+  q_ice = np.where((p > 1.5e4) & (p < 4e4), rng.uniform(0, 1e-4, p.shape), 0.0)
+  q_liq[:, [0, -1]] = 0
+  q_ice[:, [0, -1]] = 0
+  q_c = q_liq + q_ice
+  r_liq = rng.uniform(6e-6, 14e-6, p.shape)
+  r_ice = rng.uniform(20e-6, 70e-6, p.shape)
+  zen = rng.uniform(0.0, 0.45 * np.pi, ncol)
+  zen[0] = 0.5 * np.pi
+  zen[9] = 0.7 * np.pi
+  alb_dir = rng.uniform(0.05, 0.4, (ncol, n_bnd_sw))
+  alb_dif = rng.uniform(0.05, 0.4, (ncol, n_bnd_sw))
+  sfc_emis = rng.uniform(0.92, 0.99, ncol)
+  tau_scale_liq = rng.uniform(0.6, 1.0, ncol)
+
+  def aer(n_bnd, scale):
+    return {
+        'optical_depth': rng.uniform(0, scale, (n_bnd, ncol, nz)),
+        'ssa': rng.uniform(0.6, 0.97, (n_bnd, ncol, nz)),
+        'asymmetry_factor': rng.uniform(0.5, 0.8, (n_bnd, ncol, nz)),
+    }
+
+  aer_lw, aer_sw = aer(n_bnd_lw, 0.02), aer(n_bnd_sw, 0.05)
+
+  # McICA: each g-point sees the cell's cloud or none.
+  dz = 500.0
+  lwp = rho[:, 1:-1] * q_liq[:, 1:-1] * dz
+  iwp = rho[:, 1:-1] * q_ice[:, 1:-1] * dz
+  mask_lw = rng.uniform(size=(n_gpt_lw, ncol, nz)) < 0.5
+  mask_sw = rng.uniform(size=(n_gpt_sw, ncol, nz)) < 0.5
+
+  f32 = lambda a: jnp.asarray(a, jnp.float32)
+  to3 = lambda a: f32(a.reshape(nx, ny, *a.shape[1:]))
+  zc = lambda a: f32(np.moveaxis(a, 0, -1))  # (ncol, ...) -> (..., ncol)
+  common = dict(
+      irrad=jnp.float32(1360.0),
+      cloud_tau_scale_ice=jnp.float32(0.8),
+  )
+  kwargs_3d = dict(
+      rho_xxc=to3(rho), q_t=to3(q_v + q_c), q_liq=to3(q_liq), q_ice=to3(q_ice),
+      q_c=to3(q_c), cloud_r_eff_liq=to3(r_liq), cloud_r_eff_ice=to3(r_ice),
+      temperature=to3(temp), sfc_temperature=to3(t_sfc), p_ref_xxc=to3(p),
+      sg_map={}, vmr_fields={'o3': to3(pad_edge(o3))}, zenith=to3(zen),
+      sfc_emis=to3(sfc_emis), sfc_alb_dir=to3(alb_dir),
+      sfc_alb_dif=to3(alb_dif),
+      aerosol_optics_lw={
+          k: f32(pad_edge(v).reshape(n_bnd_lw, nx, ny, nz + 2))
+          for k, v in aer_lw.items()
+      },
+      aerosol_optics_sw={
+          k: f32(pad_edge(v).reshape(n_bnd_sw, nx, ny, nz + 2))
+          for k, v in aer_sw.items()
+      },
+      cloud_tau_scale_liq=to3(tau_scale_liq[:, None]),
+      **common,
+  )
+  kwargs_zc = dict(
+      rho_zc=zc(rho), q_t=zc(q_v + q_c), q_liq=zc(q_liq), q_ice=zc(q_ice),
+      q_c=zc(q_c), cloud_r_eff_liq=zc(r_liq), cloud_r_eff_ice=zc(r_ice),
+      temperature=zc(temp), sfc_temperature=f32(t_sfc), p_ref_zc=zc(p),
+      dz_zc=dz, vmr_fields={'o3': zc(pad_edge(o3))}, zenith=f32(zen),
+      sfc_emis=f32(sfc_emis), sfc_alb_dir=f32(alb_dir.T),
+      sfc_alb_dif=f32(alb_dif.T),
+      aerosol_optics_lw={k: f32(np.moveaxis(v, 1, 2)) for k, v in aer_lw.items()},
+      aerosol_optics_sw={k: f32(np.moveaxis(v, 1, 2)) for k, v in aer_sw.items()},
+      cloud_tau_scale_liq=f32(tau_scale_liq),
+      **common,
+  )
+
+  def per_gpt_3d(mask, path):
+    a = pad_edge(mask * path[None])
+    a[..., 0] = a[..., -1] = 0.0
+    return f32(a.reshape(a.shape[0], nx, ny, nz + 2))
+
+  mcica_3d = dict(
+      cloud_path_liq_lw_per_gpt=per_gpt_3d(mask_lw, lwp),
+      cloud_path_ice_lw_per_gpt=per_gpt_3d(mask_lw, iwp),
+      cloud_path_liq_sw_per_gpt=per_gpt_3d(mask_sw, lwp),
+      cloud_path_ice_sw_per_gpt=per_gpt_3d(mask_sw, iwp),
+  )
+  # The column-minor solve takes the same thing as boolean masks of the bulk
+  # paths, `(nz, n_gpt, nc)`.
+  mcica_zc = dict(
+      cloud_path_liq=zc(lwp), cloud_path_ice=zc(iwp),
+      cloud_mask_lw_per_gpt=jnp.asarray(np.transpose(mask_lw, (2, 0, 1))),
+      cloud_mask_sw_per_gpt=jnp.asarray(np.transpose(mask_sw, (2, 0, 1))),
+  )
+  return rt, kwargs_3d, kwargs_zc, mcica_3d, mcica_zc
+
+
+def _as_zc(value: np.ndarray) -> np.ndarray:
+  """A 3D-layout output, `(nx, ny, ...)`, in the column-minor layout."""
+  value = np.asarray(value)
+  if value.ndim == 3:
+    return np.moveaxis(value, 2, 0).reshape(value.shape[2], -1)
+  if value.ndim == 2:
+    return value.reshape(-1)
+  return value
+
+
+# Every extra problem, so that their sharing of the spectral loop is tested.
+_FLAGS = dict(clear_sky_fluxes=True, aerosol_free_fluxes=True)
+
+# Agreement of the column-minor and the level-minor solves. They solve the
+# same equations with differently fused float32 arithmetic (and, with the TPU
+# kernels, `Precision.HIGHEST` contractions); `main`'s own two placements
+# (`use_scan` True / False) differ by 2.4e-4 W/m^2 and 0.011 K/day.
+_FLUX_ATOL = 1e-2  # W/m^2
+_HEATING_ATOL = 0.05 / 86400  # K/s, 0.05 K/day
+
+
+def _assert_outputs_close(
+    test, want, got, axis, rtol=1e-4, flux_atol=_FLUX_ATOL
+):
+  """`want` and `got` agree; `axis` is their vertical axis."""
+  test.assertEqual(set(want), set(got))
+  for key in want:
+    w, g = np.asarray(want[key]), np.asarray(got[key])
+    test.assertEqual(w.shape, g.shape, key)
+    heating = key.startswith('rad_heat')
+    if heating:
+      # The heating rates of the halo levels are not defined.
+      ax = 0 if w.ndim == 1 else axis
+      interior = np.arange(1, w.shape[ax] - 1)
+      w, g = np.take(w, interior, axis=ax), np.take(g, interior, axis=ax)
+    np.testing.assert_allclose(
+        g, w, rtol=rtol, atol=_HEATING_ATOL if heating else flux_atol,
+        err_msg=key,
+    )
+
+
+class RRTMGPColumnMinorTest(unittest.TestCase):
+  """The column-minor solve against the level-minor one it restates.
+
+  `compute_heating_rate` with the gas optics hoisted, scanned recurrences and
+  `gpt_chunk > 1` is solved column-minor on every backend; the level-minor
+  solve of the same placement (forced with `two_stream._column_minor(False)`)
+  is the reference. The column-minor solve is checked through both entry
+  points and with both kernel sets (`rrtmgp.backend`), on distinct,
+  horizontally varying columns, for values and gradients.
+  """
 
   def tearDown(self):
     jax.clear_caches()
     super().tearDown()
 
-  def _setup_problem(self):
-    cfg = dataclasses.replace(
-        _build_radiative_transfer_cfg(),
-        save_lw_sw_heating_rates=True,
-    )
-    diagnostics = (
-        'surf_lw_flux_down_2d_xy',
-        'surf_lw_flux_up_2d_xy',
-        'surf_sw_flux_down_2d_xy',
-        'surf_sw_flux_up_2d_xy',
-        'toa_sw_flux_incoming_2d_xy',
-        'toa_sw_flux_outgoing_2d_xy',
-        'toa_lw_flux_outgoing_2d_xy',
-        'toa_sw_flux_outgoing_clearsky_2d_xy',
-        'toa_lw_flux_outgoing_clearsky_2d_xy',
-        'toa_sw_flux_outgoing_aerosolfree_2d_xy',
-        'toa_lw_flux_outgoing_aerosolfree_2d_xy',
-        'toa_sw_flux_outgoing_aerosolfree_clearsky_2d_xy',
-        'toa_lw_flux_outgoing_aerosolfree_clearsky_2d_xy',
-    )
-    rt = rrtmgp.RRTMGP(cfg, dz=500.0, diagnostic_fields=diagnostics)
-    base = _build_inputs(n_horiz=2)
-    nx, ny, nzh = base['p_ref_xxc'].shape
-    nc = nx * ny
-    nz = nzh - 2
-    n_gpt_lw = rt.optics_lib.n_gpt_lw
-    n_gpt_sw = rt.optics_lib.n_gpt_sw
-    n_bnd_lw = rt.optics_lib.gas_optics_lw.n_bnd
-    n_bnd_sw = rt.optics_lib.gas_optics_sw.n_bnd
-
-    rng = np.random.default_rng(7)
-    cpl_lw = jnp.asarray(
-        rng.uniform(0.0, 0.04, (n_gpt_lw, nx, ny, nz)).astype(np.float32)
-    )
-    cpi_lw = jnp.asarray(
-        rng.uniform(0.0, 0.02, (n_gpt_lw, nx, ny, nz)).astype(np.float32)
-    )
-    cpl_sw = jnp.asarray(
-        rng.uniform(0.0, 0.04, (n_gpt_sw, nx, ny, nz)).astype(np.float32)
-    )
-    cpi_sw = jnp.asarray(
-        rng.uniform(0.0, 0.02, (n_gpt_sw, nx, ny, nz)).astype(np.float32)
-    )
-
-    def pad_halo_zero(arr):
-      z = jnp.zeros((arr.shape[0], nx, ny, 1), dtype=arr.dtype)
-      return jnp.concatenate([z, arr, z], axis=3)
-
-    def make_aer(n_bnd, scale):
-      tau = jnp.asarray(
-          rng.uniform(0.0, scale, (n_bnd, nx, ny, nz)).astype(np.float32)
-      )
-      ssa = jnp.asarray(
-          rng.uniform(0.6, 0.95, (n_bnd, nx, ny, nz)).astype(np.float32)
-      )
-      asy = jnp.asarray(
-          rng.uniform(0.5, 0.8, (n_bnd, nx, ny, nz)).astype(np.float32)
-      )
-      def pad_edge(x):
-        return jnp.concatenate([x[..., :1], x, x[..., -1:]], axis=3)
-
-      return (
-          {
-              'optical_depth': pad_edge(tau),
-              'ssa': pad_edge(ssa),
-              'asymmetry_factor': pad_edge(asy),
-          },
-          {
-              'optical_depth': jnp.moveaxis(tau, 3, 1).reshape(n_bnd, nz, nc),
-              'ssa': jnp.moveaxis(ssa, 3, 1).reshape(n_bnd, nz, nc),
-              'asymmetry_factor': jnp.moveaxis(asy, 3, 1).reshape(
-                  n_bnd, nz, nc
-              ),
-          },
-      )
-
-    aer_sw_3d, aer_sw_zc = make_aer(n_bnd_sw, 0.04)
-    aer_lw_3d, aer_lw_zc = make_aer(n_bnd_lw, 0.02)
-    zenith_2d = jnp.array([[0.3, 1.2], [1.7, 0.8]], dtype=jnp.float32)
-    sfc_emis_2d = jnp.array([[0.96, 0.98], [0.95, 0.99]], dtype=jnp.float32)
-    sfc_alb_2d = jnp.array([[0.12, 0.25], [0.08, 0.35]], dtype=jnp.float32)
-    sfc_alb_dir_3d = jnp.asarray(
-        rng.uniform(0.05, 0.35, (nx, ny, n_bnd_sw)).astype(np.float32)
-    )
-    sfc_alb_dif_3d = jnp.asarray(
-        rng.uniform(0.05, 0.35, (nx, ny, n_bnd_sw)).astype(np.float32)
-    )
-    tau_scale_liq_3d = jnp.array(
-        [[[0.75], [0.85]], [[0.65], [0.90]]], dtype=jnp.float32
-    )
-    def to_zc(x):
-      return jnp.moveaxis(x, 2, 0).reshape(nzh, nc)
-
-    o3_3d = jnp.asarray(
-        rng.uniform(1e-6, 4e-6, (nx, ny, nzh)).astype(np.float32)
-    )
-    kwargs_3d = dict(
-        rho_xxc=base['rho_xxc'].astype(jnp.float32),
-        q_t=base['q_t'].astype(jnp.float32),
-        q_liq=base['q_liq'].astype(jnp.float32),
-        q_ice=base['q_ice'].astype(jnp.float32),
-        q_c=base['q_c'].astype(jnp.float32),
-        cloud_r_eff_liq=jnp.full((nx, ny, nzh), 10e-6, dtype=jnp.float32),
-        cloud_r_eff_ice=jnp.full((nx, ny, nzh), 30e-6, dtype=jnp.float32),
-        temperature=base['temperature'].astype(jnp.float32),
-        sfc_temperature=base['sfc_temperature'].astype(jnp.float32),
-        p_ref_xxc=base['p_ref_xxc'].astype(jnp.float32),
-        sg_map=base['sg_map'],
-        vmr_fields={'o3': o3_3d},
-        zenith=zenith_2d,
-        irrad=jnp.float32(1361.0),
-        sfc_emis=sfc_emis_2d,
-        sfc_alb=sfc_alb_2d,
-        sfc_alb_dir=sfc_alb_dir_3d,
-        sfc_alb_dif=sfc_alb_dif_3d,
-        cloud_path_liq_lw_per_gpt=pad_halo_zero(cpl_lw),
-        cloud_path_ice_lw_per_gpt=pad_halo_zero(cpi_lw),
-        cloud_path_liq_sw_per_gpt=pad_halo_zero(cpl_sw),
-        cloud_path_ice_sw_per_gpt=pad_halo_zero(cpi_sw),
-        aerosol_optics_sw=aer_sw_3d,
-        aerosol_optics_lw=aer_lw_3d,
-        cloud_tau_scale_liq=tau_scale_liq_3d,
-        cloud_tau_scale_ice=jnp.float32(0.8),
-        clear_sky_fluxes=True,
-        aerosol_free_fluxes=True,
-        gas_optics_mode='all_gpts',
-        use_scan=True,
-    )
-    kwargs_zc = dict(
-        rho_zc=to_zc(base['rho_xxc'].astype(jnp.float32)),
-        q_t=to_zc(base['q_t'].astype(jnp.float32)),
-        q_liq=to_zc(base['q_liq'].astype(jnp.float32)),
-        q_ice=to_zc(base['q_ice'].astype(jnp.float32)),
-        q_c=to_zc(base['q_c'].astype(jnp.float32)),
-        cloud_r_eff_liq=jnp.full((nzh, nc), 10e-6, dtype=jnp.float32),
-        cloud_r_eff_ice=jnp.full((nzh, nc), 30e-6, dtype=jnp.float32),
-        temperature=to_zc(base['temperature'].astype(jnp.float32)),
-        sfc_temperature=base['sfc_temperature'].astype(jnp.float32).reshape(nc),
-        p_ref_zc=to_zc(base['p_ref_xxc'].astype(jnp.float32)),
-        vmr_fields={'o3': to_zc(o3_3d)},
-        zenith=zenith_2d.reshape(nc),
-        irrad=jnp.float32(1361.0),
-        sfc_emis=sfc_emis_2d.reshape(nc),
-        sfc_alb=sfc_alb_2d.reshape(nc),
-        sfc_alb_dir=jnp.moveaxis(sfc_alb_dir_3d, 2, 0).reshape(n_bnd_sw, nc),
-        sfc_alb_dif=jnp.moveaxis(sfc_alb_dif_3d, 2, 0).reshape(n_bnd_sw, nc),
-        cloud_path_liq_lw_per_gpt=jnp.moveaxis(cpl_lw, 3, 0).reshape(
-            nz, n_gpt_lw, nc
-        ),
-        cloud_path_ice_lw_per_gpt=jnp.moveaxis(cpi_lw, 3, 0).reshape(
-            nz, n_gpt_lw, nc
-        ),
-        cloud_path_liq_sw_per_gpt=jnp.moveaxis(cpl_sw, 3, 0).reshape(
-            nz, n_gpt_sw, nc
-        ),
-        cloud_path_ice_sw_per_gpt=jnp.moveaxis(cpi_sw, 3, 0).reshape(
-            nz, n_gpt_sw, nc
-        ),
-        aerosol_optics_sw=aer_sw_zc,
-        aerosol_optics_lw=aer_lw_zc,
-        cloud_tau_scale_liq=tau_scale_liq_3d.reshape(1, nc),
-        cloud_tau_scale_ice=jnp.float32(0.8),
-        clear_sky_fluxes=True,
-        aerosol_free_fluxes=True,
-    )
-    return rt, kwargs_3d, kwargs_zc, nc
+  def _solve_both(self, mcica, **options):
+    options.update(_FLAGS)
+    rt, kw_3d, kw_zc, mcica_3d, mcica_zc = _varied_columns()
+    if mcica:
+      kw_3d = {**kw_3d, **mcica_3d}
+      kw_zc = {**kw_zc, **mcica_zc}
+    placement = dict(gas_optics_mode='all_gpts', use_scan=True, gpt_chunk=64)
+    with two_stream._column_minor(False):  # pylint: disable=protected-access
+      want = jax.jit(
+          functools.partial(rt.compute_heating_rate, **placement, **options)
+      )(**kw_3d)
+    got_3d = jax.jit(
+        functools.partial(rt.compute_heating_rate, **placement, **options)
+    )(**kw_3d)
+    got_zc = {}
+    for tpu in (False, True):
+      with backend.tpu_kernels(tpu):
+        got_zc[tpu] = jax.jit(
+            functools.partial(
+                rt.compute_heating_rate_zc, gpt_chunk=16, **options
+            )
+        )(**kw_zc)
+    return want, got_3d, got_zc
 
   @parameterized.expand([
-      ('two_stream_64', 'two_stream', 64),
-      ('two_stream_5', 'two_stream', 5),
-      ('noscat_64', 'noscat', 64),
+      ('bulk_two_stream', False, 'two_stream'),
+      ('mcica_noscat', True, 'noscat'),
   ])
-  def test_forward_parity_and_tpu_dispatch(self, _, lw_solver, gpt_chunk):
-    rt, kwargs_3d, kwargs_zc, nc = self._setup_problem()
-    ref = rt.compute_heating_rate(
-        **kwargs_3d, lw_solver=lw_solver, gpt_chunk=gpt_chunk
-    )
-    with mock.patch.object(jax, 'default_backend', return_value='tpu'):
-      got_zc = rt.compute_heating_rate_zc(
-          **kwargs_zc, lw_solver=lw_solver, gpt_chunk=gpt_chunk
-      )
-      got_3d = rt.compute_heating_rate(
-          **kwargs_3d, lw_solver=lw_solver, gpt_chunk=gpt_chunk
-      )
-    self.assertEqual(set(ref), set(got_zc))
-    self.assertEqual(set(ref), set(got_3d))
-    for key, val in ref.items():
-      v_ref = np.asarray(val)
-      v_zc = np.asarray(got_zc[key])
-      v_3d = np.asarray(got_3d[key])
-      if v_ref.ndim == 3:
-        v_ref_zc = np.moveaxis(v_ref, 2, 0).reshape(v_ref.shape[2], nc)
-      elif v_ref.ndim == 2:
-        v_ref_zc = v_ref.reshape(nc)
-      else:
-        v_ref_zc = v_ref
-      mask = ~np.isnan(v_ref_zc)
-      np.testing.assert_allclose(
-          v_zc[mask], v_ref_zc[mask], rtol=1e-4, atol=2e-4, err_msg=key
-      )
-      mask3 = ~np.isnan(v_ref)
-      np.testing.assert_allclose(
-          v_3d[mask3], v_ref[mask3], rtol=1e-4, atol=2e-4, err_msg=key
-      )
+  def test_matches_the_level_minor_solve(self, _, mcica, lw_solver):
+    want, got_3d, got_zc = self._solve_both(mcica, lw_solver=lw_solver)
+    with self.subTest('3D entry point'):
+      _assert_outputs_close(self, want, got_3d, axis=2)
+    want_zc = {k: _as_zc(v) for k, v in want.items()}
+    for tpu, got in got_zc.items():
+      with self.subTest('column-minor entry point', tpu_kernels=tpu):
+        _assert_outputs_close(self, want_zc, got, axis=0)
+    # Night and horizon columns carry no shortwave flux.
+    for key in ('sw_flux_down_full', 'sw_flux_up_full'):
+      np.testing.assert_array_equal(np.asarray(got_zc[False][key])[:, [0, 9]], 0)
 
-  def test_grad_parity_and_zero_gather_scatter_barrier(self):
-    rt, kwargs_3d, kwargs_zc, nc = self._setup_problem()
-    t3_int = kwargs_3d['temperature'][:, :, 1:-1]
-    tz_int = kwargs_zc['temperature'][1:-1, :]
+  def test_gradients_match_the_level_minor_solve(self):
+    rt, kw_3d, kw_zc, _, _ = _varied_columns()
+    placement = dict(gas_optics_mode='all_gpts', use_scan=True, gpt_chunk=64)
 
-    def loss_ref(t_int):
-      pad = jnp.full((t_int.shape[0], t_int.shape[1], 1), jnp.nan, t_int.dtype)
-      t_full = jnp.concatenate([pad, t_int, pad], axis=2)
-      kw = {**kwargs_3d, 'temperature': t_full}
-      out = rt.compute_heating_rate(**kw, lw_solver='two_stream', gpt_chunk=64)
+    def loss_3d(t_int):
+      t = jnp.concatenate(
+          [kw_3d['temperature'][..., :1], t_int,
+           kw_3d['temperature'][..., -1:]], axis=-1,
+      )
+      out = rt.compute_heating_rate(
+          **{**kw_3d, 'temperature': t}, **placement, **_FLAGS
+      )
       return (
-          jnp.sum(out['rad_heat_src'][:, :, 1:-1] ** 2)
-          + 1e-4 * jnp.sum(out['toa_sw_flux_outgoing_2d_xy'])
-          + 1e-4 * jnp.sum(out['toa_lw_flux_outgoing_2d_xy'])
+          jnp.sum(out['rad_heat_src'][..., 1:-1] ** 2) * 1e8
+          + 1e-3 * jnp.sum(out['toa_lw_flux_outgoing_2d_xy'])
+          + 1e-3 * jnp.sum(out['toa_sw_flux_outgoing_2d_xy'])
       )
 
     def loss_zc(t_int):
-      pad = jnp.full((1, t_int.shape[1]), jnp.nan, t_int.dtype)
-      t_full = jnp.concatenate([pad, t_int, pad], axis=0)
-      kw = {**kwargs_zc, 'temperature': t_full}
+      t = jnp.concatenate(
+          [kw_zc['temperature'][:1], t_int, kw_zc['temperature'][-1:]], axis=0
+      )
       out = rt.compute_heating_rate_zc(
-          **kw, lw_solver='two_stream', gpt_chunk=64
+          **{**kw_zc, 'temperature': t}, gpt_chunk=16, **_FLAGS
       )
       return (
-          jnp.sum(out['rad_heat_src'][1:-1, :] ** 2)
-          + 1e-4 * jnp.sum(out['toa_sw_flux_outgoing_2d_xy'])
-          + 1e-4 * jnp.sum(out['toa_lw_flux_outgoing_2d_xy'])
+          jnp.sum(out['rad_heat_src'][1:-1] ** 2) * 1e8
+          + 1e-3 * jnp.sum(out['toa_lw_flux_outgoing_2d_xy'])
+          + 1e-3 * jnp.sum(out['toa_sw_flux_outgoing_2d_xy'])
       )
 
-    g_ref = jax.grad(loss_ref)(t3_int)
-    with mock.patch.object(jax, 'default_backend', return_value='tpu'):
-      g_zc = jax.grad(loss_zc)(tz_int)
-      mlir = str(
+    with two_stream._column_minor(False):  # pylint: disable=protected-access
+      want = _as_zc(jax.jit(jax.grad(loss_3d))(kw_3d['temperature'][..., 1:-1]))
+    got = {}
+    for tpu in (False, True):
+      with backend.tpu_kernels(tpu):
+        got[tpu] = np.asarray(
+            jax.jit(jax.grad(loss_zc))(kw_zc['temperature'][1:-1])
+        )
+    scale = np.abs(want).max()
+    for tpu, g in got.items():
+      with self.subTest(tpu_kernels=tpu):
+        self.assertTrue(np.isfinite(g).all())
+        np.testing.assert_allclose(g, want, rtol=0, atol=1e-3 * scale)
+
+  def test_masks_equal_masked_per_gpt_paths(self):
+    """`cloud_mask_*_per_gpt` of the bulk paths equal the masked paths."""
+    rt, _, kw_zc, _, mcica_zc = _varied_columns()
+    masked_paths = {
+        f'cloud_path_{phase}_{band}_per_gpt': jnp.where(
+            mcica_zc[f'cloud_mask_{band}_per_gpt'],
+            mcica_zc[f'cloud_path_{phase}'][:, jnp.newaxis],
+            0.0,
+        )
+        for phase in ('liq', 'ice')
+        for band in ('lw', 'sw')
+    }
+    base = {k: v for k, v in kw_zc.items() if k not in ('q_liq', 'q_ice')}
+    for tpu in (False, True):
+      with self.subTest(tpu_kernels=tpu), backend.tpu_kernels(tpu):
+        want = rt.compute_heating_rate_zc(
+            **base, **masked_paths, gpt_chunk=16, **_FLAGS
+        )
+        got = rt.compute_heating_rate_zc(
+            **base, **mcica_zc, gpt_chunk=16, **_FLAGS
+        )
+        _assert_outputs_close(
+            self, want, got, axis=0, rtol=1e-5, flux_atol=1e-4
+        )
+
+  def test_masks_and_per_gpt_paths_are_exclusive(self):
+    rt, _, kw_zc, _, mcica_zc = _varied_columns()
+    paths = {
+        'cloud_path_liq_lw_per_gpt': jnp.zeros_like(
+            mcica_zc['cloud_mask_lw_per_gpt'], dtype=jnp.float32
+        )
+    }
+    with self.assertRaisesRegex(ValueError, 'cloud_mask_per_gpt'):
+      rt.compute_heating_rate_zc(**kw_zc, **mcica_zc, **paths)
+
+  def test_tpu_program_has_no_gather_scatter_or_barrier(self):
+    rt, _, kw_zc, _, mcica_zc = _varied_columns()
+    with backend.tpu_kernels(True):
+      text = (
           jax.jit(
               functools.partial(
-                  rt.compute_heating_rate_zc,
-                  lw_solver='two_stream',
-                  gpt_chunk=64,
-                  clear_sky_fluxes=True,
-                  aerosol_free_fluxes=True,
+                  rt.compute_heating_rate_zc, gpt_chunk=16, **_FLAGS
               )
           )
-          .lower(**{
-              k: v
-              for k, v in kwargs_zc.items()
-              if k not in ('clear_sky_fluxes', 'aerosol_free_fluxes')
-          })
-          .compiler_ir(dialect='stablehlo')
+          .lower(**kw_zc, **mcica_zc)
+          .as_text()
       )
+    for op in ('gather', 'scatter', 'optimization_barrier'):
+      self.assertEqual(text.count(f'stablehlo.{op}'), 0, op)
 
-    self.assertFalse(np.any(np.isnan(np.asarray(g_zc))))
-    g_ref_zc = np.moveaxis(np.asarray(g_ref), 2, 0).reshape(tz_int.shape[0], nc)
-    np.testing.assert_allclose(
-        np.asarray(g_zc), g_ref_zc, rtol=5e-4, atol=1e-6
+  def test_routing(self):
+    rt, kw_3d, *_ = _varied_columns()
+    olib = rt.optics_lib
+    t = kw_3d['temperature']
+    route = functools.partial(two_stream._uses_column_minor, olib, t)  # pylint: disable=protected-access
+    self.assertTrue(route(True, True, 64))
+    self.assertFalse(route(True, False, 64))  # unrolled recurrences
+    self.assertFalse(route(True, True, 1))  # one g-point per iteration
+    self.assertFalse(route(False, True, 64))  # gas optics in the loop
+    self.assertFalse(
+        two_stream._uses_column_minor(olib, t[0], True, True, 64)  # pylint: disable=protected-access
     )
-    self.assertEqual(mlir.count('stablehlo.gather'), 0)
-    self.assertEqual(mlir.count('stablehlo.scatter'), 0)
-    self.assertEqual(mlir.count('stablehlo.optimization_barrier'), 0)
-
-  def test_cloud_mask_per_gpt_matches_per_gpt_paths_and_differentiates(self):
-    """2D `cloud_path_{liq,ice}` + `bool` McICA masks match 3D per-gpt paths."""
-    rt, _, kwargs_zc, nc = self._setup_problem()
-    nzh = kwargs_zc['temperature'].shape[0]
-    nz = nzh - 2
-    n_gpt_lw = rt.optics_lib.n_gpt_lw
-    n_gpt_sw = rt.optics_lib.n_gpt_sw
-
-    rng = np.random.default_rng(19)
-    lwp_2d = jnp.asarray(rng.uniform(0.0, 0.05, (nz, nc)).astype(np.float32))
-    iwp_2d = jnp.asarray(rng.uniform(0.0, 0.02, (nz, nc)).astype(np.float32))
-    mask_lw = jnp.asarray(rng.uniform(size=(nz, n_gpt_lw, nc)) < 0.35)
-    mask_sw = jnp.asarray(rng.uniform(size=(nz, n_gpt_sw, nc)) < 0.35)
-
-    kw_base = {
-        k: v
-        for k, v in kwargs_zc.items()
-        if not k.startswith('cloud_path_') and k != 'aerosol_optics_lw'
-    }
-    kw_paths = {
-        **kw_base,
-        'aerosol_optics_lw': None,
-        'aerosol_free_fluxes': False,
-        'cloud_path_liq_lw_per_gpt': jnp.where(
-            mask_lw, lwp_2d[:, None, :], 0.0
-        ),
-        'cloud_path_ice_lw_per_gpt': jnp.where(
-            mask_lw, iwp_2d[:, None, :], 0.0
-        ),
-        'cloud_path_liq_sw_per_gpt': jnp.where(
-            mask_sw, lwp_2d[:, None, :], 0.0
-        ),
-        'cloud_path_ice_sw_per_gpt': jnp.where(
-            mask_sw, iwp_2d[:, None, :], 0.0
-        ),
-    }
-    kw_masked = {
-        **kw_base,
-        'aerosol_optics_lw': None,
-        'aerosol_free_fluxes': False,
-        'cloud_path_liq': lwp_2d,
-        'cloud_path_ice': iwp_2d,
-        'cloud_mask_lw_per_gpt': mask_lw,
-        'cloud_mask_sw_per_gpt': mask_sw,
-    }
-
-    ref_cpu = rt.compute_heating_rate_zc(
-        **kw_paths, lw_solver='two_stream', gpt_chunk=16
-    )
-    got_cpu = rt.compute_heating_rate_zc(
-        **kw_masked, lw_solver='two_stream', gpt_chunk=16
-    )
-    with mock.patch.object(jax, 'default_backend', return_value='tpu'):
-      got_tpu = rt.compute_heating_rate_zc(
-          **kw_masked, lw_solver='two_stream', gpt_chunk=16
-      )
-      mlir = str(
-          jax.jit(
-              functools.partial(
-                  rt.compute_heating_rate_zc,
-                  lw_solver='two_stream',
-                  gpt_chunk=16,
-                  clear_sky_fluxes=True,
-                  aerosol_free_fluxes=False,
-              )
-          )
-          .lower(**{
-              k: v
-              for k, v in kw_masked.items()
-              if k not in ('clear_sky_fluxes', 'aerosol_free_fluxes')
-          })
-          .compiler_ir(dialect='stablehlo')
-      )
-      g_lwp, g_iwp = jax.grad(
-          lambda lwp, iwp: jnp.sum(
-              rt.compute_heating_rate_zc(
-                  **{**kw_masked, 'cloud_path_liq': lwp, 'cloud_path_ice': iwp},
-                  lw_solver='two_stream',
-                  gpt_chunk=16,
-              )['rad_heat_src'][1:-1, :]
-          ),
-          argnums=(0, 1),
-      )(lwp_2d, iwp_2d)
-
-    self.assertEqual(mlir.count('stablehlo.gather'), 0)
-    self.assertEqual(mlir.count('stablehlo.scatter'), 0)
-    self.assertTrue(bool(jnp.all(jnp.isfinite(g_lwp))))
-    self.assertTrue(bool(jnp.all(jnp.isfinite(g_iwp))))
-    for key, val in ref_cpu.items():
-      v_ref = np.asarray(val)
-      valid = ~np.isnan(v_ref)
-      np.testing.assert_allclose(
-          np.asarray(got_cpu[key])[valid],
-          v_ref[valid],
-          rtol=1e-5,
-          atol=1e-5,
-          err_msg=f'cpu {key}',
-      )
-      np.testing.assert_allclose(
-          np.asarray(got_tpu[key])[valid],
-          v_ref[valid],
-          rtol=1e-4,
-          atol=2e-4,
-          err_msg=f'tpu {key}',
-      )
+    with two_stream._column_minor(False):  # pylint: disable=protected-access
+      self.assertFalse(route(True, True, 64))
+    with two_stream._column_minor(True):  # pylint: disable=protected-access
+      self.assertTrue(route(True, False, 1))
 
 
 if __name__ == '__main__':

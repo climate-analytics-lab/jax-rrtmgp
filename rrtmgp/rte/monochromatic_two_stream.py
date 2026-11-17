@@ -66,6 +66,32 @@ def _shift_down(f: Array) -> Array:
   return kernel_ops.shift_from_plus(f, 2)
 
 
+def level_source(src_top_below: Array, src_bottom_above: Array) -> Array:
+  """The Planck source of a level shared by the two layers that meet there.
+
+  RRTMGP gives a level two sources, one from the spectral mapping of each
+  adjacent layer: the top-face source of the layer below and the bottom-face
+  source of the layer above. Their geometric mean is the level's source.
+
+  `jnp.sqrt` has an infinite derivative at zero, so a level where the product
+  vanishes (e.g. a halo/edge layer with a zero Planck source) would yield a
+  finite forward value but a NaN cotangent in reverse mode. The argument is
+  guarded with the standard double-`where`, so the sqrt never sees a
+  non-positive value on the differentiated path while the forward result
+  (`sqrt(0) = 0`) is preserved.
+
+  Args:
+    src_top_below: The top-face source of the layer below each level.
+    src_bottom_above: The bottom-face source of the layer above it.
+
+  Returns:
+    The combined source of each level.
+  """
+  product = src_top_below * src_bottom_above
+  positive = product > 0.0
+  return jnp.where(positive, jnp.sqrt(jnp.where(positive, product, 1.0)), 0.0)
+
+
 def lw_combine_sources(planck_srcs: StatesMap) -> StatesMap:
   """Combine the longwave source functions at each cell face.
 
@@ -88,18 +114,8 @@ def lw_combine_sources(planck_srcs: StatesMap) -> StatesMap:
   """
   planck_src_top = planck_srcs['planck_src_top']
   planck_src_bottom = planck_srcs['planck_src_bottom']
-  # Geometric mean of the two adjacent-layer sources. `jnp.sqrt` has an infinite
-  # derivative at zero, so a cell where the product vanishes (e.g. a halo/edge
-  # layer with a zero Planck source) yields a finite forward value but a NaN
-  # cotangent in reverse mode. Guard the argument with the standard double-`where`
-  # so the sqrt never sees a non-positive value on the differentiated path while
-  # the forward result (`sqrt(0) = 0`) is preserved.
-  planck_product = planck_src_top * _shift_down(planck_src_bottom)
-  product_is_positive = planck_product > 0.0
-  combined_src_top = jnp.where(
-      product_is_positive,
-      jnp.sqrt(jnp.where(product_is_positive, planck_product, 1.0)),
-      0.0,
+  combined_src_top = level_source(
+      planck_src_top, _shift_down(planck_src_bottom)
   )
   combined_src_bottom = _shift_up(combined_src_top)
   return {
@@ -885,6 +901,58 @@ def sw_cell_source(
   return srcs_primary
 
 
+# The adding method of Shonk and Hogan (2008), one layer at a time. Both
+# layouts of the solve -- `_solve_rte_2stream` (levels last, with halos) and
+# `solve_rte_2stream_zc` (levels first, no halos) -- are written with these, so
+# they solve the same equations.
+
+
+def _adding_beta(r_diff: Array, albedo_below: Array) -> Array:
+  """The sum of the multiple reflections between a layer and the atmosphere
+  below it, `1 / (1 - r a)` (the geometric series of Shonk and Hogan)."""
+  return 1 / (1 - r_diff * albedo_below)
+
+
+def _adding_albedo(
+    r_diff: Array, t_diff: Array, beta: Array, albedo_below: Array
+) -> Array:
+  """The albedo of a layer and everything below it (Shonk and Hogan, eq. 9)."""
+  return r_diff + t_diff**2 * beta * albedo_below
+
+
+def _adding_emission(
+    src_up: Array,
+    src_down: Array,
+    t_diff: Array,
+    beta: Array,
+    albedo_below: Array,
+    emission_below: Array,
+) -> Array:
+  """The upward emission out of the top of a layer and everything below it.
+
+  Shonk and Hogan, eq. 11: the layer's upward source, plus the emission from
+  below and the layer's downward source reflected by the atmosphere below,
+  both transmitted up through the layer.
+  """
+  return src_up + t_diff * beta * (emission_below + src_down * albedo_below)
+
+
+def _adding_flux_down(
+    t_diff: Array,
+    r_diff: Array,
+    src_down: Array,
+    beta: Array,
+    flux_down_above: Array,
+    emission_below: Array,
+) -> Array:
+  """The downward flux out of the bottom of a layer (Shonk and Hogan, eq. 13).
+
+  The flux from above transmitted through the layer, the emission from below
+  reflected by it, and its own downward source.
+  """
+  return (t_diff * flux_down_above + r_diff * emission_below + src_down) * beta
+
+
 def _solve_rte_2stream(
     t_diff: Array,
     r_diff: Array,
@@ -933,8 +1001,8 @@ def _solve_rte_2stream(
   ) -> tuple[Array, Array]:
     """Recurrent formula for albedo solution, starting from the surface."""
     # Geometric series solution accounting for infinite reflection events.
-    beta = 1 / (1 - r_diff * albedo_below)
-    out = r_diff + t_diff**2 * beta * albedo_below
+    beta = _adding_beta(r_diff, albedo_below)
+    out = _adding_albedo(r_diff, t_diff, beta, albedo_below)
     return out, out  # Carry and output are the same.
 
   init = sfc_reflectance
@@ -962,8 +1030,10 @@ def _solve_rte_2stream(
   ) -> tuple[Array, Array]:
     """Recurrent formula for upward emission, starting from the surface."""
     # Geometric series solution accounting for infinite reflection events.
-    beta = 1 / (1 - r_diff * albedo)
-    out = src_up + t_diff * beta * (emission_from_below + src_down * albedo)
+    beta = _adding_beta(r_diff, albedo)
+    out = _adding_emission(
+        src_up, src_down, t_diff, beta, albedo, emission_from_below
+    )
     return out, out  # Carry and output are the same.
 
   init = sfc_emission
@@ -996,8 +1066,10 @@ def _solve_rte_2stream(
   ) -> tuple[Array, Array]:
     """Recurrent formula for downwelling flux initiating at top boundar."""
     # Geometric series solution accounting for infinite reflection events.
-    beta = 1 / (1 - r_diff * albedo)
-    out = (t_diff * flux_down_from_above + r_diff * emiss_up + src_down) * beta
+    beta = _adding_beta(r_diff, albedo)
+    out = _adding_flux_down(
+        t_diff, r_diff, src_down, beta, flux_down_from_above, emiss_up
+    )
     return out, out  # Carry and output are the same.
 
   init = toa_flux_down
@@ -1132,3 +1204,176 @@ def sw_transport(
   # The net flux computed at cell faces.
   fluxes['flux_net'] = fluxes['flux_up'] - fluxes['flux_down']
   return fluxes
+
+
+# ---------------------------------------------------------------------------
+# Column-minor transport (see `two_stream.solve_lw_zc`).
+#
+# The same equations as `_solve_rte_2stream` and `sw_cell_source` for arrays
+# laid out `(n_layers, ..., n_columns)`: interior layers only, the levels
+# leading and the columns minor. The recurrences are `rte_utils.scan_levels`
+# over the leading axis, with no transposes and no halos. They return the
+# fluxes on the `n_layers + 1` faces, from the surface (face 0) to the top of
+# the atmosphere (face `n_layers`).
+# ---------------------------------------------------------------------------
+
+
+def _up_step_zc(carry, layer):
+  albedo_below, emission_below = carry
+  t_diff, r_diff, src_up, src_down = layer
+  beta = _adding_beta(r_diff, albedo_below)
+  albedo = _adding_albedo(r_diff, t_diff, beta, albedo_below)
+  emission = _adding_emission(
+      src_up, src_down, t_diff, beta, albedo_below, emission_below
+  )
+  return (albedo, emission), (albedo_below, emission_below, beta)
+
+
+def _down_step_zc(flux_down_above, layer):
+  t_diff, r_diff, src_down, emission_below, beta = layer
+  flux_down = _adding_flux_down(
+      t_diff, r_diff, src_down, beta, flux_down_above, emission_below
+  )
+  return flux_down, flux_down
+
+
+def solve_rte_2stream_zc(
+    t_diff: Array,
+    r_diff: Array,
+    src_up: Array,
+    src_down: Array,
+    toa_flux_down: Array,
+    sfc_emission: Array,
+    sfc_reflectance: Array,
+) -> StatesMap:
+  """`_solve_rte_2stream` in the column-minor layout.
+
+  The albedo and the emission recurrences run upward together in one scan,
+  which also keeps each layer's multiple-reflection factor for the downward
+  scan, so the two scans evaluate it once.
+
+  Args:
+    t_diff: Diffuse transmittance, `(n_layers, ...)`.
+    r_diff: Diffuse reflectance, same shape.
+    src_up: Upward source out of the top of each layer, same shape.
+    src_down: Downward source out of the bottom of each layer, same shape.
+    toa_flux_down: The downward flux at the top of the atmosphere, `(...)`.
+    sfc_emission: The upward surface emission, `(...)`.
+    sfc_reflectance: The surface reflectance, `(...)`.
+
+  Returns:
+    'flux_up', 'flux_down', 'flux_net' on the `n_layers + 1` faces.
+  """
+  (albedo_toa, emission_toa), (albedo_below, emission_below, beta) = (
+      rte_utils.scan_levels(
+          _up_step_zc,
+          (sfc_reflectance, sfc_emission),
+          (t_diff, r_diff, src_up, src_down),
+          vacuum=(1.0, 0.0, 0.0, 0.0),
+      )
+  )
+  _, flux_down = rte_utils.scan_levels(
+      _down_step_zc,
+      toa_flux_down,
+      (t_diff, r_diff, src_down, emission_below, beta),
+      reverse=True,
+      vacuum=(1.0, 0.0, 0.0, 0.0, 1.0),
+  )
+  flux_down = jnp.concatenate([flux_down, toa_flux_down[jnp.newaxis]], axis=0)
+  albedo = jnp.concatenate([albedo_below, albedo_toa[jnp.newaxis]], axis=0)
+  emission = jnp.concatenate(
+      [emission_below, emission_toa[jnp.newaxis]], axis=0
+  )
+  flux_up = flux_down * albedo + emission
+  return {
+      'flux_up': flux_up,
+      'flux_down': flux_down,
+      'flux_net': flux_up - flux_down,
+  }
+
+
+def _propagate_step_zc(flux_in, layer):
+  trans, source = layer
+  flux_out = trans * flux_in + source
+  return flux_out, flux_out
+
+
+def solve_rte_absorbing_zc(
+    trans: Array,
+    src_up: Array,
+    src_down: Array,
+    toa_flux_down: Array,
+    sfc_emission: Array,
+    sfc_reflectance: Array,
+) -> StatesMap:
+  """Column-minor transport through layers that do not scatter.
+
+  With no reflection inside the atmosphere the adding method reduces to two
+  independent recurrences: the downward flux from the top of the atmosphere,
+  `F_dn(bottom) = T F_dn(top) + src_down`, then, from the surface flux
+  `R F_dn(surface) + emission`, the upward one, `F_up(top) = T F_up(bottom)
+  + src_up`. That is `_solve_rte_2stream` with `r_diff = 0` exactly, and the
+  transport of `longwave_noscat.lw_noscat_transport`.
+
+  Args:
+    trans: Layer transmittance, `(n_layers, ...)`.
+    src_up: Upward source out of the top of each layer, same shape.
+    src_down: Downward source out of the bottom of each layer, same shape.
+    toa_flux_down: The downward flux at the top of the atmosphere, `(...)`.
+    sfc_emission: The upward surface emission, `(...)`.
+    sfc_reflectance: The surface reflectance, `(...)`.
+
+  Returns:
+    'flux_up', 'flux_down', 'flux_net' on the `n_layers + 1` faces.
+  """
+  sfc_flux_down, flux_down = rte_utils.scan_levels(
+      _propagate_step_zc,
+      toa_flux_down,
+      (trans, src_down),
+      reverse=True,
+      vacuum=(1.0, 0.0),
+  )
+  sfc_flux_up = sfc_reflectance * sfc_flux_down + sfc_emission
+  _, flux_up = rte_utils.scan_levels(
+      _propagate_step_zc,
+      sfc_flux_up,
+      (trans, src_up),
+      vacuum=(1.0, 0.0),
+  )
+  flux_down = jnp.concatenate([flux_down, toa_flux_down[jnp.newaxis]], axis=0)
+  flux_up = jnp.concatenate([sfc_flux_up[jnp.newaxis], flux_up], axis=0)
+  return {
+      'flux_up': flux_up,
+      'flux_down': flux_down,
+      'flux_net': flux_up - flux_down,
+  }
+
+
+def _direct_step_zc(flux_above, trans):
+  flux_below = trans * flux_above
+  return flux_below, (flux_below, flux_above)
+
+
+def sw_direct_beam_zc(
+    t_noscat: Array, flux_down_direct_toa: Array
+) -> tuple[Array, Array, Array]:
+  """The direct beam of `sw_cell_source`, in the column-minor layout.
+
+  Args:
+    t_noscat: The direct-beam transmittance of each layer, `(n_layers, ...)`.
+    flux_down_direct_toa: The direct beam's downward flux at the top of the
+      atmosphere, `(...)`.
+
+  Returns:
+    The direct flux at the surface `(...)`, at the bottom face of every layer
+    `(n_layers, ...)`, and at the top face of every layer `(n_layers, ...)`
+    (what the layer's direct-beam sources are formed from).
+  """
+  flux_sfc, (flux_bottom, flux_top) = rte_utils.scan_levels(
+      _direct_step_zc,
+      flux_down_direct_toa,
+      t_noscat,
+      reverse=True,
+      vacuum=1.0,
+  )
+  return flux_sfc, flux_bottom, flux_top

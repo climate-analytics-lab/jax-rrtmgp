@@ -339,6 +339,30 @@ _MAX_ALL_GPTS_STAGE_LAUNCHES = {
     ('cpu', 'sw'): 220,
 }
 
+# Budgets for the column-minor solve (`two_stream.solve_lw_zc` /
+# `solve_sw_zc`), which `solve_lw` / `solve_sw` route `gas_optics_mode=
+# 'all_gpts'` with `use_scan=True` and `gpt_chunk > 1` to on every backend
+# (`two_stream._uses_column_minor`). Another program again: the atmosphere is
+# laid out levels-leading and columns-minor, the vertical recurrences are
+# `lax.scan`s with the g-point chunk second-minor, and the gas optics are
+# evaluated ahead of the loop as in `'all_gpts'`. Measured at the `_N_HORIZ`
+# shape, CPU backend, g256 / g224 tables, `gpt_chunk=64`:
+#
+#                     flops            transcendentals    launches
+#   LW solve      43,155,365,888         214,257,664        2,260
+#   SW solve      43,141,267,456         621,465,600        5,118
+#
+# with the same ~30% / ~20% headroom as above. This is the placement jax-gcm
+# runs on GPU and TPU (on a TPU with the TPU kernels, a different program
+# again, measured in wall-clock in the PR that introduced it).
+_COLUMN_MINOR_CHUNK = 64
+_MAX_COLUMN_MINOR_FLOPS = {'lw': 56_000_000_000, 'sw': 56_000_000_000}
+_MAX_COLUMN_MINOR_TRANSCENDENTALS = {'lw': 280_000_000, 'sw': 810_000_000}
+_MAX_COLUMN_MINOR_LAUNCHES = {
+    ('cpu', 'lw'): 2_700,
+    ('cpu', 'sw'): 6_150,
+}
+
 # HLO text parsing for the launch count. Instruction lines look like
 #   %name = f32[16,16,62]{2,1,0} fusion(%a, %b), kind=kLoop, calls=%fused.1
 # or, for a tuple-shaped result,
@@ -681,6 +705,30 @@ def _compiled_all_gpts_solve(band: str):
         return two_stream.solve_sw(
             p, temp, molecules, optics_lib, atmos_state, vmr_fields,
             gpt_chunk=_ALL_GPTS_CHUNK, gas_optics_mode='all_gpts',
+        )['flux_net']
+
+    return jax.jit(solve).lower(t).compile()
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_column_minor_solve(band: str):
+    """The compiled solve `solve_lw` / `solve_sw` route column-minor, cached."""
+    (optics_lib, atmos_state, p, t, molecules, vmr_fields,
+     sfc_temperature) = _radiation_setup()
+    placement = dict(
+        gpt_chunk=_COLUMN_MINOR_CHUNK, gas_optics_mode='all_gpts',
+        use_scan=True,
+    )
+
+    def solve(temp):
+        if band == 'lw':
+            return two_stream.solve_lw(
+                p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+                sfc_temperature, **placement,
+            )['flux_net']
+        return two_stream.solve_sw(
+            p, temp, molecules, optics_lib, atmos_state, vmr_fields,
+            **placement,
         )['flux_net']
 
     return jax.jit(solve).lower(t).compile()
@@ -1060,6 +1108,41 @@ class PerformanceTest(unittest.TestCase):
                     msg=(f'{band} all_gpts solve issues {launches:,} launches '
                          f'on {platform}, over the '
                          f'{_MAX_ALL_GPTS_LAUNCHES[platform, band]:,} budget.'))
+
+    def test_column_minor_solve_within_budget(self):
+        """The column-minor solve: arithmetic and launches of both bands.
+
+        The placement that routes to it on every backend (see
+        `_MAX_COLUMN_MINOR_FLOPS`).
+        """
+        (optics_lib, _, _, t, *_) = _radiation_setup()
+        self.assertTrue(two_stream._uses_column_minor(  # pylint: disable=protected-access
+            optics_lib, t, True, True, _COLUMN_MINOR_CHUNK))
+        platform = jax.devices()[0].platform
+        for band in ('lw', 'sw'):
+            with self.subTest(band=band):
+                compiled = _compiled_column_minor_solve(band)
+                cost = _flops_of(compiled)
+                self._assert_metrics_present(cost, f'{band} column-minor solve')
+                self.assertLessEqual(
+                    cost['flops'], _MAX_COLUMN_MINOR_FLOPS[band],
+                    msg=(f'{band} column-minor solve: {cost["flops"]:,.0f} '
+                         f'flops'))
+                self.assertLessEqual(
+                    cost['transcendentals'],
+                    _MAX_COLUMN_MINOR_TRANSCENDENTALS[band],
+                    msg=(f'{band} column-minor solve: '
+                         f'{cost["transcendentals"]:,.0f} transcendentals'))
+                if (platform, band) not in _MAX_COLUMN_MINOR_LAUNCHES:
+                    continue
+                launches = _count_launches(compiled.as_text())
+                self.assertGreater(launches, 0, msg='HLO text did not parse')
+                self.assertLessEqual(
+                    launches, _MAX_COLUMN_MINOR_LAUNCHES[platform, band],
+                    msg=(f'{band} column-minor solve issues {launches:,} '
+                         f'launches on {platform}, over the '
+                         f'{_MAX_COLUMN_MINOR_LAUNCHES[platform, band]:,} '
+                         f'budget.'))
 
     def test_all_gpts_gas_stage_within_budget(self):
         """The gas-optics stage alone: its launches do not scale with g-points.
