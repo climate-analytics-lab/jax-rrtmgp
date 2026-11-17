@@ -572,10 +572,15 @@ def interpolate_rows_1d(table: Array, interp: Interpolant) -> Array:
     return out.T.reshape(n_rows, *cell_shape)
 
   def contract(idx_lo: Array, w_lo: Array, w_hi: Array) -> Array:
+    # The weights are a sum of two one-hots, which XLA fuses into the matmul's
+    # operand. The equivalent one-hot of `idx_lo` padded onto both nodes
+    # (`gas_optics._spread`) does not fuse here, and the level-minor solve,
+    # which calls this per g-point, measured 54% slower with it on a TPU v5e.
     m = idx_lo.shape[0]
-    one_hot = jax.nn.one_hot(idx_lo, n_nodes - 1, dtype=table.dtype, axis=0)
-    weights = jnp.pad(w_lo.reshape(1, m) * one_hot, ((0, 1), (0, 0))) + (
-        jnp.pad(w_hi.reshape(1, m) * one_hot, ((1, 0), (0, 0)))
+    weights = w_lo.reshape(1, m) * jax.nn.one_hot(
+        idx_lo, n_nodes, dtype=table.dtype, axis=0
+    ) + w_hi.reshape(1, m) * jax.nn.one_hot(
+        idx_lo + 1, n_nodes, dtype=table.dtype, axis=0
     )
     return jnp.matmul(table, weights, precision=jax.lax.Precision.HIGHEST)
 

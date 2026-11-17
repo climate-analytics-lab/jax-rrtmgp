@@ -1491,14 +1491,17 @@ def _pack_chunks(
   The spectrum is padded to `n_chunks * chunk` by repeating its last g-point,
   which the spectral sum masks out.
   """
-  if gpt_axis == 0:
-    arr = jnp.swapaxes(arr, 0, 1)
-  nz, n_gpt, nc = arr.shape
+  n_gpt = arr.shape[gpt_axis]
   pad = n_chunks * chunk - n_gpt
   if pad:
+    last = jax.lax.slice_in_dim(arr, n_gpt - 1, n_gpt, axis=gpt_axis)
     arr = jnp.concatenate(
-        [arr, jnp.repeat(arr[:, -1:, :], pad, axis=1)], axis=1
+        [arr, jnp.repeat(last, pad, axis=gpt_axis)], axis=gpt_axis
     )
+  if gpt_axis == 0:
+    _, nz, nc = arr.shape
+    return jnp.swapaxes(arr.reshape(n_chunks, chunk, nz, nc), 1, 2)
+  nz, _, nc = arr.shape
   return jnp.swapaxes(arr.reshape(nz, n_chunks, chunk, nc), 0, 1)
 
 
@@ -1838,6 +1841,7 @@ def solve_lw_zc(
       `sfc_emis` and `toa_flux_lw` may be scalars or `(nc,)`.
     vmr_fields: Optional volume mixing ratio fields, keyed by gas name or
       index, each `(nz + 2, nc)`.
+    sfc_temperature: Surface temperature [K], a scalar or `(nc,)`.
     cloud_r_eff_liq: Effective droplet radius [m], `(nz[+2], nc)`.
     cloud_path_liq: Liquid water path [kg/m^2], `(nz[+2], nc)`.
     cloud_r_eff_ice: Effective ice radius [m], `(nz[+2], nc)`.
@@ -1855,7 +1859,6 @@ def solve_lw_zc(
     cloud_tau_scale_liq: Multiplier of the liquid cloud optical depth: a
       scalar, `(nc,)` or `(nz[+2], nc)`.
     cloud_tau_scale_ice: Same as above, for ice.
-    sfc_temperature: Surface temperature [K], a scalar or `(nc,)`.
     with_clear_sky: Also solve the cloud-free problem (`solve_lw`).
     lw_solver: `'two_stream'` or `'noscat'` (`solve_lw`).
     lw_secant: Secant of the `'noscat'` solver's propagation angle.
@@ -1866,7 +1869,7 @@ def solve_lw_zc(
       (or `(n_gpt, nz[+2], nc)` with `per_gpt_axis=0`): the bulk cloud paths
       are seen by a g-point only where its mask is set. Cannot be combined
       with per-g-point cloud paths. One byte per (level, g-point, column)
-      instead of the four floats of per-g-point paths.
+      instead of a float per phase.
 
   Returns:
     `(nz + 2, nc)` face fluxes [W/m^2], `flux_up`, `flux_down` and
@@ -2167,7 +2170,7 @@ def solve_sw_zc(
       (or `(n_gpt, nz[+2], nc)` with `per_gpt_axis=0`): the bulk cloud paths
       are seen by a g-point only where its mask is set. Cannot be combined
       with per-g-point cloud paths. One byte per (level, g-point, column)
-      instead of the four floats of per-g-point paths.
+      instead of a float per phase.
 
   Returns:
     `(nz + 2, nc)` face fluxes [W/m^2], `flux_up`, `flux_down` and

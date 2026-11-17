@@ -46,13 +46,13 @@ def reconstruct_face_values(
     A tuple with the reconstructed temperature at the bottom and top face,
     respectively.
   """
-  # Use WENO5. The halos are set with selects rather than indexed updates, so
-  # no layout and no `vmap` lowers them to scatters.
+  # Use WENO5. The halos are set in place (`interpolation.set_at`), in either
+  # layout.
   n = f.shape[axis]
   # Set halo value to the BC wall value.
-  f = interpolation._set_at(f, axis, 0, jnp.expand_dims(f_lower_bc, axis))  # pylint: disable=protected-access
+  f = interpolation.set_at(f, axis, 0, jnp.expand_dims(f_lower_bc, axis))
   # Enforce Neumann BC on the upper halo value.
-  f = interpolation._set_at(  # pylint: disable=protected-access
+  f = interpolation.set_at(
       f, axis, -1, jax.lax.slice_in_dim(f, n - 2, n - 1, axis=axis)
   )
 
