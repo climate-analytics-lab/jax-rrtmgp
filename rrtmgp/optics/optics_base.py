@@ -20,6 +20,7 @@ from typing import TypeAlias
 
 import jax
 import jax.numpy as jnp
+from rrtmgp import backend
 from rrtmgp import interpolation
 from rrtmgp import kernel_ops
 
@@ -52,7 +53,7 @@ def reconstruct_face_values(f: Array, f_lower_bc: Array) -> tuple[Array, Array]:
   # f is f_ccc.
   # Use WENO5.
 
-  if jax.default_backend() == 'tpu':
+  if backend.use_tpu_kernels():
     # Set lower halo to the BC wall value and upper halo to Neumann BC via
     # concatenation rather than `.at[...].set(...)` so `vmap` never lowers halo
     # updates into indexed scatters on TPU.
@@ -77,7 +78,7 @@ def reconstruct_face_values(f: Array, f_lower_bc: Array) -> tuple[Array, Array]:
   # Use centered interpolation: UNSTABLE.
   # f_bottom_ccf = interpolation.z_c_to_f(f)
 
-  if jax.default_backend() == 'tpu':
+  if backend.use_tpu_kernels():
     f_top = jnp.concatenate(
         [f_bottom_ccf[:, :, 1:], f_bottom_ccf[:, :, -1:]],
         axis=2,

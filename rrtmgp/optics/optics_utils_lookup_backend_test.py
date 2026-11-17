@@ -26,14 +26,10 @@ from rrtmgp.optics import optics_utils
 
 def _both(fn):
   """Run `fn` under each lookup backend, restoring the prior selection."""
-  prev = optics_utils.get_lookup_impl()
-  try:
-    optics_utils.set_lookup_impl("matmul")
+  with optics_utils.lookup_impl("matmul"):
     out_mm = fn()
-    optics_utils.set_lookup_impl("gather")
+  with optics_utils.lookup_impl("gather"):
     out_ga = fn()
-  finally:
-    optics_utils.set_lookup_impl(prev)
   return out_mm, out_ga
 
 

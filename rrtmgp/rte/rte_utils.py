@@ -19,6 +19,7 @@ from typing import Any, Callable, TypeAlias
 
 import jax
 import jax.numpy as jnp
+from rrtmgp import backend
 
 Array: TypeAlias = jax.Array
 
@@ -261,7 +262,7 @@ def recurrent_op_with_halos(
   else:
     carry, output = recurrent_op(f, init, inputs, forward, fence_chain)
 
-  if jax.default_backend() == 'tpu':
+  if backend.use_tpu_kernels():
     # Restore halo layers via concatenation rather than `.at[...].set(...)` so
     # `vmap` never lowers halo updates into indexed scatters on TPU.
     zeros_halo = jnp.zeros_like(init)[..., jnp.newaxis]

@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from rrtmgp import constants
+from rrtmgp import backend
 from rrtmgp import kernel_ops
 from rrtmgp import smooth_ops
 from rrtmgp.optics import atmospheric_state
@@ -1358,7 +1359,7 @@ def _tpu_gpt_chunk_plan(
   """Choose an 8-aligned VMEM-resident `chunk <= gpt_chunk`."""
   eff_chunk = gpt_chunk
   if (
-      jax.default_backend() == 'tpu'
+      backend.use_tpu_kernels()
       and nz is not None
       and nc is not None
       and eff_chunk > 8
@@ -1443,7 +1444,7 @@ def _interp_1d_table_mxu(table_2d: Array, x: Array, ref_grid: Array) -> Array:
   interp = optics_utils.create_linear_interpolant(x, ref_grid)
   n_rows, n_nodes = table_2d.shape
   ncells = x.size
-  if jax.default_backend() != 'tpu':
+  if not backend.use_tpu_kernels():
     tbl_t = table_2d.T
     lo = tbl_t[interp.interp_low.idx.reshape(ncells)] * (
         interp.interp_low.weight.reshape(ncells, 1)
@@ -1782,7 +1783,7 @@ def _band_oh_packed(
   n_gpt = g2b.shape[0]
   padded = np.minimum(np.arange(n_chunks * chunk), n_gpt - 1)
   bnds = g2b[padded]
-  if jax.default_backend() != 'tpu':
+  if not backend.use_tpu_kernels():
     return jnp.asarray(bnds, dtype=jnp.int32).reshape(n_chunks, chunk)
   oh = np.eye(n_bnd, dtype=np.float32)[bnds]
   return jnp.asarray(oh, dtype=dtype).reshape(n_chunks, chunk, n_bnd)
@@ -1821,7 +1822,7 @@ def _scan_zc(
   leaves = jax.tree.leaves(xs)
   nz = leaves[0].shape[0]
   if (
-      jax.default_backend() != 'tpu'
+      not backend.use_tpu_kernels()
       or pad_vals is None
       or block <= 1
       or nz < 2 * block

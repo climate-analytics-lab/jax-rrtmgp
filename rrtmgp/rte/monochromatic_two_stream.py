@@ -30,6 +30,7 @@ from typing import TypeAlias
 import jax
 import jax.numpy as jnp
 import numpy as np
+from rrtmgp import backend
 from rrtmgp import kernel_ops
 from rrtmgp import smooth_ops
 from rrtmgp.rte import rte_utils
@@ -308,7 +309,7 @@ def _direct_quantities(
   k = _k_fn(gamma1, gamma2)
   k_mu = k * mu0
   one_plus_kmu = 1.0 + k_mu
-  is_tpu = jax.default_backend() == 'tpu'
+  is_tpu = backend.use_tpu_kernels()
 
   # These exponentials come in two families and neither can be rebuilt from
   # the other, so each is evaluated in the form it is used in. `exp` carries a
@@ -440,7 +441,7 @@ def _diffuse_quantities(
   # adjoint) is used only by the large branch.
   x2 = k2 * jnp.square(tau)
   small = x2 < _KTAU_SWITCH**2
-  if jax.default_backend() == 'tpu':
+  if backend.use_tpu_kernels():
     x2c = jnp.where(small, x2, _KTAU_SWITCH**2)
     ktau_big = jnp.where(small, _KTAU_SWITCH, k * tau)
     e1 = jnp.exp(-ktau_big)
@@ -709,7 +710,7 @@ def sw_cell_properties(
           jnp.asarray(zenith), optical_depth.shape[:-1]
       )[..., jnp.newaxis]
     mu0_g3 = jnp.cos(zenith)
-    mu0_direct = mu0_g3 if jax.default_backend() == 'tpu' else None
+    mu0_direct = mu0_g3 if backend.use_tpu_kernels() else None
   else:
     mu0_g3 = cos_zenith
     if jnp.ndim(mu0_g3) > 0 and jnp.ndim(mu0_g3) < optical_depth.ndim:

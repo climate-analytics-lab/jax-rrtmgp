@@ -15,7 +15,8 @@
 """Utility library for common operations on the RRTMGP tables."""
 
 import collections
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+import contextlib
 import dataclasses
 import inspect
 import math
@@ -25,6 +26,7 @@ from typing import Callable, TypeAlias
 
 import jax
 import jax.numpy as jnp
+from rrtmgp import backend
 
 Array: TypeAlias = jax.Array
 
@@ -35,11 +37,15 @@ Array: TypeAlias = jax.Array
 #              climate-analytics-lab/jax-rrtmgp#6: ~2.8x faster radiation at GCM
 #              resolution).
 #   "matmul" — one-hot vectors + einsum. Avoids the gather op, which is slow on
-#              TPU; uses the matrix-multiply unit instead. TPU users should
-#              select this via $RRTMGP_LOOKUP_IMPL=matmul or `set_lookup_impl`.
+#              TPU; uses the matrix-multiply unit instead. Select it via
+#              $RRTMGP_LOOKUP_IMPL=matmul or `set_lookup_impl`.
+# Unless a backend was chosen explicitly (either way), the TPU kernels (see
+# `rrtmgp.backend`) contract the 1D tables -- cloud Mie curves and the Planck
+# `totplnk` -- on the MXU in `interpolate`, whatever the default says.
 _LOOKUP_IMPL = os.environ.get("RRTMGP_LOOKUP_IMPL", "gather")
 if _LOOKUP_IMPL not in ("matmul", "gather"):
   _LOOKUP_IMPL = "gather"
+_LOOKUP_IMPL_EXPLICIT = "RRTMGP_LOOKUP_IMPL" in os.environ
 
 
 def set_lookup_impl(impl: str) -> None:
@@ -48,15 +54,39 @@ def set_lookup_impl(impl: str) -> None:
   Must be set before the gas-optics functions are traced/compiled; changing it
   afterwards has no effect on already-compiled functions.
   """
-  global _LOOKUP_IMPL
+  global _LOOKUP_IMPL, _LOOKUP_IMPL_EXPLICIT
   if impl not in ("matmul", "gather"):
     raise ValueError(f"impl must be 'matmul' or 'gather', got {impl!r}")
   _LOOKUP_IMPL = impl
+  _LOOKUP_IMPL_EXPLICIT = True
 
 
 def get_lookup_impl() -> str:
   """Return the active table-lookup backend ('matmul' or 'gather')."""
   return _LOOKUP_IMPL
+
+
+@contextlib.contextmanager
+def lookup_impl(impl: str) -> Iterator[None]:
+  """`set_lookup_impl(impl)` inside the block; the prior selection after it.
+
+  Restores whether the backend had been chosen explicitly as well as which one
+  it was, so the block leaves the TPU 1D-table default (see `interpolate`) as
+  it found it.
+
+  Args:
+    impl: The table-lookup backend to select inside the block.
+
+  Yields:
+    Nothing; the selection is active until the block exits.
+  """
+  global _LOOKUP_IMPL, _LOOKUP_IMPL_EXPLICIT
+  prev = (_LOOKUP_IMPL, _LOOKUP_IMPL_EXPLICIT)
+  try:
+    set_lookup_impl(impl)
+    yield
+  finally:
+    _LOOKUP_IMPL, _LOOKUP_IMPL_EXPLICIT = prev
 
 
 @dataclasses.dataclass
@@ -593,10 +623,10 @@ def interpolate(
   """
   if _LOOKUP_IMPL == "gather":
     if (
-        jax.default_backend() == "tpu"
+        backend.use_tpu_kernels()
         and coeffs.ndim == 1
         and len(interpolant_fns) == 1
-        and "RRTMGP_LOOKUP_IMPL" not in os.environ
+        and not _LOOKUP_IMPL_EXPLICIT
     ):
       # 1D tables (cloud Mie curves, Planck totplnk) contract cleanly on the
       # TPU MXU as (n_nodes,) @ (n_nodes, ncells) with ncells on the minor axis.
