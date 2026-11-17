@@ -50,11 +50,6 @@ LookupVolumeMixingRatio: TypeAlias = (
 _PASCAL_TO_HPASCAL_FACTOR = 0.01
 _M2_TO_CM2_FACTOR = 1e4
 
-# Capability flag advertising native TPU MXU `all_gpts` table contractions so
-# downstream callers can skip runtime compatibility shims.
-_SUPPORTS_TPU_MXU_ALL_GPTS = True
-
-
 def _pressure_interpolant(
     p: Array,
     p_ref: Array,
@@ -163,35 +158,28 @@ def get_vmr(
   return vmr
 
 
-def _compute_relative_abundance_interpolant_mxu(
+def _relative_abundance_mxu(
     lookup_gas_optics: AbstractLookupGasOptics,
     vmr_lib: LookupVolumeMixingRatio,
     troposphere_idx: Array,
     temperature_idx: Array,
     ibnd: int,
-    scale_by_mixture: bool,
-    vmr_fields: dict[int, Array] | None = None,
-    *,
-    oh_t: Array | None = None,
-    return_combined_vmr: bool = False,
-) -> Interpolant | tuple[Interpolant, Array]:
-  """MXU-backed relative-abundance interpolant for a static band `ibnd`.
+    vmr_fields: dict[int, Array] | None,
+    t_one_hot: Array,
+) -> tuple[Interpolant, Array]:
+  """`_compute_relative_abundance_interpolant` for a static band, on the MXU.
 
-  Avoids 1D and 3D dynamic gathers on TPU by selecting the lower- and upper-
-  atmosphere species with `jnp.where` and projecting `vmr_ref` against a
-  `(n_t, ncells)` temperature one-hot matrix at IEEE float32 (`HIGHEST`)
-  precision, keeping `ncells` on the minor axis so 128-lane tiles are filled
-  without padding.
+  The TPU form (see `compute_all_gpts_mxu`): the reference mixing ratios are
+  read by contracting their temperature rows with a one-hot of the cells'
+  temperature index, `t_one_hot`, instead of by a gather, and a cell's lower-
+  or upper-atmosphere species are selected with `jnp.where`.
+
+  Returns:
+    The unscaled mixing-fraction interpolant and the major species' combined
+    mixing ratio, which scales the major coefficient's weights.
   """
   ks = np.asarray(lookup_gas_optics.key_species)[int(ibnd)]
-  n_t = lookup_gas_optics.vmr_ref.shape[0]
-  dtype = lookup_gas_optics.vmr_ref.dtype
   cell_shape = temperature_idx.shape
-  ncells = math.prod(cell_shape)
-  if oh_t is None:
-    oh_t = jax.nn.one_hot(
-        temperature_idx.reshape(ncells), n_t, dtype=dtype, axis=0
-    )
   is_tropo0 = troposphere_idx == 0
   sp00, sp10 = int(ks[0, 0]), int(ks[1, 0])
   sp01, sp11 = int(ks[0, 1]), int(ks[1, 1])
@@ -217,7 +205,7 @@ def _compute_relative_abundance_interpolant_mxu(
       axis=0,
   )
   ref_all = jnp.matmul(
-      ref_rows, oh_t, precision=jax.lax.Precision.HIGHEST
+      ref_rows, t_one_hot, precision=jax.lax.Precision.HIGHEST
   ).reshape(4, *cell_shape)
   vmr_ref_0 = jnp.where(is_tropo0, ref_all[0], ref_all[1])
   vmr_ref_1 = jnp.where(is_tropo0, ref_all[2], ref_all[3])
@@ -231,20 +219,7 @@ def _compute_relative_abundance_interpolant_mxu(
   interpolant = _mixing_fraction_interpolant(
       relative_abundance, lookup_gas_optics.n_mixing_fraction
   )
-  if scale_by_mixture:
-    interpolant = Interpolant(
-        interp_low=IndexAndWeight(
-            idx=interpolant.interp_low.idx,
-            weight=interpolant.interp_low.weight * combined_vmr,
-        ),
-        interp_high=IndexAndWeight(
-            idx=interpolant.interp_high.idx,
-            weight=interpolant.interp_high.weight * combined_vmr,
-        ),
-    )
-  if return_combined_vmr:
-    return interpolant, combined_vmr
-  return interpolant
+  return interpolant, combined_vmr
 
 
 def _compute_relative_abundance_interpolant(
@@ -279,20 +254,6 @@ def _compute_relative_abundance_interpolant(
     An `Interpolant` object for the relative abundance of the major gas species
       in a particular electromagnetic frequency band.
   """
-  if (
-      jax.default_backend() == 'tpu'
-      and isinstance(ibnd, (int, np.integer))
-      and temperature_idx.ndim > 0
-  ):
-    return _compute_relative_abundance_interpolant_mxu(
-        lookup_gas_optics,
-        vmr_lib,
-        troposphere_idx,
-        temperature_idx,
-        int(ibnd),
-        scale_by_mixture,
-        vmr_fields,
-    )
   major_species_idx = []
   vmr_for_interp = []
   vmr_ref = []
@@ -978,7 +939,9 @@ def compute_planck_sources(
 # The arithmetic of every g-point is that of the single-g-point functions,
 # term for term and in the same order (the corner order and the left-to-right
 # sum of `optics_utils.interpolate_orig`), so the results are identical to the
-# per-g-point path. Both use the direct-indexing (gather) lookup backend.
+# per-g-point path. Both use the direct-indexing (gather) lookup backend. The
+# TPU form of this section, which reads the tables with contractions instead
+# and agrees to float32 rounding, is `compute_all_gpts_mxu` below.
 # ---------------------------------------------------------------------------
 
 
@@ -1084,10 +1047,10 @@ class CellInterpolation:
     )
     self._clamped = None
     self._mix = {}
-    self._oh_t: dict[str, Array] = {}
-    self._unscaled_mix: dict[
+    self._mix_mxu: dict[
         tuple[tuple[int, ...], str], tuple[Interpolant, Array]
     ] = {}
+    self._t_one_hot: dict[str, Array] = {}
     self._key_species = np.asarray(lookup.key_species)
 
   def clamped(self) -> tuple[Interpolant, Interpolant]:
@@ -1101,55 +1064,6 @@ class CellInterpolation:
           _clamp_interpolant(self.p_interp),
       )
     return self._clamped
-
-  def _ensure_t_one_hots(self) -> None:
-    if 'low' not in self._oh_t:
-      n_t = self.lookup.vmr_ref.shape[0]
-      dtype = self.lookup.vmr_ref.dtype
-      oh_lo = jax.nn.one_hot(
-          self.t_interp.interp_low.idx.reshape(-1),
-          n_t - 1,
-          dtype=dtype,
-          axis=0,
-      )
-      self._oh_t['low'] = jnp.pad(oh_lo, ((0, 1), (0, 0)))
-      self._oh_t['high'] = jnp.pad(oh_lo, ((1, 0), (0, 0)))
-
-  def unscaled_mix_and_vmr(
-      self, ibnd: int, t_side: str
-  ) -> tuple[Interpolant, Array]:
-    """Return `(unscaled_mix_interp, combined_vmr)` for `ibnd` and `t_side`."""
-    sig = tuple(self._key_species[ibnd].ravel().tolist())
-    base_key = (sig, t_side)
-    if base_key not in self._unscaled_mix:
-      t = getattr(self.t_interp, f'interp_{t_side}')
-      self._ensure_t_one_hots()
-      res = _compute_relative_abundance_interpolant_mxu(
-          self.lookup,
-          self.vmr_lib,
-          self.tropo_idx,
-          t.idx,
-          int(ibnd),
-          False,
-          self.vmr_fields,
-          oh_t=self._oh_t[t_side],
-          return_combined_vmr=True,
-      )
-      assert isinstance(res, tuple)
-      self._unscaled_mix[base_key] = res
-      base_interp, combined_vmr = res
-      self._mix[(sig, t_side, False)] = base_interp
-      self._mix[(sig, t_side, True)] = Interpolant(
-          interp_low=IndexAndWeight(
-              idx=base_interp.interp_low.idx,
-              weight=base_interp.interp_low.weight * combined_vmr,
-          ),
-          interp_high=IndexAndWeight(
-              idx=base_interp.interp_high.idx,
-              weight=base_interp.interp_high.weight * combined_vmr,
-          ),
-      )
-    return self._unscaled_mix[base_key]
 
   def mix(
       self, ibnd: int, t_side: str, scale_by_mixture: bool
@@ -1171,52 +1085,54 @@ class CellInterpolation:
     key = (sig, t_side, scale_by_mixture)
     if key not in self._mix:
       t = getattr(self.t_interp, f'interp_{t_side}')
-      if jax.default_backend() == 'tpu' and t.idx.ndim > 0:
-        self.unscaled_mix_and_vmr(ibnd, t_side)
-      else:
-        self._mix[key] = _compute_relative_abundance_interpolant(
-            self.lookup,
-            self.vmr_lib,
-            self.tropo_idx,
-            t.idx,
-            ibnd,
-            scale_by_mixture=scale_by_mixture,
-            vmr_fields=self.vmr_fields,
-        )
+      self._mix[key] = _compute_relative_abundance_interpolant(
+          self.lookup,
+          self.vmr_lib,
+          self.tropo_idx,
+          t.idx,
+          ibnd,
+          scale_by_mixture=scale_by_mixture,
+          vmr_fields=self.vmr_fields,
+      )
     return self._mix[key]
 
-  def build_te_weights_mxu(
-      self, ibnd: int, scale_by_mixture: bool, dtype: jnp.dtype
-  ) -> Array:
-    """Build `(n_t * n_eta, ncells)` four-corner MXU weight matrix for `ibnd`."""
-    n_t = self.lookup.t_ref.shape[0]
-    n_eta = self.lookup.n_mixing_fraction
-    n_te = n_t * n_eta
-    ncells = self.temperature.size
-    mix_for_t = {s: self.mix(ibnd, s, scale_by_mixture) for s in _SIDES}
-    w_oh = None
-    for t_side in _SIDES:
-      ti = getattr(self.t_interp, f'interp_{t_side}')
-      mi = mix_for_t[t_side]
-      base_idx = (ti.idx * n_eta + mi.interp_low.idx).reshape(ncells)
-      w_lo = (ti.weight * mi.interp_low.weight).reshape(1, ncells)
-      w_hi = (ti.weight * mi.interp_high.weight).reshape(1, ncells)
-      oh_base = jax.nn.one_hot(base_idx, n_te - 1, dtype=dtype, axis=0)
-      contrib = jnp.pad(w_lo * oh_base, ((0, 1), (0, 0))) + jnp.pad(
-          w_hi * oh_base, ((1, 0), (0, 0))
+  def mix_mxu(self, ibnd: int, t_side: str) -> tuple[Interpolant, Array]:
+    """The TPU form of `mix` (see `_relative_abundance_mxu`).
+
+    Args:
+      ibnd: The band.
+      t_side: `'high'` or `'low'`, the temperature corner it belongs to.
+
+    Returns:
+      The unscaled interpolant (`mix(..., scale_by_mixture=False)`) and the
+      combined mixing ratio that `scale_by_mixture=True` multiplies its weights
+      by.
+    """
+    key = (tuple(self._key_species[ibnd].ravel().tolist()), t_side)
+    if key not in self._mix_mxu:
+      if not self._t_one_hot:
+        n_t = self.lookup.vmr_ref.shape[0]
+        one_hot = _one_hot_rows(
+            self.t_interp.interp_low.idx.reshape(-1),
+            n_t - 1,
+            self.lookup.vmr_ref.dtype,
+        )
+        self._t_one_hot['low'] = jnp.pad(one_hot, ((0, 1), (0, 0)))
+        self._t_one_hot['high'] = jnp.pad(one_hot, ((1, 0), (0, 0)))
+      t = getattr(self.t_interp, f'interp_{t_side}')
+      self._mix_mxu[key] = _relative_abundance_mxu(
+          self.lookup,
+          self.vmr_lib,
+          self.tropo_idx,
+          t.idx,
+          ibnd,
+          self.vmr_fields,
+          self._t_one_hot[t_side],
       )
-      w_oh = contrib if w_oh is None else w_oh + contrib
-    assert w_oh is not None
-    return w_oh
+    return self._mix_mxu[key]
 
 
 _SIDES = ('high', 'low')
-
-# Contiguous pressure-table window width for 2D `(nz_dim, nc)` level scans on
-# TPU. Ten pressure nodes span eight intervals (~4.7x horizontal pressure ratio
-# on a single hybrid sigma-pressure level), covering Earth topography with
-# wide margin while keeping `(P_WIN, g_width, nc)` intermediates inside VMEM.
-_TPU_P_WINDOW = 10
 
 
 def _clamp_interpolant(interp: Interpolant) -> Interpolant:
@@ -1231,101 +1147,6 @@ def _clamp_interpolant(interp: Interpolant) -> Interpolant:
       IndexAndWeight(interp.interp_low.idx, 1.0 - w2_c),
       IndexAndWeight(interp.interp_high.idx, w2_c),
   )
-
-
-def _tpm_block_plan(ncells: int) -> tuple[int, int]:
-  """Choose VMEM-resident `(n_blocks, block_cells)` for MXU `tpm` blocks."""
-  if ncells <= 4096:
-    return 1, ncells
-  if ncells % 128 == 0:
-    for n_blocks in range(1, 513):
-      if ncells % n_blocks != 0:
-        continue
-      block_cells = ncells // n_blocks
-      if block_cells % 128 == 0 and 1024 <= block_cells <= 4096:
-        return n_blocks, block_cells
-  block_cells = 4096
-  n_blocks = (ncells + block_cells - 1) // block_cells
-  return n_blocks, block_cells
-
-
-def _interpolate_rows_tpm_mxu(
-    table: Array,
-    t_interp: Interpolant,
-    p_interp: Interpolant,
-    mix_for_t: dict[str, Interpolant],
-) -> Array:
-  """Factored cell-minor MXU eight-corner interpolation for `(t, p, eta, n)`.
-
-  Contracts the `(n_t * n_eta = 126)` corners first via a 2D MXU matmul and
-  reduces the `(n_p = 60)` pressure axis second in VMEM with `block_cells <=
-  4096` on the minor axis, avoiding both 5D whole-grid intermediates (issue #6)
-  and batched `(block_cells, width, n_p)` transposes.
-  """
-  cell_shape = t_interp.interp_high.idx.shape
-  ncells = math.prod(cell_shape)
-  n_t, n_p, n_eta, width = table.shape
-  n_te = n_t * n_eta
-  dtype = table.dtype
-  table_pgm = jnp.transpose(table, (1, 3, 0, 2)).reshape(n_p * width, n_te)
-  n_blocks, block_cells = _tpm_block_plan(ncells)
-  padded_cells = n_blocks * block_cells
-  pad = padded_cells - ncells
-
-  def _pack_idx(arr: Array) -> Array:
-    flat = arr.reshape(ncells)
-    if pad:
-      flat = jnp.pad(flat, (0, pad))
-    return flat.reshape(n_blocks, block_cells)
-
-  def _pack_w(arr: Array) -> Array:
-    flat = arr.reshape(ncells)
-    if pad:
-      flat = jnp.pad(flat, (0, pad))
-    return flat.reshape(n_blocks, 1, block_cells)
-
-  p_lo_i_b = _pack_idx(p_interp.interp_low.idx)
-  p_hi_w_b = _pack_w(p_interp.interp_high.weight)
-
-  te_by_t = []
-  for t_side in _SIDES:
-    ti = getattr(t_interp, f'interp_{t_side}')
-    mi = mix_for_t[t_side]
-    te_by_t.append((
-        _pack_idx(ti.idx * n_eta + mi.interp_low.idx),
-        _pack_w(ti.weight * mi.interp_low.weight),
-        _pack_w(ti.weight * mi.interp_high.weight),
-    ))
-
-  def _one_block(inputs):
-    p_lo_i, p_hi_w, t_corners = inputs
-    p_lo_w = 1.0 - p_hi_w
-    oh_p = jax.nn.one_hot(p_lo_i, n_p - 1, dtype=dtype, axis=0)
-    wp = jnp.pad(p_lo_w * oh_p, ((0, 1), (0, 0))) + jnp.pad(
-        p_hi_w * oh_p, ((1, 0), (0, 0))
-    )
-    wte = None
-    for base_idx, w_lo, w_hi in t_corners:
-      oh_te = jax.nn.one_hot(base_idx, n_te - 1, dtype=dtype, axis=0)
-      contrib = jnp.pad(w_lo * oh_te, ((0, 1), (0, 0))) + jnp.pad(
-          w_hi * oh_te, ((1, 0), (0, 0))
-      )
-      wte = contrib if wte is None else wte + contrib
-    mid = jnp.matmul(
-        table_pgm, wte, precision=jax.lax.Precision.HIGHEST
-    ).reshape(n_p, width, block_cells)
-    return jnp.sum(wp[:, jnp.newaxis, :] * mid, axis=0)
-
-  if n_blocks == 1:
-    first_t = [(idx_b[0], wl_b[0], wh_b[0]) for idx_b, wl_b, wh_b in te_by_t]
-    out_gc = _one_block((p_lo_i_b[0], p_hi_w_b[0], first_t))
-    return out_gc.T[:ncells].reshape(*cell_shape, width)
-
-  out_bgc = jax.lax.map(_one_block, (p_lo_i_b, p_hi_w_b, te_by_t))
-  out_flat = jnp.moveaxis(out_bgc, 1, 2).reshape(padded_cells, width)
-  if pad:
-    out_flat = out_flat[:ncells]
-  return out_flat.reshape(*cell_shape, width)
 
 
 def _interpolate_rows_tpm(
@@ -1350,8 +1171,6 @@ def _interpolate_rows_tpm(
   Returns:
     An array of shape `(*cell_shape, n)`.
   """
-  if jax.default_backend() == 'tpu' and t_interp.interp_high.idx.ndim > 0:
-    return _interpolate_rows_tpm_mxu(table, t_interp, p_interp, mix_for_t)
   total = None
   for eta_side in _SIDES:
     for p_side in _SIDES:
@@ -1363,53 +1182,6 @@ def _interpolate_rows_tpm(
         term = table[ti.idx, pi.idx, mi.idx] * weight[..., None]
         total = term if total is None else total + term
   return total
-
-
-def _interpolate_rows_te_mxu(
-    table: Array,
-    t_interp: Interpolant,
-    mix_for_t: dict[str, Interpolant],
-    leading_idx: Array | None = None,
-) -> Array:
-  """Cell-minor MXU four-corner interpolation of rows of a `(t, eta, n)` table."""
-  cell_shape = t_interp.interp_high.idx.shape
-  ncells = math.prod(cell_shape)
-  if leading_idx is None:
-    n_t, n_eta, width = table.shape
-    n_te = n_t * n_eta
-    flat_table_t = table.reshape(n_te, width).T
-    w_oh = None
-    for eta_side in _SIDES:
-      for t_side in _SIDES:
-        ti = getattr(t_interp, f'interp_{t_side}')
-        mi = getattr(mix_for_t[t_side], f'interp_{eta_side}')
-        idx = (ti.idx * n_eta + mi.idx).reshape(ncells)
-        w = (ti.weight * mi.weight).reshape(1, ncells)
-        oh = w * jax.nn.one_hot(idx, n_te, dtype=table.dtype, axis=0)
-        w_oh = oh if w_oh is None else w_oh + oh
-    return jnp.matmul(
-        flat_table_t, w_oh, precision=jax.lax.Precision.HIGHEST
-    ).T.reshape(*cell_shape, width)
-
-  n_lead, n_t, n_eta, width = table.shape
-  n_lte = n_lead * n_t * n_eta
-  flat_table_t = table.reshape(n_lte, width).T
-  lead_flat = leading_idx.reshape(ncells)
-  w_oh = None
-  for eta_side in _SIDES:
-    for t_side in _SIDES:
-      ti = getattr(t_interp, f'interp_{t_side}')
-      mi = getattr(mix_for_t[t_side], f'interp_{eta_side}')
-      idx = (
-          (lead_flat * n_t + ti.idx.reshape(ncells)) * n_eta
-          + mi.idx.reshape(ncells)
-      )
-      w = (ti.weight * mi.weight).reshape(1, ncells)
-      oh = w * jax.nn.one_hot(idx, n_lte, dtype=table.dtype, axis=0)
-      w_oh = oh if w_oh is None else w_oh + oh
-  return jnp.matmul(
-      flat_table_t, w_oh, precision=jax.lax.Precision.HIGHEST
-  ).T.reshape(*cell_shape, width)
 
 
 def _interpolate_rows_te(
@@ -1424,10 +1196,6 @@ def _interpolate_rows_te(
   tables. With `leading_idx`, the table has one more leading axis that each
   cell indexes with `leading_idx` (the Rayleigh table's lower/upper half).
   """
-  if jax.default_backend() == 'tpu' and t_interp.interp_high.idx.ndim > 0:
-    return _interpolate_rows_te_mxu(
-        table, t_interp, mix_for_t, leading_idx=leading_idx
-    )
   total = None
   for eta_side in _SIDES:
     for t_side in _SIDES:
@@ -1468,6 +1236,102 @@ def _minor_slots(
   return slots
 
 
+class _MinorSlot(NamedTuple):
+  """The static description of one minor-absorber interval of a band."""
+
+  band: int
+  # The band's g-point count: every interval covers its whole band.
+  width: int
+  is_lower: bool
+  gas: int
+  scaling_gas: int
+  scales_with_density: bool
+  by_complement: bool
+  # Offset of the band's columns in the interval table.
+  shift: int
+
+
+def _minor_slot_meta(
+    lookup: AbstractLookupGasOptics, ibnd: int
+) -> list[_MinorSlot]:
+  """The minor-absorber intervals of band `ibnd`, in `_minor_slots` order."""
+  width = _band_gpt_range(lookup, ibnd).size
+  slots = []
+  for is_lower, i in _minor_slots(lookup, ibnd):
+    if is_lower:
+      meta = (
+          lookup.idx_minor_gases_lower,
+          lookup.idx_scaling_gases_lower,
+          lookup.minor_lower_scales_with_density,
+          lookup.lower_scale_by_complement,
+          lookup.minor_lower_gpt_shift,
+      )
+    else:
+      meta = (
+          lookup.idx_minor_gases_upper,
+          lookup.idx_scaling_gases_upper,
+          lookup.minor_upper_scales_with_density,
+          lookup.upper_scale_by_complement,
+          lookup.minor_upper_gpt_shift,
+      )
+    gas, scaling_gas, scales_with_density, by_complement, shift = (
+        int(np.asarray(m)[i]) for m in meta
+    )
+    slots.append(
+        _MinorSlot(
+            band=ibnd,
+            width=width,
+            is_lower=is_lower,
+            gas=gas,
+            scaling_gas=scaling_gas,
+            scales_with_density=scales_with_density == 1,
+            by_complement=by_complement == 1,
+            shift=shift,
+        )
+    )
+  return slots
+
+
+def _minor_scaling(
+    lookup: AbstractLookupGasOptics,
+    vmr_lib: LookupVolumeMixingRatio,
+    vmr_fields: dict[int, Array] | None,
+    molecules: Array,
+    p_over_t: Array,
+    dry_factor: Array | float,
+    slot: _MinorSlot,
+) -> Array:
+  """The factor a minor interval's interpolated coefficient is multiplied by.
+
+  The absorber's column amount, times its density scaling `p / T` [hPa/K]
+  and, if it has one, the scaling gas's dry mixing ratio or that ratio's
+  complement. The flags are properties of the interval, not of the cell, so
+  they are static selections (see `compute_minor_optical_depth`).
+
+  Args:
+    lookup: The gas-optics lookup.
+    vmr_lib: The volume-mixing-ratio library.
+    vmr_fields: Optional per-gas volume mixing ratio fields.
+    molecules: Molecules per area of each cell [molecules/m^2].
+    p_over_t: Pressure over temperature of each cell [hPa/K].
+    dry_factor: `1 / (1 + vmr_h2o)`, or 1.
+    slot: The interval.
+
+  Returns:
+    The scaling, of the cells' shape.
+  """
+  vmr_minor = get_vmr(lookup, vmr_lib, slot.gas, vmr_fields)
+  scaling = vmr_minor * molecules / _M2_TO_CM2_FACTOR
+  if slot.scales_with_density:
+    gas_scaling = 1.0
+    if slot.scaling_gas > 0:
+      scaling_vmr = get_vmr(lookup, vmr_lib, slot.scaling_gas, vmr_fields)
+      prod = scaling_vmr * dry_factor
+      gas_scaling = 1.0 - prod if slot.by_complement else prod
+    scaling = scaling * (p_over_t * gas_scaling)
+  return scaling
+
+
 def _minor_optical_depth_band(
     lookup: AbstractLookupGasOptics,
     interp: CellInterpolation,
@@ -1489,56 +1353,25 @@ def _minor_optical_depth_band(
     `(*cell_shape, n_gpt_in_band)`, or `None` for a band with no minor
     absorbers.
   """
-  slots = _minor_slots(lookup, ibnd)
+  slots = _minor_slot_meta(lookup, ibnd)
   if not slots:
     return None
-  gpts = _band_gpt_range(lookup, ibnd)
-  width = gpts.size
   is_lower_atmos = interp.p > lookup.p_ref_tropo
   mix_for_t = {s: interp.mix(ibnd, s, False) for s in _SIDES}
+  p_over_t = _PASCAL_TO_HPASCAL_FACTOR * interp.p / interp.temperature
   total = None
-  for is_lower, i in slots:
-    if is_lower:
-      table = lookup.kminor_lower
-      meta = (
-          lookup.idx_minor_gases_lower,
-          lookup.idx_scaling_gases_lower,
-          lookup.minor_lower_scales_with_density,
-          lookup.lower_scale_by_complement,
-          lookup.minor_lower_gpt_shift,
-      )
-    else:
-      table = lookup.kminor_upper
-      meta = (
-          lookup.idx_minor_gases_upper,
-          lookup.idx_scaling_gases_upper,
-          lookup.minor_upper_scales_with_density,
-          lookup.upper_scale_by_complement,
-          lookup.minor_upper_gpt_shift,
-      )
-    gas, scaling_gas, scales_with_density, by_complement, shift = (
-        int(np.asarray(m)[i]) for m in meta
+  for slot in slots:
+    table = lookup.kminor_lower if slot.is_lower else lookup.kminor_upper
+    scaling = _minor_scaling(
+        lookup,
+        interp.vmr_lib,
+        interp.vmr_fields,
+        molecules,
+        p_over_t,
+        dry_factor,
+        slot,
     )
-    vmr_minor = get_vmr(lookup, interp.vmr_lib, gas, interp.vmr_fields)
-    scaling = vmr_minor * molecules / _M2_TO_CM2_FACTOR
-    # Scaling by density and by a scaling gas. These flags are properties of
-    # the interval, not of the cell, so they are static selections here.
-    gas_scaling = 1.0
-    if scaling_gas > 0:
-      scaling_vmr = get_vmr(
-          lookup, interp.vmr_lib, scaling_gas, interp.vmr_fields
-      )
-      gas_scaling = (
-          1.0 - scaling_vmr * dry_factor
-          if by_complement == 1
-          else scaling_vmr * dry_factor
-      )
-    if scales_with_density == 1:
-      density_scaling = (
-          _PASCAL_TO_HPASCAL_FACTOR * interp.p / interp.temperature * gas_scaling
-      )
-      scaling = scaling * density_scaling
-    rows = table[..., shift : shift + width]
+    rows = table[..., slot.shift : slot.shift + slot.width]
     # Floored like the major coefficient: temperature outside the table is
     # extrapolated along its end interval.
     contribution = (
@@ -1547,7 +1380,9 @@ def _minor_optical_depth_band(
         )
         * scaling[..., None]
     )
-    side_mask = (is_lower_atmos if is_lower else ~is_lower_atmos)[..., None]
+    side_mask = (is_lower_atmos if slot.is_lower else ~is_lower_atmos)[
+        ..., None
+    ]
     term = jnp.where(side_mask, contribution, 0.0)
     total = term if total is None else total + term
   return total
@@ -1575,470 +1410,6 @@ def _assemble_gpts(
   if np.array_equal(order, np.arange(order.size)):
     return stacked
   return stacked[np.argsort(order)]
-
-
-def _ordered_bands_and_perm(
-    lookup: AbstractLookupGasOptics, groups: list[_BandGroup]
-) -> tuple[dict[int, int], list[int], np.ndarray | None]:
-  """Return `(band_widths, ordered_bands, inv_order_or_none)` without gathers."""
-  lims = np.asarray(lookup.bnd_lims_gpt)
-  band_widths = {
-      b: _band_gpt_range(lookup, b).size for g in groups for b in g.bands
-  }
-  ordered_bands = sorted(band_widths, key=lambda b: int(lims[b, 0]))
-  band_order = np.concatenate(
-      [_band_gpt_range(lookup, b) for b in ordered_bands]
-  )
-  if np.array_equal(band_order, np.arange(band_order.size)):
-    return band_widths, ordered_bands, None
-  return band_widths, ordered_bands, np.argsort(band_order)
-
-
-def _permute_gpt_axis0(arr: Array, inv_order: np.ndarray | None) -> Array:
-  """Permute leading g-point axis without emitting `stablehlo.gather`."""
-  if inv_order is None:
-    return arr
-  return jnp.concatenate([arr[int(i) : int(i) + 1] for i in inv_order], axis=0)
-
-
-def _prepare_minor_group_specs(
-    lookup: AbstractLookupGasOptics,
-    groups: list[_BandGroup],
-    band_widths: dict[int, int],
-) -> list[tuple[Array | None, list[tuple[int, int, bool, int, int, int, int]]]]:
-  """Pre-slice static minor-absorber tables and metadata per `_BandGroup`."""
-  n_te = lookup.t_ref.shape[0] * lookup.n_mixing_fraction
-  out = []
-  for g in groups:
-    slot_rows_t = []
-    slot_meta = []
-    for b in g.bands:
-      wb = band_widths[b]
-      for is_lower, i in _minor_slots(lookup, b):
-        if is_lower:
-          table = lookup.kminor_lower
-          meta = (
-              lookup.idx_minor_gases_lower,
-              lookup.idx_scaling_gases_lower,
-              lookup.minor_lower_scales_with_density,
-              lookup.lower_scale_by_complement,
-              lookup.minor_lower_gpt_shift,
-          )
-        else:
-          table = lookup.kminor_upper
-          meta = (
-              lookup.idx_minor_gases_upper,
-              lookup.idx_scaling_gases_upper,
-              lookup.minor_upper_scales_with_density,
-              lookup.upper_scale_by_complement,
-              lookup.minor_upper_gpt_shift,
-          )
-        gas, scaling_gas, scales_with_density, by_complement, shift = (
-            int(np.asarray(m)[i]) for m in meta
-        )
-        slot_rows_t.append(table[..., shift : shift + wb].reshape(n_te, wb).T)
-        slot_meta.append((
-            b,
-            wb,
-            is_lower,
-            gas,
-            scaling_gas,
-            scales_with_density,
-            by_complement,
-        ))
-    minor_tbl = jnp.concatenate(slot_rows_t, axis=0) if slot_rows_t else None
-    out.append((minor_tbl, slot_meta))
-  return out
-
-
-def _minor_slot_scaling_1d(
-    lookup: AbstractLookupGasOptics,
-    vmr_lib: LookupVolumeMixingRatio,
-    vmr_1d: dict[int, Array] | None,
-    mol_cm2_1d: Array,
-    p_over_t_1d: Array,
-    dry_1d: Array | float,
-    gas: int,
-    scaling_gas: int,
-    scales_with_density: int,
-    by_complement: int,
-) -> Array:
-  """Compute 1D per-cell minor absorber scaling on `(nc,)`."""
-  vmr_minor = _get_vmr_static(lookup, vmr_lib, gas, vmr_1d)
-  scaling = vmr_minor * mol_cm2_1d
-  if scales_with_density == 1:
-    gas_scaling: Array | float = 1.0
-    if scaling_gas > 0:
-      scaling_vmr = _get_vmr_static(lookup, vmr_lib, scaling_gas, vmr_1d)
-      prod = scaling_vmr * dry_1d
-      gas_scaling = 1.0 - prod if by_complement == 1 else prod
-    scaling = scaling * (p_over_t_1d * gas_scaling)
-  return scaling
-
-
-def _split_vmr_for_scan(
-    vmr_fields: dict[int, Array] | None, nz_dim: int, nc: int
-) -> tuple[dict[int, Array], dict[int, Array]]:
-  """Separate `(nz_dim, nc)` VMR fields from scalar VMR overrides."""
-  vmr_2d: dict[int, Array] = {}
-  vmr_scalar: dict[int, Array] = {}
-  if vmr_fields is not None:
-    for k, v in vmr_fields.items():
-      if jnp.ndim(v) == 0:
-        vmr_scalar[k] = v
-      else:
-        vmr_2d[k] = jnp.broadcast_to(v, (nz_dim, nc))
-  return vmr_2d, vmr_scalar
-
-
-def _interpolate_groups_tpm_mxu(
-    lookup: AbstractLookupGasOptics,
-    table: Array,
-    t_interp: Interpolant,
-    p_interp: Interpolant,
-    interp: CellInterpolation,
-    scale_by_mixture: bool,
-) -> Array:
-  """Batched VMEM-resident MXU `tpm` interpolation across all band groups.
-
-  Uses a per-level `_TPU_P_WINDOW` pressure-windowed scan on 2D `(nz_dim, nc)`
-  atmospheres (falling back cleanly via `jax.lax.cond` if a synthetic test level
-  spans the entire pressure table) and VMEM-sized `<= 4096`-cell blocks
-  otherwise. Returns `(n_gpt, ncells)`.
-  """
-  cell_shape = t_interp.interp_high.idx.shape
-  ncells = math.prod(cell_shape)
-  n_t, n_p, n_eta, _ = table.shape
-  n_te = n_t * n_eta
-  dtype = table.dtype
-  groups = band_groups(lookup)
-  band_widths, ordered_bands, inv_order = _ordered_bands_and_perm(
-      lookup, groups
-  )
-  tables_pgm_3d = [
-      jnp.transpose(_group_columns(lookup, table, g), (1, 3, 0, 2)).reshape(
-          n_p, g.gpts.size, n_te
-      )
-      for g in groups
-  ]
-  tables_pgm_2d = [
-      tbl.reshape(n_p * g.gpts.size, n_te)
-      for tbl, g in zip(tables_pgm_3d, groups)
-  ]
-  group_mix_pairs = [
-      (
-          interp.mix(g.bands[0], 'high', scale_by_mixture),
-          interp.mix(g.bands[0], 'low', scale_by_mixture),
-      )
-      for g in groups
-  ]
-
-  def _blocked_full(_=None) -> Array:
-    n_blocks, block_cells = _tpm_block_plan(ncells)
-    padded_cells = n_blocks * block_cells
-    pad = padded_cells - ncells
-
-    def _pack_idx(arr: Array) -> Array:
-      flat = arr.reshape(ncells)
-      if pad:
-        flat = jnp.pad(flat, (0, pad))
-      return flat.reshape(n_blocks, block_cells)
-
-    def _pack_w(arr: Array) -> Array:
-      flat = arr.reshape(ncells)
-      if pad:
-        flat = jnp.pad(flat, (0, pad))
-      return flat.reshape(n_blocks, 1, block_cells)
-
-    p_lo_i_b = _pack_idx(p_interp.interp_low.idx)
-    p_hi_w_b = _pack_w(p_interp.interp_high.weight)
-
-    te_by_group = []
-    for m_hi, m_lo in group_mix_pairs:
-      mix_for_t = {'high': m_hi, 'low': m_lo}
-      t_corners = []
-      for t_side in _SIDES:
-        ti = getattr(t_interp, f'interp_{t_side}')
-        mi = mix_for_t[t_side]
-        t_corners.append((
-            _pack_idx(ti.idx * n_eta + mi.interp_low.idx),
-            _pack_w(ti.weight * mi.interp_low.weight),
-            _pack_w(ti.weight * mi.interp_high.weight),
-        ))
-      te_by_group.append(tuple(t_corners))
-    te_by_group_t = tuple(te_by_group)
-
-    def _one_block(inputs):
-      p_lo_i, p_hi_w, group_corners = inputs
-      p_lo_w = 1.0 - p_hi_w
-      oh_p = jax.nn.one_hot(p_lo_i, n_p - 1, dtype=dtype, axis=0)
-      wp = jnp.pad(p_lo_w * oh_p, ((0, 1), (0, 0))) + jnp.pad(
-          p_hi_w * oh_p, ((1, 0), (0, 0))
-      )
-      by_band: dict[int, Array] = {}
-      for g_idx, g in enumerate(groups):
-        wg = g.gpts.size
-        wte = None
-        for base_idx, w_lo, w_hi in group_corners[g_idx]:
-          oh_te = jax.nn.one_hot(base_idx, n_te - 1, dtype=dtype, axis=0)
-          contrib = jnp.pad(w_lo * oh_te, ((0, 1), (0, 0))) + jnp.pad(
-              w_hi * oh_te, ((1, 0), (0, 0))
-          )
-          wte = contrib if wte is None else wte + contrib
-        mid = jnp.matmul(
-            tables_pgm_2d[g_idx], wte, precision=jax.lax.Precision.HIGHEST
-        ).reshape(n_p, wg, block_cells)
-        out_gc = jnp.sum(wp[:, jnp.newaxis, :] * mid, axis=0)
-        off = 0
-        for b in g.bands:
-          wb = band_widths[b]
-          by_band[b] = out_gc[off : off + wb]
-          off += wb
-      return jnp.concatenate([by_band[b] for b in ordered_bands], axis=0)
-
-    if n_blocks == 1:
-      first_groups = tuple(
-          tuple((idx_b[0], wl_b[0], wh_b[0]) for idx_b, wl_b, wh_b in corners)
-          for corners in te_by_group_t
-      )
-      out_gc = _one_block((p_lo_i_b[0], p_hi_w_b[0], first_groups))
-      stacked = out_gc[:, :ncells]
-    else:
-      out_bgc = jax.lax.map(
-          _one_block, (p_lo_i_b, p_hi_w_b, te_by_group_t)
-      )
-      stacked = jnp.moveaxis(out_bgc, 0, 1).reshape(-1, padded_cells)[
-          :, :ncells
-      ]
-    return _permute_gpt_axis0(stacked, inv_order)
-
-  if len(cell_shape) == 2 and n_p > _TPU_P_WINDOW and cell_shape[1] <= 32768:
-    nz_dim, nc = cell_shape
-    p_lo_i_zc = p_interp.interp_low.idx
-    p_span = jnp.max(p_lo_i_zc, axis=1) - jnp.min(p_lo_i_zc, axis=1)
-    can_window = jnp.all(p_span <= (_TPU_P_WINDOW - 2))
-
-    def _windowed_level_scan(_=None) -> Array:
-      p_hi_w_zc = p_interp.interp_high.weight
-      t_hi_i_zc = t_interp.interp_high.idx
-      t_hi_w_zc = t_interp.interp_high.weight
-      group_mix_zc = []
-      for m_hi, m_lo in group_mix_pairs:
-        group_mix_zc.append((
-            m_hi.interp_low.idx,
-            m_hi.interp_low.weight,
-            m_hi.interp_high.weight,
-            m_lo.interp_low.idx,
-            m_lo.interp_low.weight,
-            m_lo.interp_high.weight,
-        ))
-      group_mix_t = tuple(group_mix_zc)
-
-      def _step(_, scan_in):
-        p_lo_i_z, p_hi_w_z, t_hi_i_z, t_hi_w_z, g_mix_z = scan_in
-        p_start = jnp.clip(jnp.min(p_lo_i_z), 0, n_p - _TPU_P_WINDOW)
-        oh_p = jax.nn.one_hot(
-            p_lo_i_z - p_start, _TPU_P_WINDOW - 1, dtype=dtype, axis=0
-        )
-        p_hi_1c = p_hi_w_z[jnp.newaxis, :]
-        p_lo_1c = 1.0 - p_hi_1c
-        wp = jnp.pad(p_lo_1c * oh_p, ((0, 1), (0, 0))) + jnp.pad(
-            p_hi_1c * oh_p, ((1, 0), (0, 0))
-        )
-        t_lo_i_z = t_hi_i_z - 1
-        t_hi_1c = t_hi_w_z[jnp.newaxis, :]
-        t_lo_1c = 1.0 - t_hi_1c
-        by_band: dict[int, Array] = {}
-        for g_idx, g in enumerate(groups):
-          wg = g.gpts.size
-          ehi_i, ehi_lw, ehi_hw, elo_i, elo_lw, elo_hw = g_mix_z[g_idx]
-          oh_hi = jax.nn.one_hot(
-              t_hi_i_z * n_eta + ehi_i, n_te - 1, dtype=dtype, axis=0
-          )
-          oh_lo = jax.nn.one_hot(
-              t_lo_i_z * n_eta + elo_i, n_te - 1, dtype=dtype, axis=0
-          )
-          wte = (
-              jnp.pad(
-                  (t_hi_1c * ehi_lw[jnp.newaxis, :]) * oh_hi, ((0, 1), (0, 0))
-              )
-              + jnp.pad(
-                  (t_hi_1c * ehi_hw[jnp.newaxis, :]) * oh_hi, ((1, 0), (0, 0))
-              )
-              + jnp.pad(
-                  (t_lo_1c * elo_lw[jnp.newaxis, :]) * oh_lo, ((0, 1), (0, 0))
-              )
-              + jnp.pad(
-                  (t_lo_1c * elo_hw[jnp.newaxis, :]) * oh_lo, ((1, 0), (0, 0))
-              )
-          )
-          tbl_win = jax.lax.dynamic_slice_in_dim(
-              tables_pgm_3d[g_idx], p_start, _TPU_P_WINDOW, axis=0
-          ).reshape(_TPU_P_WINDOW * wg, n_te)
-          mid = jnp.matmul(
-              tbl_win, wte, precision=jax.lax.Precision.HIGHEST
-          ).reshape(_TPU_P_WINDOW, wg, nc)
-          out_gc = jnp.sum(wp[:, jnp.newaxis, :] * mid, axis=0)
-          off = 0
-          for b in g.bands:
-            wb = band_widths[b]
-            by_band[b] = out_gc[off : off + wb]
-            off += wb
-        out_z = jnp.concatenate([by_band[b] for b in ordered_bands], axis=0)
-        return None, _permute_gpt_axis0(out_z, inv_order)
-
-      _, out_zgc = jax.lax.scan(
-          _step,
-          None,
-          (p_lo_i_zc, p_hi_w_zc, t_hi_i_zc, t_hi_w_zc, group_mix_t),
-      )
-      return jnp.swapaxes(out_zgc, 0, 1).reshape(-1, ncells)
-
-    return jax.lax.cond(can_window, _windowed_level_scan, _blocked_full)
-
-  return _blocked_full()
-
-
-def _matmul_te_blocked_mxu(
-    rows_t: Array,
-    interp: CellInterpolation,
-    ibnd: int,
-    scale_by_mixture: bool,
-    dtype: jnp.dtype,
-) -> Array:
-  """Evaluate `rows_t @ w_oh` in `<= 4096`-cell blocks so `w_oh` stays in VMEM."""
-  ncells = interp.temperature.size
-  if ncells <= 4096:
-    w_oh = interp.build_te_weights_mxu(ibnd, scale_by_mixture, dtype)
-    return jnp.matmul(rows_t, w_oh, precision=jax.lax.Precision.HIGHEST)
-  n_t = interp.lookup.t_ref.shape[0]
-  n_eta = interp.lookup.n_mixing_fraction
-  n_te = n_t * n_eta
-  n_blocks, block_cells = _tpm_block_plan(ncells)
-  padded_cells = n_blocks * block_cells
-  pad = padded_cells - ncells
-
-  def _pack_idx(arr: Array) -> Array:
-    flat = arr.reshape(ncells)
-    if pad:
-      flat = jnp.pad(flat, (0, pad))
-    return flat.reshape(n_blocks, block_cells)
-
-  def _pack_w(arr: Array) -> Array:
-    flat = arr.reshape(ncells)
-    if pad:
-      flat = jnp.pad(flat, (0, pad))
-    return flat.reshape(n_blocks, 1, block_cells)
-
-  mix_for_t = {s: interp.mix(ibnd, s, scale_by_mixture) for s in _SIDES}
-  t_corners = []
-  for t_side in _SIDES:
-    ti = getattr(interp.t_interp, f'interp_{t_side}')
-    mi = mix_for_t[t_side]
-    t_corners.append((
-        _pack_idx(ti.idx * n_eta + mi.interp_low.idx),
-        _pack_w(ti.weight * mi.interp_low.weight),
-        _pack_w(ti.weight * mi.interp_high.weight),
-    ))
-
-  def _block_fn(corners_b):
-    wte = None
-    for base_idx, w_lo, w_hi in corners_b:
-      oh_te = jax.nn.one_hot(base_idx, n_te - 1, dtype=dtype, axis=0)
-      contrib = jnp.pad(w_lo * oh_te, ((0, 1), (0, 0))) + jnp.pad(
-          w_hi * oh_te, ((1, 0), (0, 0))
-      )
-      wte = contrib if wte is None else wte + contrib
-    return jnp.matmul(rows_t, wte, precision=jax.lax.Precision.HIGHEST)
-
-  out_bmc = jax.lax.map(_block_fn, tuple(t_corners))
-  return jnp.moveaxis(out_bmc, 0, 1).reshape(rows_t.shape[0], padded_cells)[
-      :, :ncells
-  ]
-
-
-def _minor_optical_depth_all_gpts_mxu(
-    lookup: AbstractLookupGasOptics,
-    interp: CellInterpolation,
-    molecules: Array,
-    dry_factor: Array | float,
-) -> Array | None:
-  """Cell-minor MXU minor-absorber optical depth `(n_gpt, ncells)` across groups."""
-  ncells = molecules.size
-  dtype = lookup.kminor_lower.dtype
-  groups = band_groups(lookup)
-  band_widths, ordered_bands, inv_order = _ordered_bands_and_perm(
-      lookup, groups
-  )
-  minor_specs = _prepare_minor_group_specs(lookup, groups, band_widths)
-
-  mol_cm2_flat = molecules.reshape(ncells) / _M2_TO_CM2_FACTOR
-  p_flat = interp.p.reshape(ncells)
-  temp_flat = interp.temperature.reshape(ncells)
-  p_over_t_flat = _PASCAL_TO_HPASCAL_FACTOR * p_flat / temp_flat
-  is_lower_flat = p_flat > lookup.p_ref_tropo
-  dry_flat = (
-      dry_factor.reshape(ncells) if jnp.ndim(dry_factor) > 0 else dry_factor
-  )
-  vmr_flat = (
-      None
-      if interp.vmr_fields is None
-      else {
-          k: v.reshape(ncells) if jnp.ndim(v) > 0 else v
-          for k, v in interp.vmr_fields.items()
-      }
-  )
-
-  band_totals: dict[int, Array] = {}
-  for g, (minor_tbl, slot_meta) in zip(groups, minor_specs):
-    if minor_tbl is None:
-      continue
-    raw_all = _matmul_te_blocked_mxu(
-        minor_tbl, interp, g.bands[0], False, dtype
-    )
-    off = 0
-    for (
-        b,
-        wb,
-        is_lower,
-        gas,
-        scaling_gas,
-        scales_with_density,
-        by_complement,
-    ) in slot_meta:
-      scaling = _minor_slot_scaling_1d(
-          lookup,
-          interp.vmr_lib,
-          vmr_flat,
-          mol_cm2_flat,
-          p_over_t_flat,
-          dry_flat,
-          gas,
-          scaling_gas,
-          scales_with_density,
-          by_complement,
-      )
-      contrib = (
-          optics_utils.floor_at_zero(raw_all[off : off + wb])
-          * scaling[jnp.newaxis, :]
-      )
-      off += wb
-      mask = (is_lower_flat if is_lower else ~is_lower_flat)[jnp.newaxis, :]
-      term = jnp.where(mask, contrib, 0.0)
-      band_totals[b] = term if b not in band_totals else band_totals[b] + term
-
-  if not band_totals:
-    return None
-  stacked = jnp.concatenate(
-      [
-          band_totals[b]
-          if b in band_totals
-          else jnp.zeros((band_widths[b], ncells), dtype=dtype)
-          for b in ordered_bands
-      ],
-      axis=0,
-  )
-  return _permute_gpt_axis0(stacked, inv_order)
 
 
 def compute_optical_depth_all_gpts(
@@ -2070,26 +1441,6 @@ def compute_optical_depth_all_gpts(
   if interp is None:
     interp = CellInterpolation(lookup, vmr_lib, temperature, p, vmr_fields)
   dry_factor = _dry_factor(lookup, vmr_fields)
-  if jax.default_backend() == 'tpu' and temperature.ndim > 0 and temperature.size > 0:
-    cell_shape = temperature.shape
-    ncells = temperature.size
-    mol_scale = (molecules.reshape(ncells) / _M2_TO_CM2_FACTOR)[jnp.newaxis, :]
-    major_gn = mol_scale * optics_utils.floor_at_zero(
-        _interpolate_groups_tpm_mxu(
-            lookup,
-            lookup.kmajor,
-            interp.t_interp,
-            interp.p_interp,
-            interp,
-            True,
-        )
-    )
-    minor_gn = _minor_optical_depth_all_gpts_mxu(
-        lookup, interp, molecules, dry_factor
-    )
-    total_gn = major_gn if minor_gn is None else minor_gn + major_gn
-    return total_gn.reshape(total_gn.shape[0], *cell_shape)
-
   groups = band_groups(lookup)
   pieces = []
   for group in groups:
@@ -2144,17 +1495,6 @@ def compute_planck_fraction_all_gpts(
     interp = CellInterpolation(lookup, vmr_lib, temperature, p, vmr_fields)
   # Clamped, not extrapolated, at the table ends: see `compute_planck_fraction`.
   t_clamped, p_clamped = interp.clamped()
-  if jax.default_backend() == 'tpu' and temperature.ndim > 0 and temperature.size > 0:
-    pfrac_gn = _interpolate_groups_tpm_mxu(
-        lookup,
-        lookup.planck_fraction,
-        t_clamped,
-        p_clamped,
-        interp,
-        False,
-    )
-    return pfrac_gn.reshape(pfrac_gn.shape[0], *temperature.shape)
-
   groups = band_groups(lookup)
   pieces = []
   for group in groups:
@@ -2191,43 +1531,6 @@ def compute_rayleigh_optical_depth_all_gpts(
     factor = 1.0 + vmr_fields[lkp.idx_h2o]
   else:
     factor = 1.0
-  if jax.default_backend() == 'tpu' and temperature.ndim > 0 and temperature.size > 0:
-    cell_shape = temperature.shape
-    ncells = temperature.size
-    n_te = lkp.t_ref.shape[0] * lkp.n_mixing_fraction
-    dtype = lkp.rayl_lower.dtype
-    groups = band_groups(lkp)
-    band_widths, ordered_bands, inv_order = _ordered_bands_and_perm(
-        lkp, groups
-    )
-    scale_flat = (
-        (factor * molecules).reshape(ncells) / _M2_TO_CM2_FACTOR
-    )[jnp.newaxis, :]
-    is_tropo0 = (interp.tropo_idx.reshape(ncells) == 0)[jnp.newaxis, :]
-    by_band: dict[int, Array] = {}
-    for g in groups:
-      wg = g.gpts.size
-      lo_t = _group_columns(lkp, lkp.rayl_lower, g).reshape(n_te, wg).T
-      hi_t = _group_columns(lkp, lkp.rayl_upper, g).reshape(n_te, wg).T
-      both = _matmul_te_blocked_mxu(
-          jnp.concatenate([lo_t, hi_t], axis=0), interp, g.bands[0], False, dtype
-      )
-      rayl_g = (
-          optics_utils.floor_at_zero(
-              jnp.where(is_tropo0, both[:wg], both[wg:])
-          )
-          * scale_flat
-      )
-      off = 0
-      for b in g.bands:
-        wb = band_widths[b]
-        by_band[b] = rayl_g[off : off + wb]
-        off += wb
-    stacked = _permute_gpt_axis0(
-        jnp.concatenate([by_band[b] for b in ordered_bands], axis=0), inv_order
-    )
-    return stacked.reshape(stacked.shape[0], *cell_shape)
-
   groups = band_groups(lkp)
   pieces = []
   for group in groups:
@@ -2248,633 +1551,574 @@ def compute_rayleigh_optical_depth_all_gpts(
   return _assemble_gpts(pieces, groups)
 
 
-def compute_lw_optical_and_planck_all_gpts_mxu(
-    lkp: LookupGasOpticsLongwave,
-    vmr_lib: LookupVolumeMixingRatio,
-    molecules: Array,
-    temperature: Array,
-    p: Array,
-    vmr_fields: dict[int, Array] | None = None,
-    interp: CellInterpolation | None = None,
-    *,
-    z_leading_output: bool = False,
-) -> tuple[Array, Array]:
-  """Fused VMEM-resident MXU LW optical depth + Planck fraction.
+# ---------------------------------------------------------------------------
+# All-g-point gas optics on the TPU matrix unit (MXU).
+#
+# The TPU form of `compute_optical_depth_all_gpts`,
+# `compute_planck_fraction_all_gpts` and
+# `compute_rayleigh_optical_depth_all_gpts` (selected by `rrtmgp.backend`).
+# A TPU runs a gather serially on its vector unit, and the row gathers above
+# are thousands of them, while its matrix unit idles. So each table read is a
+# contraction instead: a cell's interpolation weights are written into a
+# one-hot `(n_table_rows, n_cells)` matrix and the table, flattened to
+# `(n_out, n_table_rows)`, is multiplied by it. The cell axis is the minor axis
+# of every array, which is what fills the TPU's `(8, 128)` tiles.
+#
+# * The `(t, eta)` corners are one contraction per band group, over the
+#   `n_t * n_eta` flattened rows; the pressure axis, whose interpolant is shared
+#   by every group, is reduced afterwards with its own one-hot weights.
+# * The major, Planck-fraction, minor and Rayleigh tables of a band group read
+#   the same corner matrices, so they are evaluated together (`_mxu_cells`).
+# * On a `(n_levels, n_columns)` atmosphere the cells of one level are solved
+#   at a time in a `lax.scan` (`_mxu_level_scan`), and a level's pressures span
+#   only a few nodes of the `n_p = 60` pressure table: each level reads a
+#   window of `_TPU_P_WINDOW` nodes, starting at its lowest, and the
+#   intermediates stay in the TPU's vector memory. That holds when no level
+#   spans more of the table than the window; it is a property of the data, so
+#   it is tested at run time and anything else is solved in blocks of cells
+#   over the whole table (`_mxu_blocked`). Both are compiled (a `lax.cond`),
+#   and under `vmap` the `cond` becomes a select that runs both; nothing in
+#   this library vmaps the solve.
+#
+# The contractions run at `Precision.HIGHEST`, which on a TPU is float32 to
+# within a few ulp (a multi-pass bfloat16 product, not IEEE float32), so the
+# results agree with the gather path to float32 rounding rather than bit for
+# bit.
+# ---------------------------------------------------------------------------
 
-  On 2D `(nzh, nc)` atmospheres, evaluates `kmajor`, `planck_fraction`, and
-  `kminor` together inside a single per-level `jax.lax.scan`, slicing each band
-  group's `n_p = 60` pressure table down to the `_TPU_P_WINDOW` active pressure
-  nodes of that level and sharing the exact same pressure and `(t, eta)` corner
-  one-hot matrices across all three contractions in VMEM.
+# Width in nodes of the pressure-table window a level reads. Ten nodes span
+# nine intervals, a pressure ratio of ~5.8 on the shipped tables: a hybrid
+# sigma-pressure level spans less than half that over Earth's topography.
+_TPU_P_WINDOW = 10
+# Most columns a level's window is used for; past this the `(_TPU_P_WINDOW,
+# group_width, n_columns)` intermediates outgrow the vector memory and the
+# cells are solved in blocks instead.
+_TPU_MAX_WINDOW_COLUMNS = 32768
+# Cells per block of the blocked solve, which sizes its `(n_table_rows,
+# block_cells)` weight matrices for the vector memory.
+_TPU_MAX_BLOCK_CELLS = 4096
+
+
+def _one_hot_rows(idx: Array, n: int, dtype: jnp.dtype) -> Array:
+  """`(n, *idx.shape)` one-hot of `idx`: the table-row axis leads."""
+  return jax.nn.one_hot(idx, n, dtype=dtype, axis=0)
+
+
+def _spread(one_hot: Array, w_lo: Array, w_hi: Array) -> Array:
+  """Linear-interpolation weights as rows of a table axis.
+
+  Args:
+    one_hot: `(n - 1, m)`, the one-hot of each cell's lower node over the
+      table's `n - 1` intervals.
+    w_lo: The weight of the lower node, broadcastable against `one_hot`.
+    w_hi: The weight of the upper node.
+
+  Returns:
+    `(n, m)`, with `w_lo` on each cell's lower node and `w_hi` on the next.
   """
-  if interp is None:
-    interp = CellInterpolation(lkp, vmr_lib, temperature, p, vmr_fields)
-  cell_shape = temperature.shape
-  n_t, n_p, n_eta, _ = lkp.kmajor.shape
-  n_te = n_t * n_eta
-  dtype = lkp.kmajor.dtype
-
-  def _fallback(_=None) -> tuple[Array, Array]:
-    tau = compute_optical_depth_all_gpts(
-        lkp, vmr_lib, molecules, temperature, p, vmr_fields, interp=interp
-    )
-    pfrac = compute_planck_fraction_all_gpts(
-        lkp, vmr_lib, p, temperature, vmr_fields, interp=interp
-    )
-    if z_leading_output and tau.ndim == 3:
-      return jnp.swapaxes(tau, 0, 1), jnp.swapaxes(pfrac, 0, 1)
-    return tau, pfrac
-
-  if len(cell_shape) != 2 or n_p <= _TPU_P_WINDOW or cell_shape[1] > 32768:
-    return _fallback()
-
-  nzh, nc = cell_shape
-  t_clamped, p_clamped = interp.clamped()
-  p_lo_i_zc = interp.p_interp.interp_low.idx
-  p_span = jnp.max(p_lo_i_zc, axis=1) - jnp.min(p_lo_i_zc, axis=1)
-  can_window = jnp.all(p_span <= (_TPU_P_WINDOW - 2))
-
-  groups = band_groups(lkp)
-  band_widths, ordered_bands, inv_order = _ordered_bands_and_perm(lkp, groups)
-  kmaj_pgm = [
-      jnp.transpose(_group_columns(lkp, lkp.kmajor, g), (1, 3, 0, 2)).reshape(
-          n_p, g.gpts.size, n_te
-      )
-      for g in groups
-  ]
-  pfr_pgm = [
-      jnp.transpose(
-          _group_columns(lkp, lkp.planck_fraction, g), (1, 3, 0, 2)
-      ).reshape(n_p, g.gpts.size, n_te)
-      for g in groups
-  ]
-  minor_specs = _prepare_minor_group_specs(lkp, groups, band_widths)
-  group_mix = []
-  for g in groups:
-    ibnd0 = g.bands[0]
-    b_hi, c_hi = interp.unscaled_mix_and_vmr(ibnd0, 'high')
-    b_lo, c_lo = interp.unscaled_mix_and_vmr(ibnd0, 'low')
-    group_mix.append((
-        b_hi.interp_low.idx,
-        b_hi.interp_high.weight,
-        c_hi,
-        b_lo.interp_low.idx,
-        b_lo.interp_high.weight,
-        c_lo,
-    ))
-  group_mix_t = tuple(group_mix)
-
-  def _windowed_scan(_=None) -> tuple[Array, Array]:
-    dry_factor = _dry_factor(lkp, vmr_fields)
-    dry_zc = (
-        jnp.broadcast_to(dry_factor, (nzh, nc))
-        if jnp.ndim(dry_factor) > 0
-        else None
-    )
-    dry_scalar = 1.0 if dry_zc is not None else dry_factor
-    vmr_2d, vmr_scalar = _split_vmr_for_scan(vmr_fields, nzh, nc)
-
-    scan_inputs = (
-        jnp.broadcast_to(molecules, (nzh, nc)),
-        jnp.broadcast_to(p, (nzh, nc)),
-        temperature,
-        p_lo_i_zc,
-        interp.p_interp.interp_high.weight,
-        p_clamped.interp_high.weight,
-        interp.t_interp.interp_high.idx,
-        interp.t_interp.interp_high.weight,
-        t_clamped.interp_high.weight,
-        dry_zc,
-        vmr_2d,
-        group_mix_t,
-    )
-
-    def _lw_step(_, s_in):
-      (
-          mol_z,
-          p_z,
-          temp_z,
-          p_lo_i_z,
-          p_hi_w_z,
-          pc_hi_w_z,
-          t_hi_i_z,
-          t_hi_w_z,
-          tc_hi_w_z,
-          dry_z_opt,
-          vmr_z_2d,
-          g_mix_z,
-      ) = s_in
-      vmr_z = {**vmr_scalar, **vmr_z_2d}
-      dry_z = dry_scalar if dry_z_opt is None else dry_z_opt
-      mol_cm2_z = mol_z / _M2_TO_CM2_FACTOR
-      mol_scale_1c = mol_cm2_z[jnp.newaxis, :]
-      p_over_t_z = _PASCAL_TO_HPASCAL_FACTOR * p_z / temp_z
-      is_lower_z = p_z > lkp.p_ref_tropo
-
-      p_start = jnp.clip(jnp.min(p_lo_i_z), 0, n_p - _TPU_P_WINDOW)
-      oh_p = jax.nn.one_hot(
-          p_lo_i_z - p_start, _TPU_P_WINDOW - 1, dtype=dtype, axis=0
-      )
-      p_hi_1c = p_hi_w_z[jnp.newaxis, :]
-      wp_maj = jnp.pad((1.0 - p_hi_1c) * oh_p, ((0, 1), (0, 0))) + jnp.pad(
-          p_hi_1c * oh_p, ((1, 0), (0, 0))
-      )
-      pc_hi_1c = pc_hi_w_z[jnp.newaxis, :]
-      wp_pfr = jnp.pad((1.0 - pc_hi_1c) * oh_p, ((0, 1), (0, 0))) + jnp.pad(
-          pc_hi_1c * oh_p, ((1, 0), (0, 0))
-      )
-
-      t_lo_i_z = t_hi_i_z - 1
-      t_hi_1c = t_hi_w_z[jnp.newaxis, :]
-      t_lo_1c = 1.0 - t_hi_1c
-      tc_hi_1c = tc_hi_w_z[jnp.newaxis, :]
-      tc_lo_1c = 1.0 - tc_hi_1c
-
-      tau_by_band: dict[int, Array] = {}
-      pfr_by_band: dict[int, Array] = {}
-      for g_idx, g in enumerate(groups):
-        wg = g.gpts.size
-        ehi_i, ehi_hw, c_hi_z, elo_i, elo_hw, c_lo_z = g_mix_z[g_idx]
-        ehi_hw_1c = ehi_hw[jnp.newaxis, :]
-        ehi_lw_1c = 1.0 - ehi_hw_1c
-        elo_hw_1c = elo_hw[jnp.newaxis, :]
-        elo_lw_1c = 1.0 - elo_hw_1c
-
-        oh_hi = jax.nn.one_hot(
-            t_hi_i_z * n_eta + ehi_i, n_te - 1, dtype=dtype, axis=0
-        )
-        oh_lo = jax.nn.one_hot(
-            t_lo_i_z * n_eta + elo_i, n_te - 1, dtype=dtype, axis=0
-        )
-
-        unsc_hi = jnp.pad((t_hi_1c * ehi_lw_1c) * oh_hi, ((0, 1), (0, 0))) + (
-            jnp.pad((t_hi_1c * ehi_hw_1c) * oh_hi, ((1, 0), (0, 0)))
-        )
-        unsc_lo = jnp.pad((t_lo_1c * elo_lw_1c) * oh_lo, ((0, 1), (0, 0))) + (
-            jnp.pad((t_lo_1c * elo_hw_1c) * oh_lo, ((1, 0), (0, 0)))
-        )
-        wte_unscaled = unsc_hi + unsc_lo
-        wte_major = (
-            unsc_hi * c_hi_z[jnp.newaxis, :] + unsc_lo * c_lo_z[jnp.newaxis, :]
-        )
-        wte_pfrac = (
-            jnp.pad((tc_hi_1c * ehi_lw_1c) * oh_hi, ((0, 1), (0, 0)))
-            + jnp.pad((tc_hi_1c * ehi_hw_1c) * oh_hi, ((1, 0), (0, 0)))
-            + jnp.pad((tc_lo_1c * elo_lw_1c) * oh_lo, ((0, 1), (0, 0)))
-            + jnp.pad((tc_lo_1c * elo_hw_1c) * oh_lo, ((1, 0), (0, 0)))
-        )
-
-        kmaj_win = jax.lax.dynamic_slice_in_dim(
-            kmaj_pgm[g_idx], p_start, _TPU_P_WINDOW, axis=0
-        ).reshape(_TPU_P_WINDOW * wg, n_te)
-        mid_maj = jnp.matmul(
-            kmaj_win, wte_major, precision=jax.lax.Precision.HIGHEST
-        ).reshape(_TPU_P_WINDOW, wg, nc)
-        maj_g = mol_scale_1c * optics_utils.floor_at_zero(
-            jnp.sum(wp_maj[:, jnp.newaxis, :] * mid_maj, axis=0)
-        )
-
-        pfr_win = jax.lax.dynamic_slice_in_dim(
-            pfr_pgm[g_idx], p_start, _TPU_P_WINDOW, axis=0
-        ).reshape(_TPU_P_WINDOW * wg, n_te)
-        mid_pfr = jnp.matmul(
-            pfr_win, wte_pfrac, precision=jax.lax.Precision.HIGHEST
-        ).reshape(_TPU_P_WINDOW, wg, nc)
-        pfr_g = jnp.sum(wp_pfr[:, jnp.newaxis, :] * mid_pfr, axis=0)
-
-        off = 0
-        maj_band_g: dict[int, Array] = {}
-        for b in g.bands:
-          wb = band_widths[b]
-          maj_band_g[b] = maj_g[off : off + wb]
-          pfr_by_band[b] = pfr_g[off : off + wb]
-          off += wb
-
-        minor_band_g: dict[int, Array] = {}
-        minor_tbl, slot_meta = minor_specs[g_idx]
-        if minor_tbl is not None:
-          raw_min = jnp.matmul(
-              minor_tbl, wte_unscaled, precision=jax.lax.Precision.HIGHEST
-          )
-          moff = 0
-          for (
-              b,
-              wb,
-              is_lower,
-              gas,
-              scaling_gas,
-              scales_with_density,
-              by_complement,
-          ) in slot_meta:
-            scaling_z = _minor_slot_scaling_1d(
-                lkp,
-                vmr_lib,
-                vmr_z,
-                mol_cm2_z,
-                p_over_t_z,
-                dry_z,
-                gas,
-                scaling_gas,
-                scales_with_density,
-                by_complement,
-            )
-            contrib = (
-                optics_utils.floor_at_zero(raw_min[moff : moff + wb])
-                * scaling_z[jnp.newaxis, :]
-            )
-            moff += wb
-            mask = (is_lower_z if is_lower else ~is_lower_z)[jnp.newaxis, :]
-            term = jnp.where(mask, contrib, 0.0)
-            minor_band_g[b] = (
-                term if b not in minor_band_g else minor_band_g[b] + term
-            )
-        for b in g.bands:
-          tau_by_band[b] = (
-              minor_band_g[b] + maj_band_g[b]
-              if b in minor_band_g
-              else maj_band_g[b]
-          )
-
-      tau_z = _permute_gpt_axis0(
-          jnp.concatenate([tau_by_band[b] for b in ordered_bands], axis=0),
-          inv_order,
-      )
-      pfr_z = _permute_gpt_axis0(
-          jnp.concatenate([pfr_by_band[b] for b in ordered_bands], axis=0),
-          inv_order,
-      )
-      return None, (tau_z, pfr_z)
-
-    _, (tau_zgc, pfr_zgc) = jax.lax.scan(_lw_step, None, scan_inputs)
-    if z_leading_output:
-      return tau_zgc, pfr_zgc
-    return jnp.swapaxes(tau_zgc, 0, 1), jnp.swapaxes(pfr_zgc, 0, 1)
-
-  return jax.lax.cond(can_window, _windowed_scan, _fallback)
-
-
-def compute_sw_optical_and_rayleigh_all_gpts_mxu(
-    lkp: LookupGasOpticsShortwave,
-    vmr_lib: LookupVolumeMixingRatio,
-    molecules: Array,
-    temperature: Array,
-    p: Array,
-    vmr_fields: dict[int, Array] | None = None,
-    interp: CellInterpolation | None = None,
-    *,
-    z_leading_output: bool = False,
-) -> tuple[Array, Array]:
-  """Fused VMEM-resident MXU SW absorption + Rayleigh depths.
-
-  On 2D `(nz, nc)` atmospheres, evaluates `kmajor`, `kminor`, and `rayleigh`
-  together inside a single per-level `jax.lax.scan`, slicing `kmajor` to the
-  level's `_TPU_P_WINDOW` active pressure nodes and reusing the two `(t, eta)`
-  one-hot matrices per band group across `kmajor`, `kminor`, and `rayleigh`.
-  """
-  if interp is None:
-    interp = CellInterpolation(lkp, vmr_lib, temperature, p, vmr_fields)
-  cell_shape = temperature.shape
-  ncells = temperature.size
-  n_t, n_p, n_eta, _ = lkp.kmajor.shape
-  n_te = n_t * n_eta
-  dtype = lkp.rayl_lower.dtype
-  dry_factor = _dry_factor(lkp, vmr_fields)
-  rayl_factor = (
-      1.0 + vmr_fields[lkp.idx_h2o]
-      if (vmr_fields is not None and lkp.idx_h2o in vmr_fields)
-      else 1.0
+  return jnp.pad(w_lo * one_hot, ((0, 1), (0, 0))) + jnp.pad(
+      w_hi * one_hot, ((1, 0), (0, 0))
   )
 
-  groups = band_groups(lkp)
-  band_widths, ordered_bands, inv_order = _ordered_bands_and_perm(lkp, groups)
-  minor_specs = _prepare_minor_group_specs(lkp, groups, band_widths)
-  minor_and_rayl_tables = []
-  for g, (minor_tbl, _) in zip(groups, minor_specs):
-    wg = g.gpts.size
-    lo_t = _group_columns(lkp, lkp.rayl_lower, g).reshape(n_te, wg).T
-    hi_t = _group_columns(lkp, lkp.rayl_upper, g).reshape(n_te, wg).T
-    parts = [lo_t, hi_t] if minor_tbl is None else [minor_tbl, lo_t, hi_t]
-    minor_and_rayl_tables.append(jnp.concatenate(parts, axis=0))
 
-  def _fallback(_=None) -> tuple[Array, Array]:
-    mol_cm2_flat = molecules.reshape(ncells) / _M2_TO_CM2_FACTOR
-    major_gn = mol_cm2_flat[jnp.newaxis, :] * optics_utils.floor_at_zero(
-        _interpolate_groups_tpm_mxu(
-            lkp, lkp.kmajor, interp.t_interp, interp.p_interp, interp, True
-        )
-    )
-    p_flat = interp.p.reshape(ncells)
-    temp_flat = interp.temperature.reshape(ncells)
-    p_over_t_flat = _PASCAL_TO_HPASCAL_FACTOR * p_flat / temp_flat
-    is_lower_flat = p_flat > lkp.p_ref_tropo
-    is_tropo0 = (interp.tropo_idx.reshape(ncells) == 0)[jnp.newaxis, :]
-    dry_flat = (
-        dry_factor.reshape(ncells) if jnp.ndim(dry_factor) > 0 else dry_factor
-    )
-    rayl_scale_flat = (
-        (rayl_factor * molecules).reshape(ncells) / _M2_TO_CM2_FACTOR
-    )[jnp.newaxis, :]
-    vmr_flat = (
-        None
-        if interp.vmr_fields is None
-        else {
-            k: v.reshape(ncells) if jnp.ndim(v) > 0 else v
-            for k, v in interp.vmr_fields.items()
-        }
-    )
+class _MxuGroup(NamedTuple):
+  """The tables of one band group, laid out for the MXU contractions."""
 
-    minor_totals: dict[int, Array] = {}
-    rayl_by_band: dict[int, Array] = {}
-    for g_idx, g in enumerate(groups):
-      wg = g.gpts.size
-      _, slot_meta = minor_specs[g_idx]
-      raw_all = _matmul_te_blocked_mxu(
-          minor_and_rayl_tables[g_idx], interp, g.bands[0], False, dtype
-      )
-      off = 0
-      for (
-          b,
-          wb,
-          is_lower,
-          gas,
-          scaling_gas,
-          scales_with_density,
-          by_complement,
-      ) in slot_meta:
-        scaling = _minor_slot_scaling_1d(
-            lkp,
-            vmr_lib,
-            vmr_flat,
-            mol_cm2_flat,
-            p_over_t_flat,
-            dry_flat,
-            gas,
-            scaling_gas,
-            scales_with_density,
-            by_complement,
-        )
-        contrib = (
-            optics_utils.floor_at_zero(raw_all[off : off + wb])
-            * scaling[jnp.newaxis, :]
-        )
-        off += wb
-        mask = (is_lower_flat if is_lower else ~is_lower_flat)[jnp.newaxis, :]
-        term = jnp.where(mask, contrib, 0.0)
-        minor_totals[b] = (
-            term if b not in minor_totals else minor_totals[b] + term
-        )
+  bands: tuple[int, ...]
+  # `(n_p, width, n_t * n_eta)`: the major table, pressure leading so a
+  # window of it is a slice.
+  kmajor: Array
+  # The same for the Planck fraction (longwave), else `None`.
+  planck_fraction: Array | None
+  # `(n_rows, n_t * n_eta)`: each minor interval's band columns, then, in the
+  # shortwave, the lower and the upper Rayleigh table. `None` if empty.
+  rows: Array | None
+  slots: tuple[_MinorSlot, ...]
 
-      both_rayl = raw_all[off:]
-      rayl_g = (
-          optics_utils.floor_at_zero(
-              jnp.where(is_tropo0, both_rayl[:wg], both_rayl[wg:])
-          )
-          * rayl_scale_flat
-      )
-      roff = 0
-      for b in g.bands:
-        wb = band_widths[b]
-        rayl_by_band[b] = rayl_g[roff : roff + wb]
-        roff += wb
 
-    rayl_gn = _permute_gpt_axis0(
-        jnp.concatenate([rayl_by_band[b] for b in ordered_bands], axis=0),
-        inv_order,
-    )
-    if minor_totals:
-      minor_gn = _permute_gpt_axis0(
-          jnp.concatenate(
-              [
-                  minor_totals[b]
-                  if b in minor_totals
-                  else jnp.zeros((band_widths[b], ncells), dtype=dtype)
-                  for b in ordered_bands
-              ],
-              axis=0,
-          ),
-          inv_order,
-      )
-      tau_gn = minor_gn + major_gn
-    else:
-      tau_gn = major_gn
+class _MxuPlan(NamedTuple):
+  """The static layout of a lookup's all-g-point MXU evaluation."""
 
-    tau_out = tau_gn.reshape(tau_gn.shape[0], *cell_shape)
-    rayl_out = rayl_gn.reshape(rayl_gn.shape[0], *cell_shape)
-    if z_leading_output and tau_out.ndim == 3:
-      return jnp.swapaxes(tau_out, 0, 1), jnp.swapaxes(rayl_out, 0, 1)
-    return tau_out, rayl_out
+  groups: tuple[_MxuGroup, ...]
+  band_widths: dict[int, int]
+  # The bands in g-point order, and the permutation that takes the bands'
+  # g-points in that order to g-point order (`None` when it is the identity).
+  ordered_bands: tuple[int, ...]
+  inv_order: np.ndarray | None
+  is_lw: bool
 
-  if len(cell_shape) != 2 or n_p <= _TPU_P_WINDOW or cell_shape[1] > 32768:
-    return _fallback()
 
-  nz_dim, nc = cell_shape
-  p_lo_i_zc = interp.p_interp.interp_low.idx
-  p_span = jnp.max(p_lo_i_zc, axis=1) - jnp.min(p_lo_i_zc, axis=1)
-  can_window = jnp.all(p_span <= (_TPU_P_WINDOW - 2))
-  kmaj_pgm = [
-      jnp.transpose(_group_columns(lkp, lkp.kmajor, g), (1, 3, 0, 2)).reshape(
-          n_p, g.gpts.size, n_te
-      )
-      for g in groups
-  ]
-  group_mix = []
+def _mxu_plan(lookup: AbstractLookupGasOptics, is_lw: bool) -> _MxuPlan:
+  """Lays out the tables of `lookup` for `_mxu_cells`."""
+  n_t, n_p, n_eta, _ = lookup.kmajor.shape
+  n_te = n_t * n_eta
+  groups = band_groups(lookup)
+  lims = np.asarray(lookup.bnd_lims_gpt)
+  band_widths = {
+      b: _band_gpt_range(lookup, b).size for g in groups for b in g.bands
+  }
+  ordered_bands = tuple(sorted(band_widths, key=lambda b: int(lims[b, 0])))
+  band_order = np.concatenate(
+      [_band_gpt_range(lookup, b) for b in ordered_bands]
+  )
+  inv_order = (
+      None
+      if np.array_equal(band_order, np.arange(band_order.size))
+      else np.argsort(band_order)
+  )
+
+  def by_pressure(table: Array, group: _BandGroup) -> Array:
+    return jnp.transpose(
+        _group_columns(lookup, table, group), (1, 3, 0, 2)
+    ).reshape(n_p, group.gpts.size, n_te)
+
+  mxu_groups = []
   for g in groups:
-    ibnd0 = g.bands[0]
-    b_hi, c_hi = interp.unscaled_mix_and_vmr(ibnd0, 'high')
-    b_lo, c_lo = interp.unscaled_mix_and_vmr(ibnd0, 'low')
-    group_mix.append((
-        b_hi.interp_low.idx,
-        b_hi.interp_high.weight,
+    rows = []
+    slots = []
+    for b in g.bands:
+      for slot in _minor_slot_meta(lookup, b):
+        table = lookup.kminor_lower if slot.is_lower else lookup.kminor_upper
+        rows.append(
+            table[..., slot.shift : slot.shift + slot.width]
+            .reshape(n_te, slot.width)
+            .T
+        )
+        slots.append(slot)
+    if not is_lw:
+      width = g.gpts.size
+      for table in (lookup.rayl_lower, lookup.rayl_upper):
+        rows.append(_group_columns(lookup, table, g).reshape(n_te, width).T)
+    mxu_groups.append(
+        _MxuGroup(
+            bands=g.bands,
+            kmajor=by_pressure(lookup.kmajor, g),
+            planck_fraction=(
+                by_pressure(lookup.planck_fraction, g) if is_lw else None
+            ),
+            rows=jnp.concatenate(rows, axis=0) if rows else None,
+            slots=tuple(slots),
+        )
+    )
+  return _MxuPlan(
+      groups=tuple(mxu_groups),
+      band_widths=band_widths,
+      ordered_bands=ordered_bands,
+      inv_order=inv_order,
+      is_lw=is_lw,
+  )
+
+
+def _in_gpt_order(by_band: dict[int, Array], plan: _MxuPlan) -> Array:
+  """Stacks per-band `(width, m)` pieces into `(n_gpt, m)` g-point order.
+
+  The permutation is a concatenation of static slices, not a gather.
+  """
+  stacked = jnp.concatenate([by_band[b] for b in plan.ordered_bands], axis=0)
+  if plan.inv_order is None:
+    return stacked
+  return jnp.concatenate(
+      [stacked[int(i) : int(i) + 1] for i in plan.inv_order], axis=0
+  )
+
+
+class _MxuCells(NamedTuple):
+  """Per-cell inputs of `_mxu_cells`, each of the cells' shape.
+
+  `None` marks an input the quantity does not read, or a scalar (see
+  `_MxuScalars`). The field order is the order of the scanned operands.
+  """
+
+  molecules: Array
+  p: Array
+  temperature: Array
+  tropo_idx: Array | None  # Shortwave (the Rayleigh half).
+  p_lo_idx: Array
+  p_hi_weight: Array
+  p_hi_weight_clamped: Array | None  # Longwave (the Planck fraction).
+  t_hi_idx: Array
+  t_hi_weight: Array
+  t_hi_weight_clamped: Array | None  # Longwave.
+  dry_factor: Array | None
+  rayleigh_factor: Array | None  # Shortwave.
+  vmr: dict[int, Array]
+  # Per band group, at the upper and at the lower temperature corner, the
+  # unscaled mixing-fraction interpolant's lower index and upper weight and
+  # the major species' combined mixing ratio (`CellInterpolation.mix_mxu`).
+  mix: tuple[tuple[Array, Array, Array, Array, Array, Array], ...]
+
+
+class _MxuScalars(NamedTuple):
+  """The inputs of `_mxu_cells` that are the same for every cell."""
+
+  vmr: dict[int, Array]
+  dry_factor: Array | float
+  rayleigh_factor: Array | float
+
+
+def _mxu_inputs(
+    lookup: AbstractLookupGasOptics,
+    interp: CellInterpolation,
+    molecules: Array,
+    plan: _MxuPlan,
+) -> tuple[_MxuCells, _MxuScalars]:
+  """The per-cell and the shared inputs of `_mxu_cells`, of cell shape."""
+  cell_shape = interp.temperature.shape
+  vmr_fields = interp.vmr_fields
+  dry_factor = _dry_factor(lookup, vmr_fields)
+  rayleigh_factor = (
+      1.0
+      if plan.is_lw or vmr_fields is None or lookup.idx_h2o not in vmr_fields
+      else 1.0 + vmr_fields[lookup.idx_h2o]
+  )
+  vmr_cells: dict[int, Array] = {}
+  vmr_scalar: dict[int, Array] = {}
+  for k, v in (vmr_fields or {}).items():
+    if jnp.ndim(v) == 0:
+      vmr_scalar[k] = v
+    else:
+      vmr_cells[k] = jnp.broadcast_to(v, cell_shape)
+
+  def per_cell(x):
+    return jnp.broadcast_to(x, cell_shape) if jnp.ndim(x) > 0 else None
+
+  t_clamped, p_clamped = interp.clamped() if plan.is_lw else (None, None)
+  mix = []
+  for g in plan.groups:
+    m_hi, c_hi = interp.mix_mxu(g.bands[0], 'high')
+    m_lo, c_lo = interp.mix_mxu(g.bands[0], 'low')
+    mix.append((
+        m_hi.interp_low.idx,
+        m_hi.interp_high.weight,
         c_hi,
-        b_lo.interp_low.idx,
-        b_lo.interp_high.weight,
+        m_lo.interp_low.idx,
+        m_lo.interp_high.weight,
         c_lo,
     ))
-  group_mix_t = tuple(group_mix)
+  cells = _MxuCells(
+      molecules=jnp.broadcast_to(molecules, cell_shape),
+      p=jnp.broadcast_to(interp.p, cell_shape),
+      temperature=interp.temperature,
+      tropo_idx=None if plan.is_lw else interp.tropo_idx,
+      p_lo_idx=interp.p_interp.interp_low.idx,
+      p_hi_weight=interp.p_interp.interp_high.weight,
+      p_hi_weight_clamped=(
+          p_clamped.interp_high.weight if plan.is_lw else None
+      ),
+      t_hi_idx=interp.t_interp.interp_high.idx,
+      t_hi_weight=interp.t_interp.interp_high.weight,
+      t_hi_weight_clamped=(
+          t_clamped.interp_high.weight if plan.is_lw else None
+      ),
+      dry_factor=per_cell(dry_factor),
+      rayleigh_factor=per_cell(rayleigh_factor),
+      vmr=vmr_cells,
+      mix=tuple(mix),
+  )
+  scalars = _MxuScalars(
+      vmr=vmr_scalar,
+      dry_factor=1.0 if cells.dry_factor is not None else dry_factor,
+      rayleigh_factor=(
+          1.0 if cells.rayleigh_factor is not None else rayleigh_factor
+      ),
+  )
+  return cells, scalars
 
-  def _windowed_scan(_=None) -> tuple[Array, Array]:
-    dry_zc = (
-        jnp.broadcast_to(dry_factor, (nz_dim, nc))
-        if jnp.ndim(dry_factor) > 0
-        else None
+
+def _mxu_cells(
+    lookup: AbstractLookupGasOptics,
+    vmr_lib: LookupVolumeMixingRatio,
+    plan: _MxuPlan,
+    cells: _MxuCells,
+    scalars: _MxuScalars,
+    p_window: int | None,
+) -> tuple[Array, Array]:
+  """The gas optics of every g-point for a vector of cells, on the MXU.
+
+  Args:
+    lookup: The gas-optics lookup.
+    vmr_lib: The volume-mixing-ratio library.
+    plan: `_mxu_plan(lookup, is_lw)`.
+    cells: The per-cell inputs, each `(m,)`.
+    scalars: The inputs shared by every cell.
+    p_window: Read this many pressure-table nodes, starting at the cells'
+      lowest node; it must cover every cell's interval. `None` reads the whole
+      table.
+
+  Returns:
+    `(n_gpt, m)` arrays in g-point order: the absorption optical depth (major
+    plus minor), and the Planck fraction (longwave) or the Rayleigh optical
+    depth (shortwave).
+  """
+  n_t, n_p, n_eta, _ = lookup.kmajor.shape
+  n_te = n_t * n_eta
+  dtype = lookup.kmajor.dtype
+  highest = jax.lax.Precision.HIGHEST
+  vmr = {**scalars.vmr, **cells.vmr}
+  dry_factor = (
+      scalars.dry_factor if cells.dry_factor is None else cells.dry_factor
+  )
+  mol_cm2 = cells.molecules / _M2_TO_CM2_FACTOR
+  mol_scale = mol_cm2[jnp.newaxis, :]
+  if not plan.is_lw:
+    rayleigh_factor = (
+        scalars.rayleigh_factor
+        if cells.rayleigh_factor is None
+        else cells.rayleigh_factor
     )
-    dry_scalar = 1.0 if dry_zc is not None else dry_factor
-    rayl_fac_zc = (
-        jnp.broadcast_to(rayl_factor, (nz_dim, nc))
-        if jnp.ndim(rayl_factor) > 0
-        else None
+    rayleigh_scale = (rayleigh_factor * mol_cm2)[jnp.newaxis, :]
+    is_tropo0 = (cells.tropo_idx == 0)[jnp.newaxis, :]
+  p_over_t = _PASCAL_TO_HPASCAL_FACTOR * cells.p / cells.temperature
+  is_lower = cells.p > lookup.p_ref_tropo
+
+  # The pressure corners, shared by every band group.
+  if p_window is None:
+    p_window = n_p
+    p_start = 0
+    oh_p = _one_hot_rows(cells.p_lo_idx, n_p - 1, dtype)
+  else:
+    p_start = jnp.clip(jnp.min(cells.p_lo_idx), 0, n_p - p_window)
+    oh_p = _one_hot_rows(cells.p_lo_idx - p_start, p_window - 1, dtype)
+  p_hi = cells.p_hi_weight[jnp.newaxis, :]
+  wp_major = _spread(oh_p, 1.0 - p_hi, p_hi)
+  if plan.is_lw:
+    pc_hi = cells.p_hi_weight_clamped[jnp.newaxis, :]
+    wp_planck = _spread(oh_p, 1.0 - pc_hi, pc_hi)
+
+  t_lo_idx = cells.t_hi_idx - 1
+  t_hi = cells.t_hi_weight[jnp.newaxis, :]
+  t_lo = 1.0 - t_hi
+  if plan.is_lw:
+    tc_hi = cells.t_hi_weight_clamped[jnp.newaxis, :]
+    tc_lo = 1.0 - tc_hi
+
+  def window(table: Array, width: int) -> Array:
+    if p_window != n_p:
+      table = jax.lax.dynamic_slice_in_dim(table, p_start, p_window, axis=0)
+    return table.reshape(p_window * width, n_te)
+
+  def reduce_pressure(table: Array, w_te: Array, w_p: Array, width: int):
+    mid = jnp.matmul(window(table, width), w_te, precision=highest)
+    mid = mid.reshape(p_window, width, -1)
+    return jnp.sum(w_p[:, jnp.newaxis, :] * mid, axis=0)
+
+  tau_by_band: dict[int, Array] = {}
+  second_by_band: dict[int, Array] = {}
+  for g, g_mix in zip(plan.groups, cells.mix):
+    width = g.kmajor.shape[1]
+    e_hi_idx, e_hi_w, vmr_hi, e_lo_idx, e_lo_w, vmr_lo = g_mix
+    e_hi = e_hi_w[jnp.newaxis, :]
+    e_lo = e_lo_w[jnp.newaxis, :]
+    # The (t, eta) corners: one one-hot per temperature corner.
+    oh_hi = _one_hot_rows(cells.t_hi_idx * n_eta + e_hi_idx, n_te - 1, dtype)
+    oh_lo = _one_hot_rows(t_lo_idx * n_eta + e_lo_idx, n_te - 1, dtype)
+    w_hi = _spread(oh_hi, t_hi * (1.0 - e_hi), t_hi * e_hi)
+    w_lo = _spread(oh_lo, t_lo * (1.0 - e_lo), t_lo * e_lo)
+    w_unscaled = w_hi + w_lo
+    # The major coefficient's weights carry the major species' combined
+    # mixing ratio (`scale_by_mixture`); nothing else's do.
+    w_major = w_hi * vmr_hi[jnp.newaxis, :] + w_lo * vmr_lo[jnp.newaxis, :]
+
+    major = mol_scale * optics_utils.floor_at_zero(
+        reduce_pressure(g.kmajor, w_major, wp_major, width)
     )
-    rayl_fac_scalar = 1.0 if rayl_fac_zc is not None else rayl_factor
-    vmr_2d, vmr_scalar = _split_vmr_for_scan(vmr_fields, nz_dim, nc)
+    if plan.is_lw:
+      # The Planck fraction is clamped, not extrapolated, at the table ends
+      # (see `compute_planck_fraction`).
+      w_planck = _spread(oh_hi, tc_hi * (1.0 - e_hi), tc_hi * e_hi) + _spread(
+          oh_lo, tc_lo * (1.0 - e_lo), tc_lo * e_lo
+      )
+      second = reduce_pressure(g.planck_fraction, w_planck, wp_planck, width)
 
-    scan_inputs = (
-        jnp.broadcast_to(molecules, (nz_dim, nc)),
-        jnp.broadcast_to(p, (nz_dim, nc)),
-        temperature,
-        interp.tropo_idx,
-        p_lo_i_zc,
-        interp.p_interp.interp_high.weight,
-        interp.t_interp.interp_high.idx,
-        interp.t_interp.interp_high.weight,
-        dry_zc,
-        rayl_fac_zc,
-        vmr_2d,
-        group_mix_t,
+    raw = (
+        None
+        if g.rows is None
+        else jnp.matmul(g.rows, w_unscaled, precision=highest)
+    )
+    minor_by_band: dict[int, Array] = {}
+    offset = 0
+    for slot in g.slots:
+      scaling = _minor_scaling(
+          lookup, vmr_lib, vmr, cells.molecules, p_over_t, dry_factor, slot
+      )
+      contribution = (
+          optics_utils.floor_at_zero(raw[offset : offset + slot.width])
+          * scaling[jnp.newaxis, :]
+      )
+      offset += slot.width
+      side = (is_lower if slot.is_lower else ~is_lower)[jnp.newaxis, :]
+      term = jnp.where(side, contribution, 0.0)
+      minor_by_band[slot.band] = (
+          term
+          if slot.band not in minor_by_band
+          else minor_by_band[slot.band] + term
+      )
+    if not plan.is_lw:
+      # The cell reads the half of the Rayleigh table its pressure selects.
+      second = (
+          optics_utils.floor_at_zero(
+              jnp.where(
+                  is_tropo0,
+                  raw[offset : offset + width],
+                  raw[offset + width :],
+              )
+          )
+          * rayleigh_scale
+      )
+
+    start = 0
+    for b in g.bands:
+      w_b = plan.band_widths[b]
+      major_b = major[start : start + w_b]
+      tau_by_band[b] = (
+          minor_by_band[b] + major_b if b in minor_by_band else major_b
+      )
+      second_by_band[b] = second[start : start + w_b]
+      start += w_b
+
+  return _in_gpt_order(tau_by_band, plan), _in_gpt_order(second_by_band, plan)
+
+
+def _mxu_level_scan(
+    lookup: AbstractLookupGasOptics,
+    vmr_lib: LookupVolumeMixingRatio,
+    plan: _MxuPlan,
+    cells: _MxuCells,
+    scalars: _MxuScalars,
+) -> tuple[Array, Array]:
+  """`_mxu_cells` one level of a `(n_levels, n_columns)` atmosphere at a time.
+
+  Every level reads its `_TPU_P_WINDOW`-node window of the pressure table, so
+  every level must span less than that.
+
+  Returns:
+    `(n_levels, n_gpt, n_columns)` arrays.
+  """
+
+  def step(_, level_cells):
+    return None, _mxu_cells(
+        lookup, vmr_lib, plan, level_cells, scalars, _TPU_P_WINDOW
     )
 
-    def _sw_step(_, s_in):
-      (
-          mol_z,
-          p_z,
-          temp_z,
-          tropo_z,
-          p_lo_i_z,
-          p_hi_w_z,
-          t_hi_i_z,
-          t_hi_w_z,
-          dry_z_opt,
-          rfac_z_opt,
-          vmr_z_2d,
-          g_mix_z,
-      ) = s_in
-      vmr_z = {**vmr_scalar, **vmr_z_2d}
-      dry_z = dry_scalar if dry_z_opt is None else dry_z_opt
-      rfac_z = rayl_fac_scalar if rfac_z_opt is None else rfac_z_opt
-      mol_cm2_z = mol_z / _M2_TO_CM2_FACTOR
-      mol_scale_1c = mol_cm2_z[jnp.newaxis, :]
-      rayl_scale_1c = (rfac_z * mol_cm2_z)[jnp.newaxis, :]
-      p_over_t_z = _PASCAL_TO_HPASCAL_FACTOR * p_z / temp_z
-      is_lower_z = p_z > lkp.p_ref_tropo
-      is_tropo0_1c = (tropo_z == 0)[jnp.newaxis, :]
+  _, out = jax.lax.scan(step, None, cells)
+  return out
 
-      p_start = jnp.clip(jnp.min(p_lo_i_z), 0, n_p - _TPU_P_WINDOW)
-      oh_p = jax.nn.one_hot(
-          p_lo_i_z - p_start, _TPU_P_WINDOW - 1, dtype=dtype, axis=0
-      )
-      p_hi_1c = p_hi_w_z[jnp.newaxis, :]
-      wp_maj = jnp.pad((1.0 - p_hi_1c) * oh_p, ((0, 1), (0, 0))) + jnp.pad(
-          p_hi_1c * oh_p, ((1, 0), (0, 0))
-      )
 
-      t_lo_i_z = t_hi_i_z - 1
-      t_hi_1c = t_hi_w_z[jnp.newaxis, :]
-      t_lo_1c = 1.0 - t_hi_1c
+def _mxu_blocked(
+    lookup: AbstractLookupGasOptics,
+    vmr_lib: LookupVolumeMixingRatio,
+    plan: _MxuPlan,
+    cells: _MxuCells,
+    scalars: _MxuScalars,
+) -> tuple[Array, Array]:
+  """`_mxu_cells` over the whole pressure table, in blocks of cells.
 
-      tau_by_band: dict[int, Array] = {}
-      rayl_by_band: dict[int, Array] = {}
-      for g_idx, g in enumerate(groups):
-        wg = g.gpts.size
-        ehi_i, ehi_hw, c_hi_z, elo_i, elo_hw, c_lo_z = g_mix_z[g_idx]
-        ehi_hw_1c = ehi_hw[jnp.newaxis, :]
-        ehi_lw_1c = 1.0 - ehi_hw_1c
-        elo_hw_1c = elo_hw[jnp.newaxis, :]
-        elo_lw_1c = 1.0 - elo_hw_1c
+  Returns:
+    `(n_gpt, *cell_shape)` arrays.
+  """
+  cell_shape = cells.temperature.shape
+  n_cells = math.prod(cell_shape)
+  n_blocks = -(-n_cells // _TPU_MAX_BLOCK_CELLS)
+  block_cells = -(-n_cells // n_blocks)
+  # Lane-align the blocks when that costs no extra block.
+  aligned = -(-block_cells // 128) * 128
+  if aligned * n_blocks - n_cells < aligned:
+    block_cells = aligned
+  pad = n_blocks * block_cells - n_cells
 
-        oh_hi = jax.nn.one_hot(
-            t_hi_i_z * n_eta + ehi_i, n_te - 1, dtype=dtype, axis=0
-        )
-        oh_lo = jax.nn.one_hot(
-            t_lo_i_z * n_eta + elo_i, n_te - 1, dtype=dtype, axis=0
-        )
-        unsc_hi = jnp.pad((t_hi_1c * ehi_lw_1c) * oh_hi, ((0, 1), (0, 0))) + (
-            jnp.pad((t_hi_1c * ehi_hw_1c) * oh_hi, ((1, 0), (0, 0)))
-        )
-        unsc_lo = jnp.pad((t_lo_1c * elo_lw_1c) * oh_lo, ((0, 1), (0, 0))) + (
-            jnp.pad((t_lo_1c * elo_hw_1c) * oh_lo, ((1, 0), (0, 0)))
-        )
-        wte_unscaled = unsc_hi + unsc_lo
-        wte_major = (
-            unsc_hi * c_hi_z[jnp.newaxis, :] + unsc_lo * c_lo_z[jnp.newaxis, :]
-        )
+  def blocks(x: Array) -> Array:
+    # Edge padding keeps the padded cells' arithmetic finite (a zero
+    # temperature would divide by zero); they are dropped below.
+    flat = x.reshape(n_cells)
+    if pad:
+      flat = jnp.pad(flat, (0, pad), mode='edge')
+    return flat.reshape(n_blocks, block_cells)
 
-        kmaj_win = jax.lax.dynamic_slice_in_dim(
-            kmaj_pgm[g_idx], p_start, _TPU_P_WINDOW, axis=0
-        ).reshape(_TPU_P_WINDOW * wg, n_te)
-        mid_maj = jnp.matmul(
-            kmaj_win, wte_major, precision=jax.lax.Precision.HIGHEST
-        ).reshape(_TPU_P_WINDOW, wg, nc)
-        maj_g = mol_scale_1c * optics_utils.floor_at_zero(
-            jnp.sum(wp_maj[:, jnp.newaxis, :] * mid_maj, axis=0)
-        )
-        off = 0
-        maj_band_g: dict[int, Array] = {}
-        for b in g.bands:
-          wb = band_widths[b]
-          maj_band_g[b] = maj_g[off : off + wb]
-          off += wb
+  blocked = jax.tree.map(blocks, cells)
 
-        raw_mr = jnp.matmul(
-            minor_and_rayl_tables[g_idx],
-            wte_unscaled,
-            precision=jax.lax.Precision.HIGHEST,
-        )
-        _, slot_meta = minor_specs[g_idx]
-        minor_band_g: dict[int, Array] = {}
-        moff = 0
-        for (
-            b,
-            wb,
-            is_lower,
-            gas,
-            scaling_gas,
-            scales_with_density,
-            by_complement,
-        ) in slot_meta:
-          scaling_z = _minor_slot_scaling_1d(
-              lkp,
-              vmr_lib,
-              vmr_z,
-              mol_cm2_z,
-              p_over_t_z,
-              dry_z,
-              gas,
-              scaling_gas,
-              scales_with_density,
-              by_complement,
-          )
-          contrib = (
-              optics_utils.floor_at_zero(raw_mr[moff : moff + wb])
-              * scaling_z[jnp.newaxis, :]
-          )
-          moff += wb
-          mask = (is_lower_z if is_lower else ~is_lower_z)[jnp.newaxis, :]
-          term = jnp.where(mask, contrib, 0.0)
-          minor_band_g[b] = (
-              term if b not in minor_band_g else minor_band_g[b] + term
-          )
-        for b in g.bands:
-          tau_by_band[b] = (
-              minor_band_g[b] + maj_band_g[b]
-              if b in minor_band_g
-              else maj_band_g[b]
-          )
+  def solve(block):
+    return _mxu_cells(lookup, vmr_lib, plan, block, scalars, None)
 
-        both_rayl = raw_mr[moff:]
-        rayl_g = (
-            optics_utils.floor_at_zero(
-                jnp.where(is_tropo0_1c, both_rayl[:wg], both_rayl[wg:])
-            )
-            * rayl_scale_1c
-        )
-        roff = 0
-        for b in g.bands:
-          wb = band_widths[b]
-          rayl_by_band[b] = rayl_g[roff : roff + wb]
-          roff += wb
+  if n_blocks == 1:
+    out = solve(jax.tree.map(lambda x: x[0], blocked))
+  else:
+    out = jax.lax.map(solve, blocked)
+    # `(n_blocks, n_gpt, block_cells)` -> `(n_gpt, n_blocks * block_cells)`.
+    out = jax.tree.map(
+        lambda y: jnp.moveaxis(y, 0, 1).reshape(y.shape[1], -1), out
+    )
+  return jax.tree.map(
+      lambda y: y[:, :n_cells].reshape(y.shape[0], *cell_shape), out
+  )
 
-      tau_z = _permute_gpt_axis0(
-          jnp.concatenate([tau_by_band[b] for b in ordered_bands], axis=0),
-          inv_order,
-      )
-      rayl_z = _permute_gpt_axis0(
-          jnp.concatenate([rayl_by_band[b] for b in ordered_bands], axis=0),
-          inv_order,
-      )
-      return None, (tau_z, rayl_z)
 
-    _, (tau_zgc, rayl_zgc) = jax.lax.scan(_sw_step, None, scan_inputs)
-    if z_leading_output:
-      return tau_zgc, rayl_zgc
-    return jnp.swapaxes(tau_zgc, 0, 1), jnp.swapaxes(rayl_zgc, 0, 1)
+def compute_all_gpts_mxu(
+    lookup: AbstractLookupGasOptics,
+    vmr_lib: LookupVolumeMixingRatio,
+    molecules: Array,
+    temperature: Array,
+    p: Array,
+    vmr_fields: dict[int, Array] | None = None,
+    interp: CellInterpolation | None = None,
+    *,
+    is_lw: bool,
+    z_leading_output: bool = False,
+) -> tuple[Array, Array]:
+  """The gas optics of every g-point on the TPU matrix unit.
 
-  return jax.lax.cond(can_window, _windowed_scan, _fallback)
+  The TPU counterpart of `compute_optical_depth_all_gpts` together with
+  `compute_planck_fraction_all_gpts` (longwave) or
+  `compute_rayleigh_optical_depth_all_gpts` (shortwave): the same physics and
+  the same values to float32 rounding. See the comment above `_TPU_P_WINDOW`.
+
+  Args:
+    lookup: The gas-optics lookup, longwave if `is_lw`, else shortwave.
+    vmr_lib: The volume-mixing-ratio library.
+    molecules: Molecules per area of each cell [molecules/m^2].
+    temperature: Temperature [K], of any non-scalar cell shape. A
+      `(n_levels, n_columns)` shape with levels leading is solved a level at a
+      time with a pressure window when the data allow it.
+    p: Pressure [Pa], of the cells' shape.
+    vmr_fields: Optional per-gas volume mixing ratio fields, keyed by gas index.
+    interp: The cell interpolation state, if the caller already built it.
+    is_lw: Longwave (Planck fraction) or shortwave (Rayleigh optical depth).
+    z_leading_output: For `(n_levels, n_columns)` cells, return the arrays as
+      `(n_levels, n_gpt, n_columns)` instead of `(n_gpt, n_levels, n_columns)`.
+
+  Returns:
+    The absorption optical depth and the Planck fraction (longwave) or the
+    Rayleigh optical depth (shortwave), each `(n_gpt, *cell_shape)`.
+  """
+  if interp is None:
+    interp = CellInterpolation(lookup, vmr_lib, temperature, p, vmr_fields)
+  cell_shape = temperature.shape
+  plan = _mxu_plan(lookup, is_lw)
+  cells, scalars = _mxu_inputs(lookup, interp, molecules, plan)
+
+  def blocked(_=None) -> tuple[Array, Array]:
+    out = _mxu_blocked(lookup, vmr_lib, plan, cells, scalars)
+    if z_leading_output and len(cell_shape) == 2:
+      out = jax.tree.map(lambda y: jnp.swapaxes(y, 0, 1), out)
+    return out
+
+  n_p = lookup.kmajor.shape[1]
+  if (
+      len(cell_shape) != 2
+      or n_p <= _TPU_P_WINDOW
+      or cell_shape[1] > _TPU_MAX_WINDOW_COLUMNS
+  ):
+    return blocked()
+
+  def windowed(_=None) -> tuple[Array, Array]:
+    out = _mxu_level_scan(lookup, vmr_lib, plan, cells, scalars)
+    if not z_leading_output:
+      out = jax.tree.map(lambda y: jnp.swapaxes(y, 0, 1), out)
+    return out
+
+  # Whether every level's pressures fit in one window: a level whose lowest
+  # and highest interval are at most `_TPU_P_WINDOW - 2` apart reads at most
+  # `_TPU_P_WINDOW` nodes.
+  p_lo_idx = interp.p_interp.interp_low.idx
+  p_span = jnp.max(p_lo_idx, axis=1) - jnp.min(p_lo_idx, axis=1)
+  fits = jnp.all(p_span <= _TPU_P_WINDOW - 2)
+  return jax.lax.cond(fits, windowed, blocked)

@@ -21,6 +21,7 @@ import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
+from rrtmgp import backend
 from rrtmgp import kernel_ops
 from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import cloud_optics
@@ -469,86 +470,6 @@ class RRTMOptics(optics_base.OpticsScheme):
         'asymmetry_factor': jnp.zeros_like(ssa),
     }
 
-  def compute_gas_optics_all_gpts_zc(
-      self,
-      pressure: Array,
-      temperature: Array,
-      molecules: Array,
-      vmr_fields: dict[int, Array] | None = None,
-      *,
-      is_lw: bool,
-      z_leading_output: bool = False,
-  ) -> dict[str, Array]:
-    """Column-minor `(nz_or_nzh, nc)` gas optics of every g-point in one pass."""
-    lookup = self.gas_optics_lw if is_lw else self.gas_optics_sw
-    interp = gas_optics.CellInterpolation(
-        lookup, self.vmr_lib, temperature, pressure, vmr_fields
-    )
-    with jax.named_scope('gas_optics'):
-      if (
-          jax.default_backend() == 'tpu'
-          and temperature.ndim > 0
-          and temperature.size > 0
-      ):
-        if is_lw:
-          tau, pfrac = gas_optics.compute_lw_optical_and_planck_all_gpts_mxu(
-              lookup,
-              self.vmr_lib,
-              molecules,
-              temperature,
-              pressure,
-              vmr_fields,
-              interp=interp,
-              z_leading_output=z_leading_output,
-          )
-          return {'optical_depth': tau, 'planck_fraction': pfrac}
-        tau, rayl = gas_optics.compute_sw_optical_and_rayleigh_all_gpts_mxu(
-            lookup,
-            self.vmr_lib,
-            molecules,
-            temperature,
-            pressure,
-            vmr_fields,
-            interp=interp,
-            z_leading_output=z_leading_output,
-        )
-        return {'optical_depth': tau, 'rayleigh': rayl}
-      out = {}
-      with jax.named_scope('tau'):
-        out['optical_depth'] = gas_optics.compute_optical_depth_all_gpts(
-            lookup,
-            self.vmr_lib,
-            molecules,
-            temperature,
-            pressure,
-            vmr_fields,
-            interp=interp,
-        )
-      if is_lw:
-        with jax.named_scope('planck'):
-          out['planck_fraction'] = gas_optics.compute_planck_fraction_all_gpts(
-              lookup,
-              self.vmr_lib,
-              pressure,
-              temperature,
-              vmr_fields,
-              interp=interp,
-          )
-      else:
-        with jax.named_scope('rayleigh'):
-          out['rayleigh'] = gas_optics.compute_rayleigh_optical_depth_all_gpts(
-              lookup,
-              self.vmr_lib,
-              molecules,
-              temperature,
-              pressure,
-              vmr_fields,
-              interp=interp,
-          )
-      if z_leading_output and temperature.ndim == 2:
-        out = {k: jnp.swapaxes(v, 0, 1) for k, v in out.items()}
-    return out
-
   def compute_gas_optics_all_gpts(
       self,
       pressure: Array,
@@ -557,6 +478,7 @@ class RRTMOptics(optics_base.OpticsScheme):
       vmr_fields: dict[int, Array] | None = None,
       *,
       is_lw: bool,
+      z_leading_output: bool = False,
   ) -> dict[str, Array]:
     """Gas optics of every g-point of the spectrum, in one pass.
 
@@ -570,17 +492,27 @@ class RRTMOptics(optics_base.OpticsScheme):
     axis; see `gas_optics.compute_optical_depth_all_gpts`. The values equal the
     per-g-point ones.
 
+    With the TPU kernels (`rrtmgp.backend`) the tables are read by
+    contractions on the matrix unit instead (`gas_optics.compute_all_gpts_mxu`),
+    with the same values to float32 rounding. Those are evaluated a level at a
+    time, so a `(nx, ny, nz)` atmosphere is first laid out as
+    `(nz, nx * ny)`, levels leading.
+
     The arrays are `n_gpt` times the size of a field: at T63L47 about 460 MB
     for each longwave array and 400 MB for each shortwave array.
 
     Args:
       pressure: The pressure field [Pa].
-      temperature: The temperature [K].
+      temperature: The temperature [K]. Any cell shape: `(nx, ny, nz)`, or the
+        column-minor `(nz, n_columns)` of `two_stream.solve_lw_zc`.
       molecules: The number of molecules in an atmospheric grid cell per area
         [molecules / m^2].
       vmr_fields: An optional dictionary containing precomputed volume mixing
         ratio fields, keyed by gas index, that will overwrite the global means.
       is_lw: `True` for the longwave problem, `False` for the shortwave one.
+      z_leading_output: For column-minor `(nz, n_columns)` cells, return each
+        array as `(nz, n_gpt, n_columns)` rather than `(n_gpt, nz,
+        n_columns)`.
 
     Returns:
       Longwave: `{'optical_depth', 'planck_fraction'}`. Shortwave:
@@ -588,40 +520,71 @@ class RRTMOptics(optics_base.OpticsScheme):
       absorption optical depth alone, as `compute_gas_optical_properties`
       forms the Rayleigh sum itself.
     """
+    lookup = self.gas_optics_lw if is_lw else self.gas_optics_sw
+    second = 'planck_fraction' if is_lw else 'rayleigh'
     if (
-        jax.default_backend() == 'tpu'
-        and temperature.ndim == 3
+        backend.use_tpu_kernels()
+        and temperature.ndim > 0
         and temperature.size > 0
     ):
-      nx, ny, nzh = temperature.shape
-      nc = nx * ny
+      if temperature.ndim == 3:
+        nx, ny, nz = temperature.shape
 
-      def _to_zc(x: Array) -> Array:
-        if jnp.ndim(x) == 0:
-          return x
-        if x.shape != (nx, ny, nzh):
-          x = jnp.broadcast_to(x, (nx, ny, nzh))
-        return jnp.moveaxis(x, 2, 0).reshape(nzh, nc)
+        def to_zc(x: Array) -> Array:
+          if jnp.ndim(x) == 0:
+            return x
+          x = jnp.broadcast_to(x, (nx, ny, nz))
+          return jnp.moveaxis(x, 2, 0).reshape(nz, nx * ny)
 
-      vmr_zc = (
-          None
-          if vmr_fields is None
-          else {k: _to_zc(v) for k, v in vmr_fields.items()}
-      )
-      out_zc = self.compute_gas_optics_all_gpts_zc(
-          _to_zc(pressure),
-          _to_zc(temperature),
-          _to_zc(molecules),
-          vmr_zc,
-          is_lw=is_lw,
-      )
-      return {
-          k: jnp.moveaxis(v.reshape(v.shape[0], nzh, nx, ny), 1, -1)
-          for k, v in out_zc.items()
-      }
-    return self.compute_gas_optics_all_gpts_zc(
-        pressure, temperature, molecules, vmr_fields, is_lw=is_lw
+        out_zc = self.compute_gas_optics_all_gpts(
+            to_zc(pressure),
+            to_zc(temperature),
+            to_zc(molecules),
+            None if vmr_fields is None else jax.tree.map(to_zc, vmr_fields),
+            is_lw=is_lw,
+        )
+        return {
+            k: jnp.moveaxis(v.reshape(v.shape[0], nz, nx, ny), 1, -1)
+            for k, v in out_zc.items()
+        }
+      with jax.named_scope('gas_optics'):
+        tau, other = gas_optics.compute_all_gpts_mxu(
+            lookup,
+            self.vmr_lib,
+            molecules,
+            temperature,
+            pressure,
+            vmr_fields,
+            is_lw=is_lw,
+            z_leading_output=z_leading_output,
+        )
+      return {'optical_depth': tau, second: other}
+
+    interp = gas_optics.CellInterpolation(
+        lookup, self.vmr_lib, temperature, pressure, vmr_fields
     )
+    with jax.named_scope('gas_optics'):
+      out = {}
+      with jax.named_scope('tau'):
+        out['optical_depth'] = gas_optics.compute_optical_depth_all_gpts(
+            lookup, self.vmr_lib, molecules, temperature, pressure, vmr_fields,
+            interp=interp,
+        )
+      if is_lw:
+        with jax.named_scope('planck'):
+          out['planck_fraction'] = gas_optics.compute_planck_fraction_all_gpts(
+              lookup, self.vmr_lib, pressure, temperature, vmr_fields,
+              interp=interp,
+          )
+      else:
+        with jax.named_scope('rayleigh'):
+          out['rayleigh'] = gas_optics.compute_rayleigh_optical_depth_all_gpts(
+              lookup, self.vmr_lib, molecules, temperature, pressure,
+              vmr_fields, interp=interp,
+          )
+    if z_leading_output and temperature.ndim == 2:
+      out = {k: jnp.swapaxes(v, 0, 1) for k, v in out.items()}
+    return out
 
   def gas_optical_properties_from_all_gpts(
       self, gas_optics_all_gpts: Mapping[str, Array], igpt: Array, is_lw: bool

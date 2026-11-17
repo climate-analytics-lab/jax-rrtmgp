@@ -2083,7 +2083,7 @@ def solve_lw_zc(
       if vmr_fields is None
       else _reindex_vmr_fields(vmr_fields, lookup_lw)
   )
-  gas_all = optics_lib.compute_gas_optics_all_gpts_zc(
+  gas_all = optics_lib.compute_gas_optics_all_gpts(
       pressure,
       temperature,
       molecules,
@@ -2480,7 +2480,7 @@ def solve_sw_zc(
   )
   # Nothing in `solve_sw` ever reads the z halos: evaluate SW gas optics on
   # interior `(nz, nc)` cells directly.
-  gas_all = optics_lib.compute_gas_optics_all_gpts_zc(
+  gas_all = optics_lib.compute_gas_optics_all_gpts(
       pressure[1:-1, :],
       temperature[1:-1, :],
       molecules[1:-1, :],
