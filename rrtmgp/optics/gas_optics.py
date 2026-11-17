@@ -1581,7 +1581,7 @@ def compute_rayleigh_optical_depth_all_gpts(
 #   (169 against 143 ms per T63 radiation call block on a TPU v5e) than the
 #   scan alone, and the per-level one 1%. Under `vmap` a `cond` becomes a
 #   select that runs both branches, and the window's dynamic slice a gather:
-#   a vmapped solve measured 4.5x the cost of the same solves one after
+#   a vmapped solve measured 3.5x the cost of the same solves one after
 #   another, so nothing in this library vmaps it.
 # * Any other cell shape, or more columns than `_TPU_MAX_WINDOW_COLUMNS`, is
 #   solved in blocks of cells over the whole table (`_mxu_blocked`).

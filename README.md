@@ -64,6 +64,50 @@ they are read. The cache is `/tmp/netcdf/data` by default; set the environment
 variable `RRTMGP_NETCDF_CACHE_DIR` before importing `rrtmgp` to put it elsewhere
 (for example on a host where `/tmp/netcdf` belongs to another user).
 
+## Performance: placements, layouts and backends
+
+None of the options below changes the physics; each changes the compiled
+program, and the fastest one depends on the hardware.
+
+- `gas_optics_mode`, `use_scan` and `gpt_chunk` (arguments of
+  `RRTMGP.compute_heating_rate`, `two_stream.solve_lw` and `solve_sw`) choose
+  where the gas optics is evaluated, whether the vertical recurrences are
+  scanned or unrolled, and how many g-points the spectral loop solves per
+  iteration. The library defaults (`'per_gpt'`, unrolled, one g-point) keep
+  the historical program.
+- With `gas_optics_mode='all_gpts'`, `use_scan=True` and `gpt_chunk > 1`, a 3D
+  atmosphere is solved in a **column-minor layout** on every backend: levels
+  leading, columns minor, so the columns are the vectorised axis through the
+  gas optics, the spectral loop and the vertical scans, with no transposes.
+  Measured, one longwave + shortwave call with clear-sky fluxes and McICA
+  clouds at T63L47 (18432 columns): 108 ms on an A100 against 243 ms for the
+  level-minor solve of the same placement, and 1.2 s against 4.1 s on a
+  64-core CPU at 2048 columns.
+- `RRTMGP.compute_heating_rate_zc` takes the column-minor layout directly,
+  `(n_levels + 2, n_columns)` profiles, for host models that keep their
+  columns contiguous (no transposes in or out, and McICA as one-byte masks of
+  the bulk cloud paths). See `two_stream.solve_lw_zc` for the layout of every
+  input and output.
+
+**TPU.** A gather runs serially on a TPU's vector unit, so on a TPU the table
+lookups become contractions on the matrix unit, the vertical scans step a
+block of levels at a time, and the g-point chunk of the column-minor solve is
+capped so a chunk's arrays fit in vector memory
+(`two_stream.TPU_CHUNK_VMEM_BYTES`). These TPU kernels are chosen
+automatically from the default device; set `RRTMGP_TPU_KERNELS=1` (or `0`), or
+use `rrtmgp.backend.tpu_kernels(True)`, where that is not the device the
+computation runs on (e.g. lowering for a TPU from a CPU host). On a TPU v5e
+use the column-minor solve on blocks of about 9216 columns, with `gpt_chunk=8`:
+a T63L47 call as two such blocks measured 222 ms (265 ms at `gpt_chunk=16`).
+Do not `vmap` the solve: its data-dependent branches become selects that run
+both sides (measured 3.5x the cost of the same solves one after another).
+
+**Table lookups.** `RRTMGP_LOOKUP_IMPL=gather|matmul` (or
+`optics_utils.set_lookup_impl`) selects how the per-g-point gas-optics tables
+are read: by direct indexing (the default) or by one-hot contractions. Making
+either choice explicitly also switches off the TPU kernels' contraction of the
+1D cloud and Planck tables.
+
 ## Testing
 
 Run the test suite with:

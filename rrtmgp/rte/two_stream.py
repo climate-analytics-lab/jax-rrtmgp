@@ -1373,9 +1373,10 @@ def compute_heating_rate(
 # Measured (one LW + SW call with clear-sky fluxes and McICA clouds, T63L47,
 # 18432 columns, jax 0.11): on an A100 at `gpt_chunk=64` 97 ms through
 # `compute_heating_rate_zc` and 108 ms through `compute_heating_rate`, against
-# 243 ms for `main`'s level-minor scan; on a CPU (64 cores, 2048 columns)
-# 1.19 s against 4.08 s; on a TPU v5e 342 ms for two 9216-column calls at
-# `gpt_chunk=16`.
+# 243 ms for the level-minor solve of the same placement; on a CPU (63 cores)
+# 10.6 s against 28.9 s; on a TPU v5e, as two 9216-column calls, 222 ms at
+# `gpt_chunk=8` and 265 ms at 16 (the fastest and the next chunk sizes there;
+# 4 and 32 are slower).
 # ---------------------------------------------------------------------------
 
 # Override of `_uses_column_minor` for tests and comparisons: `None` decides
