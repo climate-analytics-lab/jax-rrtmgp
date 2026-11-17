@@ -1573,12 +1573,18 @@ def compute_rayleigh_optical_depth_all_gpts(
 #   at a time in a `lax.scan` (`_mxu_level_scan`), and a level's pressures span
 #   only a few nodes of the `n_p = 60` pressure table: each level reads a
 #   window of `_TPU_P_WINDOW` nodes, starting at its lowest, and the
-#   intermediates stay in the TPU's vector memory. That holds when no level
-#   spans more of the table than the window; it is a property of the data, so
-#   it is tested at run time and anything else is solved in blocks of cells
-#   over the whole table (`_mxu_blocked`). Both are compiled (a `lax.cond`),
-#   and under `vmap` the `cond` becomes a select that runs both; nothing in
-#   this library vmaps the solve.
+#   intermediates stay in the TPU's vector memory. Whether a level fits in the
+#   window is a property of the data, so it is tested at run time, level by
+#   level: a level that does not fit reads the whole table (a `lax.cond` in the
+#   scan step). The test is per level rather than once for the whole
+#   atmosphere because a `cond` around the whole scan measured 16% slower
+#   (169 against 143 ms per T63 radiation call block on a TPU v5e) than the
+#   scan alone, and the per-level one 1%. Under `vmap` a `cond` becomes a
+#   select that runs both branches, and the window's dynamic slice a gather:
+#   a vmapped solve measured 4.5x the cost of the same solves one after
+#   another, so nothing in this library vmaps it.
+# * Any other cell shape, or more columns than `_TPU_MAX_WINDOW_COLUMNS`, is
+#   solved in blocks of cells over the whole table (`_mxu_blocked`).
 #
 # The contractions run at `Precision.HIGHEST`, which on a TPU is float32 to
 # within a few ulp (a multi-pass bfloat16 product, not IEEE float32), so the
@@ -1988,16 +1994,22 @@ def _mxu_level_scan(
 ) -> tuple[Array, Array]:
   """`_mxu_cells` one level of a `(n_levels, n_columns)` atmosphere at a time.
 
-  Every level reads its `_TPU_P_WINDOW`-node window of the pressure table, so
-  every level must span less than that.
+  A level reads its `_TPU_P_WINDOW`-node window of the pressure table when
+  its pressures fit in one -- its lowest and highest pressure intervals at
+  most `_TPU_P_WINDOW - 2` apart -- and the whole table otherwise.
 
   Returns:
     `(n_levels, n_gpt, n_columns)` arrays.
   """
 
   def step(_, level_cells):
-    return None, _mxu_cells(
-        lookup, vmr_lib, plan, level_cells, scalars, _TPU_P_WINDOW
+    p_lo_idx = level_cells.p_lo_idx
+    fits = jnp.max(p_lo_idx) - jnp.min(p_lo_idx) <= _TPU_P_WINDOW - 2
+    return None, jax.lax.cond(
+        fits,
+        lambda c: _mxu_cells(lookup, vmr_lib, plan, c, scalars, _TPU_P_WINDOW),
+        lambda c: _mxu_cells(lookup, vmr_lib, plan, c, scalars, None),
+        level_cells,
     )
 
   _, out = jax.lax.scan(step, None, cells)
@@ -2095,30 +2107,17 @@ def compute_all_gpts_mxu(
   plan = _mxu_plan(lookup, is_lw)
   cells, scalars = _mxu_inputs(lookup, interp, molecules, plan)
 
-  def blocked(_=None) -> tuple[Array, Array]:
-    out = _mxu_blocked(lookup, vmr_lib, plan, cells, scalars)
-    if z_leading_output and len(cell_shape) == 2:
-      out = jax.tree.map(lambda y: jnp.swapaxes(y, 0, 1), out)
-    return out
-
   n_p = lookup.kmajor.shape[1]
   if (
-      len(cell_shape) != 2
-      or n_p <= _TPU_P_WINDOW
-      or cell_shape[1] > _TPU_MAX_WINDOW_COLUMNS
+      len(cell_shape) == 2
+      and n_p > _TPU_P_WINDOW
+      and cell_shape[1] <= _TPU_MAX_WINDOW_COLUMNS
   ):
-    return blocked()
-
-  def windowed(_=None) -> tuple[Array, Array]:
     out = _mxu_level_scan(lookup, vmr_lib, plan, cells, scalars)
     if not z_leading_output:
       out = jax.tree.map(lambda y: jnp.swapaxes(y, 0, 1), out)
     return out
-
-  # Whether every level's pressures fit in one window: a level whose lowest
-  # and highest interval are at most `_TPU_P_WINDOW - 2` apart reads at most
-  # `_TPU_P_WINDOW` nodes.
-  p_lo_idx = interp.p_interp.interp_low.idx
-  p_span = jnp.max(p_lo_idx, axis=1) - jnp.min(p_lo_idx, axis=1)
-  fits = jnp.all(p_span <= _TPU_P_WINDOW - 2)
-  return jax.lax.cond(fits, windowed, blocked)
+  out = _mxu_blocked(lookup, vmr_lib, plan, cells, scalars)
+  if z_leading_output and len(cell_shape) == 2:
+    out = jax.tree.map(lambda y: jnp.swapaxes(y, 0, 1), out)
+  return out
