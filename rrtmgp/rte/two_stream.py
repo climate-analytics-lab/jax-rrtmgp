@@ -14,18 +14,25 @@
 
 """A library for solving the two-stream radiative transfer equation."""
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
+import contextlib
+import contextvars
+import dataclasses
 from typing import Callable, TypeAlias, cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from rrtmgp import constants
+from rrtmgp import backend
 from rrtmgp import kernel_ops
 from rrtmgp.optics import atmospheric_state
+from rrtmgp.optics import cloud_optics
 from rrtmgp.optics import lookup_gas_optics_base
+from rrtmgp.optics import lookup_gas_optics_longwave
 from rrtmgp.optics import optics
 from rrtmgp.optics import optics_base
+from rrtmgp.optics import optics_utils
 from rrtmgp.rte import longwave_noscat
 from rrtmgp.rte import monochromatic_two_stream
 
@@ -436,10 +443,13 @@ def _lw_cell_properties(
 
 
 def _reindex_vmr_fields(
-    vmr_fields: dict[str, Array], gas_optics_lib: AbstractLookupGasOptics
+    vmr_fields: Mapping[str | int, Array], gas_optics_lib: AbstractLookupGasOptics
 ) -> dict[int, Array]:
   """Converts the chemical formulas of the gas species to RRTM indices."""
-  return {gas_optics_lib.idx_gases[k]: v for k, v in vmr_fields.items()}
+  return {
+      k if isinstance(k, int) else gas_optics_lib.idx_gases[k]: v
+      for k, v in vmr_fields.items()
+  }
 
 
 def solve_lw(
@@ -537,8 +547,17 @@ def solve_lw(
       precomputed arrays (`n_gpt` fields each of the optical depth and of the
       Planck fraction -- the Rayleigh optical depth in the shortwave).
       Requires the `RRTMOptics` scheme. The precomputed stage reads the tables
-      by direct indexing (a gather), whatever `RRTMGP_LOOKUP_IMPL` selects for
-      the per-g-point path.
+      by row gathers, or with the TPU kernels (`rrtmgp.backend`) by
+      contractions on the matrix unit.
+
+      **With `'all_gpts'`, `use_scan=True` and `gpt_chunk > 1` a 3D
+      atmosphere is solved by `solve_lw_zc`**, on every backend: the same
+      equations and outputs, with the atmosphere laid out levels-leading and
+      columns-minor for the solve (`_uses_column_minor`). It is the faster
+      program on each backend measured -- e.g. 108 against 243 ms per T63L47
+      radiation call (LW + SW) on an A100 -- and agrees with the level-minor
+      solve to float32 rounding. `two_stream._column_minor(False)` forces the
+      level-minor solve, for comparisons.
     with_clear_sky: Also solve the cloud-free problem (gas + aerosol, the same
       aerosol mix-in as the all-sky problem) and return it under `clear_`
       prefixed keys. The gas optics and the Planck sources, which dominate the
@@ -594,6 +613,34 @@ def solve_lw(
     # Convert the chemical formulas of the gas species to RRTM-consistent
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_lw)
+
+  if _uses_column_minor(
+      optics_lib, temperature, hoist_gas_optics, use_scan, gpt_chunk
+  ):
+    return _solve_3d_via_zc(
+        solve_lw_zc,
+        pressure,
+        temperature,
+        molecules,
+        optics_lib,
+        atmos_state,
+        vmr_fields=vmr_fields,
+        sfc_temperature=sfc_temperature,
+        cloud_r_eff_liq=cloud_r_eff_liq,
+        cloud_path_liq=cloud_path_liq,
+        cloud_r_eff_ice=cloud_r_eff_ice,
+        cloud_path_ice=cloud_path_ice,
+        cloud_path_liq_per_gpt=cloud_path_liq_per_gpt,
+        cloud_path_ice_per_gpt=cloud_path_ice_per_gpt,
+        aerosol_optics=aerosol_optics,
+        gpt_chunk=gpt_chunk,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
+        with_clear_sky=with_clear_sky,
+        lw_solver=lw_solver,
+        lw_secant=lw_secant,
+        with_aerosol_free=with_aerosol_free,
+    )
 
   # The gas optics of every g-point, ahead of the spectral loop. Everything in
   # it is independent of the cloud, the aerosol and the g-point loop's order.
@@ -935,8 +982,17 @@ def solve_sw(
       precomputed arrays (`n_gpt` fields each of the optical depth and of the
       Planck fraction -- the Rayleigh optical depth in the shortwave).
       Requires the `RRTMOptics` scheme. The precomputed stage reads the tables
-      by direct indexing (a gather), whatever `RRTMGP_LOOKUP_IMPL` selects for
-      the per-g-point path.
+      by row gathers, or with the TPU kernels (`rrtmgp.backend`) by
+      contractions on the matrix unit.
+
+      **With `'all_gpts'`, `use_scan=True` and `gpt_chunk > 1` a 3D
+      atmosphere is solved by `solve_sw_zc`**, on every backend: the same
+      equations and outputs, with the atmosphere laid out levels-leading and
+      columns-minor for the solve (`_uses_column_minor`). It is the faster
+      program on each backend measured -- e.g. 108 against 243 ms per T63L47
+      radiation call (LW + SW) on an A100 -- and agrees with the level-minor
+      solve to float32 rounding. `two_stream._column_minor(False)` forces the
+      level-minor solve, for comparisons.
     with_clear_sky: Also solve the cloud-free problem (gas + aerosol, the same
       aerosol mix-in, surface albedos and night masking as the all-sky problem)
       and return it under `clear_` prefixed keys. The gas optics, which
@@ -973,6 +1029,43 @@ def solve_sw(
     # Convert the chemical formulas of the gas species to RRTM-consistent
     # numerical identifiers.
     vmr_fields = _reindex_vmr_fields(vmr_fields, optics_lib.gas_optics_sw)
+
+  if _uses_column_minor(
+      optics_lib, temperature, hoist_gas_optics, use_scan, gpt_chunk
+  ):
+    plane = temperature.shape[:-1]
+
+    def albedo(alb, name):
+      by_band = (
+          None
+          if alb is None
+          else _sw_sfc_albedo_by_band(alb, plane, optics_lib, name)
+      )
+      return alb if by_band is None else by_band
+
+    return _solve_3d_via_zc(
+        solve_sw_zc,
+        pressure,
+        temperature,
+        molecules,
+        optics_lib,
+        atmos_state,
+        vmr_fields=vmr_fields,
+        cloud_r_eff_liq=cloud_r_eff_liq,
+        cloud_path_liq=cloud_path_liq,
+        cloud_r_eff_ice=cloud_r_eff_ice,
+        cloud_path_ice=cloud_path_ice,
+        cloud_path_liq_per_gpt=cloud_path_liq_per_gpt,
+        cloud_path_ice_per_gpt=cloud_path_ice_per_gpt,
+        aerosol_optics=aerosol_optics,
+        gpt_chunk=gpt_chunk,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
+        sfc_alb_dir=albedo(sfc_alb_dir, 'sfc_alb_dir'),
+        sfc_alb_dif=albedo(sfc_alb_dif, 'sfc_alb_dif'),
+        with_clear_sky=with_clear_sky,
+        with_aerosol_free=with_aerosol_free,
+    )
 
   # The gas optics of every g-point, ahead of the spectral loop (see `solve_lw`).
   gas_all_gpts = None
@@ -1018,6 +1111,8 @@ def solve_sw(
   # the night columns (the raw `exp(-tau / cos(zenith))` terms in the shortwave
   # solve diverge to +inf once `cos(zenith) <= 0`), the solve is fed a
   # horizon-clamped zenith and the night columns are zeroed out afterwards.
+  if jnp.ndim(zenith) > 0:
+    zenith = jnp.broadcast_to(jnp.asarray(zenith), plane)
   night = zenith >= 0.5 * jnp.pi
   # Overhead sun (cos = 1) is the most benign valid angle; the resulting night
   # fluxes are masked to zero below, so this placeholder never reaches output.
@@ -1190,10 +1285,16 @@ def solve_sw(
       one_gpt, optics_lib.n_gpt_sw, gpt_chunk, fluxes_0
   )
   # Zero out columns where the sun is at or below the horizon. `night` is a
-  # scalar (single column) or, under a column `vmap`, a per-column scalar; it
-  # broadcasts over the trailing spatial/vertical axes of each flux field.
+  # scalar (single column / column `vmap`) or a 2D `[nx, ny]` mask over the
+  # horizontal plane.
   fluxes = {
-      key: jnp.where(night, jnp.zeros_like(val), val)
+      key: jnp.where(
+          night[..., jnp.newaxis]
+          if (jnp.ndim(night) == 2 and val.ndim == 3)
+          else night,
+          jnp.zeros_like(val),
+          val,
+      )
       for key, val in fluxes.items()
   }
   return fluxes
@@ -1203,6 +1304,8 @@ def compute_heating_rate(
     flux_net: Array,
     pressure: Array,
     q_v: Array | None = None,
+    *,
+    axis: int = 2,
 ) -> Array:
   """Computes cell-center heating rate from pressure and net radiative flux.
 
@@ -1217,6 +1320,8 @@ def compute_heating_rate(
     q_v: Water vapor specific humidity [kg/kg], used for the moist heat
       capacity. When omitted the dry-air value is used, which overestimates
       the heating rate by 0.84·q_v — 1.7% at 20 g/kg.
+    axis: The vertical axis: 2 for `(nx, ny, nz)` fields, 0 for the
+      column-minor `(nz, n_columns)` ones of `solve_lw_zc`.
 
   Returns:
     The heating rate of the grid cell [K/s].
@@ -1225,11 +1330,11 @@ def compute_heating_rate(
   #   dp_{i,j,k} = (p_{i,j,k+1} - p_{i,j,k-1}) / 2.
   # This is an approximation to the pressure difference across the cell, which
   # would use the pressure at the upper and lower faces, but it should be ok.
-  dp = 0.5 * kernel_ops.centered_difference(pressure, dim=2)
+  dp = 0.5 * kernel_ops.centered_difference(pressure, dim=axis)
 
   # Compute the forward pressure difference of fluxes on faces (like a
   # derivative of face_to_node).
-  dflux = kernel_ops.forward_difference(flux_net, dim=2)
+  dflux = kernel_ops.forward_difference(flux_net, dim=axis)
 
   # Moist heat capacity: cp = cp_d·(1 - q_v) + cp_v·q_v. Using the dry value
   # makes the heating rate too large by (cp_v/cp_d - 1)·q_v = 0.84·q_v, which
@@ -1241,3 +1346,1113 @@ def compute_heating_rate(
 
   # Compute the heating rate at the grid cell center in K/s.
   return constants.G * dflux / dp / cp
+
+
+# ---------------------------------------------------------------------------
+# The column-minor solver: `solve_lw_zc` and `solve_sw_zc`.
+#
+# The same physics as `solve_lw` / `solve_sw`, for an atmosphere laid out
+# `(n_levels, n_columns)`: levels leading, columns minor. Keeping the columns
+# on the minor axis through the gas optics, the spectral loop and the
+# vertical recurrences is what lets every backend vectorise across columns
+# (SIMD lanes on a CPU, the 128-lane minor tile dimension of a TPU) and what
+# removes the transposes a level-minor layout needs around every vertical
+# scan. A host model that keeps its columns minor calls these directly
+# (`RRTMGP.compute_heating_rate_zc`); `solve_lw` / `solve_sw` route a 3D
+# solve here when the gas optics is hoisted, the recurrences are scanned and
+# more than one g-point is solved per iteration (`_uses_column_minor`).
+#
+# Ahead of the spectral loop: the gas optics of every g-point (levels
+# leading, `(nz, n_gpt, nc)`), the face temperatures, the Planck function of
+# every band and the cloud Mie properties of every band. Each iteration of the
+# loop solves `chunk` g-points as `(nz, chunk, nc)` arrays: it slices its
+# g-points out of the gas optics, projects the per-band fields onto its
+# g-points (`_band_selector`), forms the cell properties and runs the
+# transport (`monochromatic_two_stream.solve_rte_2stream_zc` and siblings).
+#
+# Measured (one LW + SW call with clear-sky fluxes and McICA clouds, T63L47,
+# 18432 columns, jax 0.11): on an A100 at `gpt_chunk=64` 97 ms through
+# `compute_heating_rate_zc` and 108 ms through `compute_heating_rate`, against
+# 243 ms for the level-minor solve of the same placement; on a CPU (63 cores)
+# 10.6 s against 28.9 s; on a TPU v5e, as two 9216-column calls, 222 ms at
+# `gpt_chunk=8` and 265 ms at 16 (the fastest and the next chunk sizes there;
+# 4 and 32 are slower).
+# ---------------------------------------------------------------------------
+
+# Override of `_uses_column_minor` for tests and comparisons: `None` decides
+# by the placement, `True` / `False` force the column-minor / level-minor
+# solve of a 3D atmosphere.
+_column_minor_override: contextvars.ContextVar[bool | None] = (
+    contextvars.ContextVar('rrtmgp_column_minor', default=None)
+)
+
+
+@contextlib.contextmanager
+def _column_minor(enabled: bool | None) -> Iterator[None]:
+  """Force (`True`), forbid (`False`) or restore (`None`) the column-minor solve.
+
+  Applies to `solve_lw` / `solve_sw` traced inside the block, and only where
+  the column-minor solve can run at all (the RRTMOptics scheme and a 3D
+  atmosphere). Meant for tests and A/B comparisons of the two layouts, which
+  solve the same equations.
+
+  Args:
+    enabled: The routing to use inside the block.
+
+  Yields:
+    Nothing; the routing is active until the block exits.
+  """
+  token = _column_minor_override.set(enabled)
+  try:
+    yield
+  finally:
+    _column_minor_override.reset(token)
+
+
+def _uses_column_minor(
+    optics_lib: optics_base.OpticsScheme,
+    temperature: Array,
+    hoist_gas_optics: bool,
+    use_scan: bool,
+    gpt_chunk: int,
+) -> bool:
+  """Whether `solve_lw` / `solve_sw` hand a 3D atmosphere to the `_zc` solve.
+
+  They do for the placement the column-minor solve is built for -- the gas
+  optics hoisted out of the spectral loop, the recurrences scanned, and more
+  than one g-point per iteration -- on every backend: it is the faster
+  program on each one measured (see the comment above). A single g-point per
+  iteration, or the unrolled recurrences, keep the level-minor solve, whose
+  programs those settings were tuned for.
+  """
+  if not isinstance(optics_lib, optics.RRTMOptics) or temperature.ndim != 3:
+    return False
+  if temperature.size == 0:
+    return False
+  override = _column_minor_override.get()
+  if override is not None:
+    return override
+  return hoist_gas_optics and use_scan and gpt_chunk > 1
+
+
+# The TPU vector memory one `(nz, chunk, nc)` float32 array of the spectral
+# loop may take. The TPU kernels cap `gpt_chunk` to fit, so the vertical
+# recurrences of a chunk stay in vector memory instead of round-tripping HBM.
+# 32 MiB suits a v5e; set it to `None` to use `gpt_chunk` as given.
+TPU_CHUNK_VMEM_BYTES: int | None = 32 * 1024 * 1024
+
+
+def _column_minor_chunk_plan(
+    n_gpt: int, gpt_chunk: int, nz: int, nc: int
+) -> tuple[int, int, bool]:
+  """`_gpt_chunk_plan` for the column-minor solve.
+
+  With the TPU kernels the chunk is first capped so that a `(nz, chunk, nc)`
+  float32 array fits in `TPU_CHUNK_VMEM_BYTES`, in multiples of 8 (the
+  second-minor tile dimension). Then, if the spectrum takes more than one
+  iteration, the chunk is evened out across them in multiples of 8 when that
+  still covers `n_gpt` in the same number of iterations: 112 g-points at
+  `gpt_chunk=64` are two chunks of 56, not 64 and a padded 48.
+
+  Returns:
+    The chunk size, the number of iterations and whether the last one is
+    padded, as `_gpt_chunk_plan`.
+  """
+  chunk = gpt_chunk
+  if backend.use_tpu_kernels() and TPU_CHUNK_VMEM_BYTES and chunk > 8:
+    per_gpt = max(nz * nc * 4, 1)
+    chunk = min(chunk, max(8, TPU_CHUNK_VMEM_BYTES // per_gpt // 8 * 8))
+  cap = chunk
+  chunk, n_chunks, needs_mask = _gpt_chunk_plan(n_gpt, cap)
+  if n_chunks > 1:
+    even = -(-(-(-n_gpt // n_chunks)) // 8) * 8
+    if even <= cap and even * n_chunks >= n_gpt:
+      chunk = even
+      needs_mask = n_chunks * chunk != n_gpt
+  return chunk, n_chunks, needs_mask
+
+
+def _interior(arr: Array, nz: int, axis: int = 0) -> Array:
+  """`arr` without its halo levels, if it has them (`nz + 2` on `axis`)."""
+  if arr.shape[axis] == nz + 2:
+    return jax.lax.slice_in_dim(arr, 1, nz + 1, axis=axis)
+  if arr.shape[axis] != nz:
+    raise ValueError(
+        f'Expected {nz} or {nz + 2} levels on axis {axis}, got shape'
+        f' {arr.shape}.'
+    )
+  return arr
+
+
+def _pack_chunks(
+    arr: Array, gpt_axis: int, n_chunks: int, chunk: int
+) -> Array:
+  """`(nz, n_gpt, nc)` (or `(n_gpt, nz, nc)`) as `(n_chunks, nz, chunk, nc)`.
+
+  The spectrum is padded to `n_chunks * chunk` by repeating its last g-point,
+  which the spectral sum masks out.
+  """
+  n_gpt = arr.shape[gpt_axis]
+  pad = n_chunks * chunk - n_gpt
+  if pad:
+    last = jax.lax.slice_in_dim(arr, n_gpt - 1, n_gpt, axis=gpt_axis)
+    arr = jnp.concatenate(
+        [arr, jnp.repeat(last, pad, axis=gpt_axis)], axis=gpt_axis
+    )
+  if gpt_axis == 0:
+    _, nz, nc = arr.shape
+    return jnp.swapaxes(arr.reshape(n_chunks, chunk, nz, nc), 1, 2)
+  nz, _, nc = arr.shape
+  return jnp.swapaxes(arr.reshape(nz, n_chunks, chunk, nc), 0, 1)
+
+
+def _per_column(val: Array | float, nc: int, dtype: jnp.dtype) -> Array:
+  """A scalar or `(nc,)` field as `(1, nc)` (a scalar stays `(1, 1)`)."""
+  v = jnp.asarray(val, dtype=dtype)
+  if v.ndim == 0:
+    return v.reshape(1, 1)
+  return jnp.broadcast_to(v, (nc,)).reshape(1, nc)
+
+
+def _tau_scale_zc(
+    scale: Array | float | None, nz: int, nc: int
+) -> Array | float | None:
+  """A `cloud_tau_scale_*` in a shape that broadcasts against `(nz, 1, nc)`."""
+  if scale is None or jnp.ndim(scale) == 0:
+    return scale
+  s = jnp.asarray(scale)
+  if s.ndim == 1:
+    s = jnp.broadcast_to(s, (nc,))[jnp.newaxis, :]
+  elif s.shape[0] not in (1, nz):
+    s = _interior(s, nz)
+  return s[:, jnp.newaxis, :]
+
+
+def _band_selector(
+    g_point_to_bnd: Array, n_bnd: int, n_chunks: int, chunk: int,
+    dtype: jnp.dtype,
+) -> Array:
+  """Which band each g-point of each chunk is in, for `_by_gpt`.
+
+  Static: `(n_chunks, chunk)` band indices on CPU/GPU, and on the TPU kernels
+  `(n_chunks, chunk, n_bnd)` one-hot rows, so the projection is a small
+  matmul on the matrix unit rather than a gather.
+  """
+  g2b = np.asarray(g_point_to_bnd)
+  n_gpt = g2b.shape[0]
+  bands = g2b[np.minimum(np.arange(n_chunks * chunk), n_gpt - 1)]
+  if not backend.use_tpu_kernels():
+    return jnp.asarray(bands, dtype=jnp.int32).reshape(n_chunks, chunk)
+  one_hot = np.eye(n_bnd, dtype=np.float32)[bands]
+  return jnp.asarray(one_hot, dtype=dtype).reshape(n_chunks, chunk, n_bnd)
+
+
+def _by_gpt(selector: Array, field: Array) -> Array:
+  """A per-band field on a chunk's g-points: `(..., n_bnd, nc) -> (..., chunk, nc)`.
+
+  Args:
+    selector: One chunk of `_band_selector`.
+    field: `(n_bnd, nc)` or `(nz, n_bnd, nc)`.
+
+  Returns:
+    `(chunk, nc)` or `(nz, chunk, nc)`.
+  """
+  if jnp.issubdtype(selector.dtype, jnp.integer):
+    return field[..., selector, :]
+  highest = jax.lax.Precision.HIGHEST
+  if field.ndim == 2:
+    return jnp.matmul(selector, field, precision=highest)
+  lhs = jnp.broadcast_to(selector, (field.shape[0],) + selector.shape)
+  return jax.lax.dot_general(
+      lhs,
+      field,
+      dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+      precision=highest,
+  )
+
+
+class _CloudZc:
+  """The cloud optics of a column-minor solve, by band and then per chunk.
+
+  The Mie properties of each phase are looked up for every band before the
+  spectral loop. With bulk cloud paths the cloud optical properties are formed
+  per band there too, and a chunk projects them onto its g-points (and applies
+  its McICA masks, if any). With per-g-point (McICA) cloud paths a chunk
+  projects the Mie properties and forms the cloud optics of its own g-points.
+  Either way the physics is `cloud_optics.combine_phases`.
+  """
+
+  def __init__(
+      self,
+      optics_lib: optics.RRTMOptics,
+      is_lw: bool,
+      nz: int,
+      nc: int,
+      n_chunks: int,
+      chunk: int,
+      dtype: jnp.dtype,
+      *,
+      r_eff_liq: Array | None,
+      path_liq: Array | None,
+      r_eff_ice: Array | None,
+      path_ice: Array | None,
+      path_liq_per_gpt: Array | None,
+      path_ice_per_gpt: Array | None,
+      mask_per_gpt: Array | None,
+      per_gpt_axis: int,
+      tau_scale_liq: Array | float | None,
+      tau_scale_ice: Array | float | None,
+  ):
+    self._optics_lib = optics_lib
+    self._is_lw = is_lw
+    lookup = optics_lib.cloud_optics_lw if is_lw else optics_lib.cloud_optics_sw
+    assert lookup is not None
+    has_liq = path_liq_per_gpt is not None or path_liq is not None
+    has_ice = path_ice_per_gpt is not None or path_ice is not None
+    self.per_gpt = path_liq_per_gpt is not None or path_ice_per_gpt is not None
+    if self.per_gpt and mask_per_gpt is not None:
+      raise ValueError(
+          'cloud_mask_per_gpt masks the bulk cloud paths; it cannot be combined'
+          ' with per-g-point cloud paths (cloud_path_*_per_gpt), which already'
+          ' are per g-point.'
+      )
+    zeros = jnp.zeros((nz, nc), dtype=dtype)
+
+    def radius(r):
+      return zeros if r is None else _interior(r, nz)
+
+    # `(n_bnd, nz, nc)` per field.
+    liq, ice = cloud_optics.phase_properties_all_bands(
+        lookup,
+        radius(r_eff_liq) if has_liq else None,
+        radius(r_eff_ice) if has_ice else None,
+    )
+    self._tau_scale = (
+        _tau_scale_zc(tau_scale_liq, nz, nc),
+        _tau_scale_zc(tau_scale_ice, nz, nc),
+    )
+
+    def per_gpt_or_bulk(per_gpt, bulk):
+      if per_gpt is not None:
+        return _pack_chunks(
+            _interior(per_gpt, nz, axis=1 - per_gpt_axis),
+            per_gpt_axis,
+            n_chunks,
+            chunk,
+        )
+      return None if bulk is None else _interior(bulk, nz)[:, jnp.newaxis]
+
+    if self.per_gpt:
+      # `(nz, n_bnd, nc)`, ready for `_by_gpt`.
+      self._phases = tuple(
+          None
+          if p is None
+          else cloud_optics.PhaseProperties(
+              *(jnp.swapaxes(x, 0, 1) for x in p)
+          )
+          for p in (liq, ice)
+      )
+      # `(n_chunks, nz, chunk, nc)`, or a bulk path `(nz, 1, nc)`.
+      self._paths = (
+          per_gpt_or_bulk(path_liq_per_gpt, path_liq),
+          per_gpt_or_bulk(path_ice_per_gpt, path_ice),
+      )
+      self._by_band = None
+      self._mask = None
+    else:
+      # The scales broadcast against `(n_bnd, nz, nc)` here.
+      scale = tuple(
+          s if s is None or jnp.ndim(s) == 0 else jnp.swapaxes(s, 0, 1)
+          for s in self._tau_scale
+      )
+      by_band = self._combine(
+          liq,
+          ice,
+          None if path_liq is None else _interior(path_liq, nz)[jnp.newaxis],
+          None if path_ice is None else _interior(path_ice, nz)[jnp.newaxis],
+          *scale,
+      )
+      # `(nz, n_bnd, nc)`.
+      self._by_band = {k: jnp.swapaxes(v, 0, 1) for k, v in by_band.items()}
+      self._mask = (
+          None
+          if mask_per_gpt is None
+          else _pack_chunks(
+              _interior(
+                  jnp.asarray(mask_per_gpt, dtype=jnp.bool_),
+                  nz,
+                  axis=1 - per_gpt_axis,
+              ),
+              per_gpt_axis,
+              n_chunks,
+              chunk,
+          )
+      )
+
+  def _combine(self, liq, ice, path_liq, path_ice, scale_liq, scale_ice):
+    props = cloud_optics.combine_phases(
+        liq, ice, path_liq, path_ice, scale_liq, scale_ice
+    )
+    if not self._is_lw:
+      props = self._optics_lib._apply_delta_scaling_for_cloud(props)  # pylint: disable=protected-access
+    return props
+
+  def chunk_props(self, ichunk: Array, selector: Array) -> dict[str, Array]:
+    """The cloud optical properties of chunk `ichunk`, `(nz, chunk, nc)`."""
+    if not self.per_gpt:
+      props = {k: _by_gpt(selector, v) for k, v in self._by_band.items()}
+      if self._mask is not None:
+        mask = jax.lax.dynamic_index_in_dim(
+            self._mask, ichunk, axis=0, keepdims=False
+        )
+        props = {
+            k: jnp.where(mask, v, jnp.zeros_like(v)) for k, v in props.items()
+        }
+      return props
+    phases = tuple(
+        None
+        if p is None
+        else cloud_optics.PhaseProperties(*(_by_gpt(selector, x) for x in p))
+        for p in self._phases
+    )
+    paths = tuple(
+        p
+        if p is None or p.ndim == 3
+        else jax.lax.dynamic_index_in_dim(p, ichunk, axis=0, keepdims=False)
+        for p in self._paths
+    )
+    return self._combine(*phases, *paths, *self._tau_scale)
+
+
+def _aerosol_zc(
+    aerosol_optics: Mapping[str, Array] | None, nz: int
+) -> dict[str, Array] | None:
+  """`(n_bnd, nz[+2], nc)` per-band aerosol optics as `(nz, n_bnd, nc)`."""
+  if aerosol_optics is None:
+    return None
+  return {
+      k: jnp.swapaxes(_interior(v, nz, axis=1), 0, 1)
+      for k, v in aerosol_optics.items()
+  }
+
+
+def _spectral_sum_zc(
+    solve_chunk: Callable[[Array, Array], dict[str, Array]],
+    selector: Array,
+    n_gpt: int,
+    n_chunks: int,
+    chunk: int,
+    needs_mask: bool,
+    init: dict[str, Array],
+) -> dict[str, Array]:
+  """`_solve_over_gpoints` for the column-minor solve.
+
+  Args:
+    solve_chunk: `(ichunk, selector) -> fluxes`, each `(..., chunk, nc)`: the
+      g-point axis is second-minor.
+    selector: `_band_selector` of the whole spectrum.
+    n_gpt: The number of g-points.
+    n_chunks: The number of chunks.
+    chunk: The g-points per chunk.
+    needs_mask: Whether the last chunk is padded past `n_gpt`.
+    init: Zeroed accumulators, each `solve_chunk` output with the g-point axis
+      summed out.
+
+  Returns:
+    The sum over the spectrum.
+  """
+  valid = None
+  if needs_mask:
+    valid = jnp.asarray(
+        (np.arange(n_chunks * chunk) < n_gpt).reshape(n_chunks, chunk, 1),
+        dtype=jax.tree.leaves(init)[0].dtype,
+    )
+
+  def step(ichunk, total):
+    fluxes = solve_chunk(
+        ichunk,
+        jax.lax.dynamic_index_in_dim(selector, ichunk, axis=0, keepdims=False),
+    )
+    mask = (
+        None
+        if valid is None
+        else jax.lax.dynamic_index_in_dim(valid, ichunk, axis=0, keepdims=False)
+    )
+
+    def add(flux: Array, acc: Array) -> Array:
+      if mask is not None:
+        flux = flux * mask
+      return jnp.sum(flux, axis=-2) + acc
+
+    return jax.tree.map(add, fluxes, total)
+
+  return jax.lax.fori_loop(0, n_chunks, step, init)
+
+
+def _problem_keys(
+    with_clear_sky: bool, with_aerosol_free: bool, keys: Sequence[str]
+) -> list[str]:
+  return [
+      f'{prefix}{key}'
+      for prefix in _problem_prefixes(with_clear_sky, with_aerosol_free)
+      for key in keys
+  ]
+
+
+def solve_lw_zc(
+    pressure: Array,
+    temperature: Array,
+    molecules: Array,
+    optics_lib: optics.RRTMOptics,
+    atmos_state: AtmosphericState,
+    vmr_fields: Mapping[str | int, Array] | None = None,
+    sfc_temperature: Array | float | None = None,
+    cloud_r_eff_liq: Array | None = None,
+    cloud_path_liq: Array | None = None,
+    cloud_r_eff_ice: Array | None = None,
+    cloud_path_ice: Array | None = None,
+    cloud_path_liq_per_gpt: Array | None = None,
+    cloud_path_ice_per_gpt: Array | None = None,
+    aerosol_optics: Mapping[str, Array] | None = None,
+    gpt_chunk: int = 64,
+    cloud_tau_scale_liq: Array | float | None = None,
+    cloud_tau_scale_ice: Array | float | None = None,
+    with_clear_sky: bool = False,
+    lw_solver: str = LW_SOLVER_TWO_STREAM,
+    lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
+    with_aerosol_free: bool = False,
+    *,
+    per_gpt_axis: int = 1,
+    cloud_mask_per_gpt: Array | None = None,
+) -> dict[str, Array]:
+  """`solve_lw` for a column-minor `(nz + 2, nc)` atmosphere.
+
+  The same physics, problems and outputs as `solve_lw` with the gas optics
+  hoisted and the recurrences scanned, with the levels leading and the
+  columns minor throughout (see the comment above `_column_minor`). A clear,
+  aerosol-free problem (`ssa = 0`, no reflection) is solved with the
+  no-scattering recurrences, which are what the two-stream ones reduce to.
+
+  Args:
+    pressure: `(nz + 2, nc)` pressure [Pa], with a halo level at each end.
+    temperature: `(nz + 2, nc)` temperature [K], with halos.
+    molecules: `(nz + 2, nc)` molecules per area [molecules/m^2], with halos.
+    optics_lib: The `RRTMOptics` scheme.
+    atmos_state: The atmospheric state; its `zenith`, `irrad`, `sfc_alb`,
+      `sfc_emis` and `toa_flux_lw` may be scalars or `(nc,)`.
+    vmr_fields: Optional volume mixing ratio fields, keyed by gas name or
+      index, each `(nz + 2, nc)`.
+    sfc_temperature: Surface temperature [K], a scalar or `(nc,)`.
+    cloud_r_eff_liq: Effective droplet radius [m], `(nz[+2], nc)`.
+    cloud_path_liq: Liquid water path [kg/m^2], `(nz[+2], nc)`.
+    cloud_r_eff_ice: Effective ice radius [m], `(nz[+2], nc)`.
+    cloud_path_ice: Ice water path [kg/m^2], `(nz[+2], nc)`.
+    cloud_path_liq_per_gpt: Per-g-point (McICA) liquid water path,
+      `(nz[+2], n_gpt, nc)`, or `(n_gpt, nz[+2], nc)` with `per_gpt_axis=0`.
+      Replaces `cloud_path_liq` for the liquid phase.
+    cloud_path_ice_per_gpt: Same as above, for the ice water path.
+    aerosol_optics: Per-band aerosol `'optical_depth'`, `'ssa'` and
+      `'asymmetry_factor'`, each `(n_bnd, nz[+2], nc)`.
+    gpt_chunk: g-points per iteration of the spectral loop. With the TPU
+      kernels it is capped to fit `TPU_CHUNK_VMEM_BYTES` (see
+      `_column_minor_chunk_plan`, which also evens chunks out to multiples
+      of 8).
+    cloud_tau_scale_liq: Multiplier of the liquid cloud optical depth: a
+      scalar, `(nc,)` or `(nz[+2], nc)`.
+    cloud_tau_scale_ice: Same as above, for ice.
+    with_clear_sky: Also solve the cloud-free problem (`solve_lw`).
+    lw_solver: `'two_stream'` or `'noscat'` (`solve_lw`).
+    lw_secant: Secant of the `'noscat'` solver's propagation angle.
+    with_aerosol_free: Also solve the aerosol-free twin of every problem.
+    per_gpt_axis: The g-point axis of the per-g-point inputs, 1 (default,
+      `(nz, n_gpt, nc)`) or 0 (`(n_gpt, nz, nc)`).
+    cloud_mask_per_gpt: Optional boolean McICA masks, `(nz[+2], n_gpt, nc)`
+      (or `(n_gpt, nz[+2], nc)` with `per_gpt_axis=0`): the bulk cloud paths
+      are seen by a g-point only where its mask is set. Cannot be combined
+      with per-g-point cloud paths. One byte per (level, g-point, column)
+      instead of a float per phase.
+
+  Returns:
+    `(nz + 2, nc)` face fluxes [W/m^2], `flux_up`, `flux_down` and
+    `flux_net`: entry `k` is the bottom face of level `k`, so entry 1 is the
+    surface and entry `nz + 1` the top of the atmosphere; entry 0 (the face
+    below the bottom halo) is zero. The clear-sky and aerosol-free problems
+    under their prefixes, as `solve_lw` / `solve_sw`.
+  """
+  if lw_solver not in LW_SOLVERS:
+    raise ValueError(
+        f'lw_solver must be one of {LW_SOLVERS}, got {lw_solver!r}.'
+    )
+  if sfc_temperature is None:
+    raise ValueError('solve_lw_zc requires sfc_temperature.')
+  nzh, nc = temperature.shape
+  nz = nzh - 2
+  dtype = temperature.dtype
+  lookup = cast(
+      lookup_gas_optics_longwave.LookupGasOpticsLongwave,
+      optics_lib.gas_optics_lw,
+  )
+  n_gpt = optics_lib.n_gpt_lw
+  chunk, n_chunks, needs_mask = _column_minor_chunk_plan(
+      n_gpt, gpt_chunk, nz, nc
+  )
+
+  gas = optics_lib.compute_gas_optics_all_gpts(
+      pressure,
+      temperature,
+      molecules,
+      None if vmr_fields is None else _reindex_vmr_fields(vmr_fields, lookup),
+      is_lw=True,
+      z_leading_output=True,
+  )
+  tau_packed = _pack_chunks(gas['optical_depth'][1:-1], 1, n_chunks, chunk)
+  pfrac_packed = _pack_chunks(gas['planck_fraction'], 1, n_chunks, chunk)
+
+  # The Planck function of every band at the faces, the surface and (for the
+  # no-scattering solver) the layer centres, in one interpolation.
+  sfc_temp = jnp.broadcast_to(jnp.asarray(sfc_temperature, dtype=dtype), (nc,))
+  t_face = optics_base.reconstruct_face_values(temperature, sfc_temp, axis=0)[
+      0
+  ][1:]
+  need_layer_src = lw_solver == LW_SOLVER_NOSCAT
+  t_stack = [t_face, sfc_temp[jnp.newaxis]]
+  if need_layer_src:
+    t_stack.append(temperature[1:-1])
+  planck = optics_utils.floor_at_zero(
+      optics_utils.interpolate_rows_1d(
+          lookup.totplnk,
+          optics_utils.create_linear_interpolant(
+              jnp.concatenate(t_stack, axis=0), lookup.t_planck
+          ),
+      )
+  )
+  # `(nz + 1, n_bnd, nc)`, `(n_bnd, nc)` and `(nz, n_bnd, nc)`.
+  b_face = jnp.swapaxes(planck[:, : nz + 1], 0, 1)
+  b_sfc = planck[:, nz + 1]
+  b_layer = jnp.swapaxes(planck[:, nz + 2 :], 0, 1) if need_layer_src else None
+  selector = _band_selector(
+      lookup.g_point_to_bnd, lookup.n_bnd, n_chunks, chunk, dtype
+  )
+
+  has_cloud = any(
+      p is not None
+      for p in (
+          cloud_path_liq,
+          cloud_path_ice,
+          cloud_path_liq_per_gpt,
+          cloud_path_ice_per_gpt,
+      )
+  )
+  cloud = None
+  if has_cloud:
+    cloud = _CloudZc(
+        optics_lib, True, nz, nc, n_chunks, chunk, dtype,
+        r_eff_liq=cloud_r_eff_liq, path_liq=cloud_path_liq,
+        r_eff_ice=cloud_r_eff_ice, path_ice=cloud_path_ice,
+        path_liq_per_gpt=cloud_path_liq_per_gpt,
+        path_ice_per_gpt=cloud_path_ice_per_gpt,
+        mask_per_gpt=cloud_mask_per_gpt, per_gpt_axis=per_gpt_axis,
+        tau_scale_liq=cloud_tau_scale_liq, tau_scale_ice=cloud_tau_scale_ice,
+    )
+  aerosol = _aerosol_zc(aerosol_optics, nz)
+
+  # The boundary conditions; see `solve_lw` for the split of `toa_flux_lw`.
+  toa_flux_down = jnp.broadcast_to(
+      _per_column(atmos_state.toa_flux_lw / n_gpt, nc, dtype), (chunk, nc)
+  )
+  sfc_emissivity = jnp.broadcast_to(
+      _per_column(atmos_state.sfc_emis, nc, dtype), (chunk, nc)
+  )
+  sfc_reflectance = 1.0 - sfc_emissivity
+
+  def solve_chunk(ichunk, sel):
+    tau = jax.lax.dynamic_index_in_dim(tau_packed, ichunk, 0, keepdims=False)
+    pfrac = jax.lax.dynamic_index_in_dim(
+        pfrac_packed, ichunk, 0, keepdims=False
+    )
+    # The Planck sources of every face from each adjacent layer's spectral
+    # mapping, combined into one per level (`lw_combine_sources`).
+    b_face_g = _by_gpt(sel, b_face)
+    level_src = monochromatic_two_stream.level_source(
+        pfrac[:-1] * b_face_g, pfrac[1:] * b_face_g
+    )
+    level_src_bottom = level_src[:-1]
+    level_src_top = level_src[1:]
+    sfc_src = pfrac[1] * _by_gpt(sel, b_sfc)
+    layer_src = (
+        pfrac[1:-1] * _by_gpt(sel, b_layer) if need_layer_src else None
+    )
+
+    zeros = jnp.zeros_like(tau)
+    gas_props = {'optical_depth': tau, 'ssa': zeros, 'asymmetry_factor': zeros}
+    all_sky_props = gas_props
+    if cloud is not None:
+      all_sky_props = optics_lib.combine_optical_properties(
+          gas_props, cloud.chunk_props(ichunk, sel)
+      )
+    aer = (
+        None
+        if aerosol is None
+        else {k: _by_gpt(sel, v) for k, v in aerosol.items()}
+    )
+    sfc_emission = np.pi * sfc_emissivity * sfc_src
+
+    def solve(props, aer_props):
+      gas_only = props is gas_props and aer_props is None
+      if aer_props is not None:
+        props = optics_lib.combine_optical_properties(props, aer_props)
+      if lw_solver == LW_SOLVER_NOSCAT:
+        return longwave_noscat.lw_noscat_transport_zc(
+            props['optical_depth'],
+            props['ssa'],
+            layer_src,
+            level_src_top,
+            level_src_bottom,
+            toa_flux_down,
+            sfc_src,
+            sfc_emissivity,
+            secant=lw_secant,
+        )
+      if gas_only:
+        # No scattering anywhere: the two-stream equations without
+        # reflection (`lw_pure_absorption_two_stream_cell`).
+        cell = monochromatic_two_stream.lw_pure_absorption_two_stream_cell(
+            props['optical_depth'], level_src_bottom, level_src_top
+        )
+        return monochromatic_two_stream.solve_rte_absorbing_zc(
+            cell['t_diff'],
+            cell['src_up'],
+            cell['src_down'],
+            toa_flux_down,
+            sfc_emission,
+            sfc_reflectance,
+        )
+      cell = monochromatic_two_stream.lw_cell_source_and_properties(
+          props['optical_depth'],
+          props['ssa'],
+          level_src_bottom,
+          level_src_top,
+          props['asymmetry_factor'],
+      )
+      return monochromatic_two_stream.solve_rte_2stream_zc(
+          cell['t_diff'],
+          cell['r_diff'],
+          cell['src_up'],
+          cell['src_down'],
+          toa_flux_down,
+          sfc_emission,
+          sfc_reflectance,
+      )
+
+    return _solve_problems(
+        solve,
+        all_sky_props,
+        gas_props if with_clear_sky else None,
+        aer,
+        with_clear_sky,
+        with_aerosol_free,
+    )
+
+  init = {
+      key: jnp.zeros((nz + 1, nc), dtype=dtype)
+      for key in _problem_keys(
+          with_clear_sky, with_aerosol_free,
+          ('flux_up', 'flux_down', 'flux_net'),
+      )
+  }
+  fluxes = _spectral_sum_zc(
+      solve_chunk, selector, n_gpt, n_chunks, chunk, needs_mask, init
+  )
+  # The face below the bottom halo carries no flux.
+  zero_halo = jnp.zeros((1, nc), dtype=dtype)
+  return {
+      k: jnp.concatenate([zero_halo, v], axis=0) for k, v in fluxes.items()
+  }
+
+
+
+def _sw_sfc_albedo_by_band_zc(
+    albedo: Array | float,
+    nc: int,
+    n_bnd: int,
+    name: str,
+    dtype: jnp.dtype,
+) -> Array | None:
+  """`_sw_sfc_albedo_by_band` for `(nc,)` columns: `(n_bnd, nc)` or `None`.
+
+  `None` for a per-column albedo (a scalar, `(1,)` or `(nc,)`); a per-band
+  one is `(n_bnd, nc)` or `(n_bnd, 1)`, or `(..., n_bnd)` with the leading
+  axes broadcastable against `(nc,)`.
+  """
+  shape = tuple(np.shape(albedo))
+  if len(shape) == 0 or shape in ((nc,), (1,)):
+    return None
+  if len(shape) == 2 and shape[0] == n_bnd and shape[1] in (1, nc):
+    return jnp.broadcast_to(jnp.asarray(albedo, dtype=dtype), (n_bnd, nc))
+  if (
+      len(shape) >= 1
+      and shape[-1] == n_bnd
+      and np.broadcast_shapes(shape[:-1], (nc,)) == (nc,)
+  ):
+    return jnp.broadcast_to(jnp.asarray(albedo, dtype=dtype), (nc, n_bnd)).T
+  raise ValueError(
+      f'{name} has shape {shape}, incompatible with nc={nc}, n_bnd_sw={n_bnd}.'
+  )
+
+
+def solve_sw_zc(
+    pressure: Array,
+    temperature: Array,
+    molecules: Array,
+    optics_lib: optics.RRTMOptics,
+    atmos_state: AtmosphericState,
+    vmr_fields: Mapping[str | int, Array] | None = None,
+    cloud_r_eff_liq: Array | None = None,
+    cloud_path_liq: Array | None = None,
+    cloud_r_eff_ice: Array | None = None,
+    cloud_path_ice: Array | None = None,
+    cloud_path_liq_per_gpt: Array | None = None,
+    cloud_path_ice_per_gpt: Array | None = None,
+    aerosol_optics: Mapping[str, Array] | None = None,
+    gpt_chunk: int = 64,
+    cloud_tau_scale_liq: Array | float | None = None,
+    cloud_tau_scale_ice: Array | float | None = None,
+    sfc_alb_dir: Array | float | None = None,
+    sfc_alb_dif: Array | float | None = None,
+    with_clear_sky: bool = False,
+    with_aerosol_free: bool = False,
+    *,
+    per_gpt_axis: int = 1,
+    cloud_mask_per_gpt: Array | None = None,
+) -> dict[str, Array]:
+  """`solve_sw` for a column-minor `(nz + 2, nc)` atmosphere.
+
+  The same physics, problems and outputs as `solve_sw` with the gas optics
+  hoisted and the recurrences scanned, with the levels leading and the
+  columns minor throughout (see the comment above `_column_minor`). The gas
+  optics are evaluated on the interior levels only (the shortwave never reads
+  the halos). Columns with the sun at or below the horizon return zero.
+
+  Args:
+    pressure: `(nz + 2, nc)` pressure [Pa], with a halo level at each end.
+    temperature: `(nz + 2, nc)` temperature [K], with halos.
+    molecules: `(nz + 2, nc)` molecules per area [molecules/m^2], with halos.
+    optics_lib: The `RRTMOptics` scheme.
+    atmos_state: The atmospheric state; its `zenith`, `irrad`, `sfc_alb`,
+      `sfc_emis` and `toa_flux_lw` may be scalars or `(nc,)`.
+    vmr_fields: Optional volume mixing ratio fields, keyed by gas name or
+      index, each `(nz + 2, nc)`.
+    cloud_r_eff_liq: Effective droplet radius [m], `(nz[+2], nc)`.
+    cloud_path_liq: Liquid water path [kg/m^2], `(nz[+2], nc)`.
+    cloud_r_eff_ice: Effective ice radius [m], `(nz[+2], nc)`.
+    cloud_path_ice: Ice water path [kg/m^2], `(nz[+2], nc)`.
+    cloud_path_liq_per_gpt: Per-g-point (McICA) liquid water path,
+      `(nz[+2], n_gpt, nc)`, or `(n_gpt, nz[+2], nc)` with `per_gpt_axis=0`.
+      Replaces `cloud_path_liq` for the liquid phase.
+    cloud_path_ice_per_gpt: Same as above, for the ice water path.
+    aerosol_optics: Per-band aerosol `'optical_depth'`, `'ssa'` and
+      `'asymmetry_factor'`, each `(n_bnd, nz[+2], nc)`.
+    gpt_chunk: g-points per iteration of the spectral loop. With the TPU
+      kernels it is capped to fit `TPU_CHUNK_VMEM_BYTES` (see
+      `_column_minor_chunk_plan`, which also evens chunks out to multiples
+      of 8).
+    cloud_tau_scale_liq: Multiplier of the liquid cloud optical depth: a
+      scalar, `(nc,)` or `(nz[+2], nc)`.
+    cloud_tau_scale_ice: Same as above, for ice.
+    sfc_alb_dir: Direct-beam surface albedo: per column (a scalar or `(nc,)`)
+      or per band (`(n_bnd_sw, nc)`, or `(nc, n_bnd_sw)`). Defaults to
+      `atmos_state.sfc_alb`.
+    sfc_alb_dif: Same as above, for the diffuse albedo.
+    with_clear_sky: Also solve the cloud-free problem (`solve_sw`).
+    with_aerosol_free: Also solve the aerosol-free twin of every problem.
+    per_gpt_axis: The g-point axis of the per-g-point inputs, 1 (default,
+      `(nz, n_gpt, nc)`) or 0 (`(n_gpt, nz, nc)`).
+    cloud_mask_per_gpt: Optional boolean McICA masks, `(nz[+2], n_gpt, nc)`
+      (or `(n_gpt, nz[+2], nc)` with `per_gpt_axis=0`): the bulk cloud paths
+      are seen by a g-point only where its mask is set. Cannot be combined
+      with per-g-point cloud paths. One byte per (level, g-point, column)
+      instead of a float per phase.
+
+  Returns:
+    `(nz + 2, nc)` face fluxes [W/m^2], `flux_up`, `flux_down` and
+    `flux_net`: entry `k` is the bottom face of level `k`, so entry 1 is the
+    surface and entry `nz + 1` the top of the atmosphere; entry 0 (the face
+    below the bottom halo) is zero. The clear-sky and aerosol-free problems
+    under their prefixes, as `solve_lw` / `solve_sw`.
+    Also `flux_down_dir_sfc`, the direct beam at the surface, `(nc,)` (and its
+    prefixed twins).
+  """
+  nzh, nc = temperature.shape
+  nz = nzh - 2
+  dtype = temperature.dtype
+  lookup = optics_lib.gas_optics_sw
+  n_gpt = optics_lib.n_gpt_sw
+  n_bnd = lookup.n_bnd
+  chunk, n_chunks, needs_mask = _column_minor_chunk_plan(
+      n_gpt, gpt_chunk, nz, nc
+  )
+
+  vmr = None
+  if vmr_fields is not None:
+    vmr = {
+        k: _interior(v, nz) if jnp.ndim(v) else v
+        for k, v in _reindex_vmr_fields(vmr_fields, lookup).items()
+    }
+  # Nothing in the shortwave reads the halos: the gas optics of the interior.
+  gas = optics_lib.compute_gas_optics_all_gpts(
+      pressure[1:-1],
+      temperature[1:-1],
+      molecules[1:-1],
+      vmr,
+      is_lw=False,
+      z_leading_output=True,
+  )
+  tau_packed = _pack_chunks(gas['optical_depth'], 1, n_chunks, chunk)
+  rayleigh_packed = _pack_chunks(gas['rayleigh'], 1, n_chunks, chunk)
+  selector = _band_selector(
+      lookup.g_point_to_bnd, n_bnd, n_chunks, chunk, dtype
+  )
+  solar_fraction = jnp.asarray(optics_lib.solar_fraction_by_gpt, dtype=dtype)
+  pad = n_chunks * chunk - n_gpt
+  if pad:
+    solar_fraction = jnp.concatenate(
+        [solar_fraction, jnp.repeat(solar_fraction[-1:], pad)]
+    )
+  solar_fraction = solar_fraction.reshape(n_chunks, chunk, 1)
+  irrad = _per_column(atmos_state.irrad, nc, dtype)
+
+  # Night columns: see `solve_sw`. The solve is fed an overhead sun there and
+  # their fluxes are zeroed at the end.
+  zenith = atmos_state.zenith
+  if jnp.ndim(zenith) > 0:
+    zenith = jnp.broadcast_to(jnp.asarray(zenith, dtype=dtype), (nc,))
+  night = zenith >= 0.5 * jnp.pi
+  safe_zenith = jnp.where(
+      night, jnp.zeros_like(jnp.asarray(zenith, dtype=dtype)), zenith
+  )
+  mu = jnp.cos(safe_zenith)
+  if jnp.ndim(safe_zenith) > 0:
+    safe_zenith = safe_zenith.reshape(1, 1, nc)
+    mu = mu.reshape(1, nc)
+  mu_layer = mu[jnp.newaxis] if jnp.ndim(mu) else mu
+
+  def albedo_by_gpt(albedo, name):
+    """`albedo` (or `sfc_alb`) as a function of the chunk's band selector."""
+    if albedo is None:
+      albedo, name = atmos_state.sfc_alb, 'sfc_alb'
+    by_band = _sw_sfc_albedo_by_band_zc(albedo, nc, n_bnd, name, dtype)
+    if by_band is not None:
+      return lambda sel: _by_gpt(sel, by_band)
+    per_col = jnp.broadcast_to(_per_column(albedo, nc, dtype), (chunk, nc))
+    return lambda sel: per_col
+
+  sfc_albedo_dir = albedo_by_gpt(sfc_alb_dir, 'sfc_alb_dir')
+  sfc_albedo_dif = albedo_by_gpt(sfc_alb_dif, 'sfc_alb_dif')
+
+  has_cloud = any(
+      p is not None
+      for p in (
+          cloud_path_liq,
+          cloud_path_ice,
+          cloud_path_liq_per_gpt,
+          cloud_path_ice_per_gpt,
+      )
+  )
+  cloud = None
+  if has_cloud:
+    cloud = _CloudZc(
+        optics_lib, False, nz, nc, n_chunks, chunk, dtype,
+        r_eff_liq=cloud_r_eff_liq, path_liq=cloud_path_liq,
+        r_eff_ice=cloud_r_eff_ice, path_ice=cloud_path_ice,
+        path_liq_per_gpt=cloud_path_liq_per_gpt,
+        path_ice_per_gpt=cloud_path_ice_per_gpt,
+        mask_per_gpt=cloud_mask_per_gpt, per_gpt_axis=per_gpt_axis,
+        tau_scale_liq=cloud_tau_scale_liq, tau_scale_ice=cloud_tau_scale_ice,
+    )
+  aerosol = _aerosol_zc(aerosol_optics, nz)
+  zeros_chunk = jnp.zeros((chunk, nc), dtype=dtype)
+
+  def solve_chunk(ichunk, sel):
+    tau = jax.lax.dynamic_index_in_dim(tau_packed, ichunk, 0, keepdims=False)
+    rayleigh = jax.lax.dynamic_index_in_dim(
+        rayleigh_packed, ichunk, 0, keepdims=False
+    )
+    frac = jax.lax.dynamic_index_in_dim(
+        solar_fraction, ichunk, 0, keepdims=False
+    )
+    toa_flux = jnp.broadcast_to(irrad * frac, (chunk, nc))
+    flux_down_direct_toa = toa_flux * mu
+    albedo_dir = sfc_albedo_dir(sel)
+    albedo_dif = sfc_albedo_dif(sel)
+
+    gas_props = optics_lib._sw_gas_properties(tau, rayleigh)  # pylint: disable=protected-access
+    all_sky_props = gas_props
+    if cloud is not None:
+      all_sky_props = optics_lib.combine_optical_properties(
+          gas_props, cloud.chunk_props(ichunk, sel)
+      )
+    aer = (
+        None
+        if aerosol is None
+        else {k: _by_gpt(sel, v) for k, v in aerosol.items()}
+    )
+
+    def solve(props, aer_props):
+      if aer_props is not None:
+        props = optics_lib.combine_optical_properties(props, aer_props)
+      cell = monochromatic_two_stream.sw_cell_properties(
+          safe_zenith,
+          props['optical_depth'],
+          props['ssa'],
+          props['asymmetry_factor'],
+          cos_zenith=mu_layer,
+          return_t_noscat=True,
+      )
+      # The direct beam and the diffuse sources it feeds (`sw_cell_source`).
+      flux_sfc, flux_bottom, flux_top = monochromatic_two_stream.sw_direct_beam_zc(
+          cell['t_noscat'], flux_down_direct_toa
+      )
+      diffuse = monochromatic_two_stream.solve_rte_2stream_zc(
+          cell['t_diff'],
+          cell['r_diff'],
+          cell['r_dir'] * flux_top,
+          cell['t_dir'] * flux_top,
+          zeros_chunk,
+          albedo_dir * flux_sfc,
+          albedo_dif,
+      )
+      direct = jnp.concatenate(
+          [flux_bottom, flux_down_direct_toa[jnp.newaxis]], axis=0
+      )
+      flux_up = diffuse['flux_up']
+      flux_down = diffuse['flux_down'] + direct
+      return {
+          'flux_up': flux_up,
+          'flux_down': flux_down,
+          'flux_net': flux_up - flux_down,
+          'flux_down_dir_sfc': flux_sfc,
+      }
+
+    return _solve_problems(
+        solve,
+        all_sky_props,
+        gas_props if with_clear_sky else None,
+        aer,
+        with_clear_sky,
+        with_aerosol_free,
+    )
+
+  init = {}
+  for prefix in _problem_prefixes(with_clear_sky, with_aerosol_free):
+    for key in ('flux_up', 'flux_down', 'flux_net'):
+      init[f'{prefix}{key}'] = jnp.zeros((nz + 1, nc), dtype=dtype)
+    init[f'{prefix}flux_down_dir_sfc'] = jnp.zeros((nc,), dtype=dtype)
+  fluxes = _spectral_sum_zc(
+      solve_chunk, selector, n_gpt, n_chunks, chunk, needs_mask, init
+  )
+  zero_halo = jnp.zeros((1, nc), dtype=dtype)
+  out = {}
+  for key, val in fluxes.items():
+    if val.ndim == 2:
+      val = jnp.concatenate([zero_halo, val], axis=0)
+    out[key] = jnp.where(night, jnp.zeros_like(val), val)
+  return out
+
+
+
+def _solve_3d_via_zc(
+    solve_zc: Callable[..., dict[str, Array]],
+    pressure: Array,
+    temperature: Array,
+    molecules: Array,
+    optics_lib: optics.RRTMOptics,
+    atmos_state: AtmosphericState,
+    **kwargs,
+) -> dict[str, Array]:
+  """A 3D `(nx, ny, nz + 2)` solve by `solve_zc` on `(nz + 2, nx * ny)`.
+
+  The inputs are laid out column-minor, solved, and the outputs laid back
+  out: `solve_lw` / `solve_sw` route here (`_uses_column_minor`).
+
+  Args:
+    solve_zc: `solve_lw_zc` or `solve_sw_zc`.
+    pressure: `(nx, ny, nz + 2)`.
+    temperature: `(nx, ny, nz + 2)`.
+    molecules: `(nx, ny, nz + 2)`.
+    optics_lib: The `RRTMOptics` scheme.
+    atmos_state: The atmospheric state; non-scalar fields broadcast against
+      `(nx, ny)`.
+    **kwargs: The remaining arguments of `solve_zc`, in the layout of
+      `solve_lw` / `solve_sw`: 3D fields `(nx, ny, nz + 2)`, per-g-point
+      paths and per-band aerosol `(n, nx, ny, nz + 2)`, surface fields
+      broadcastable against `(nx, ny)` and per-band albedos `(n_bnd, nx, ny)`
+      (as `_sw_sfc_albedo_by_band` returns them).
+
+  Returns:
+    The fluxes of `solve_zc`, `(nx, ny, nz + 2)` (and `(nx, ny)` for
+    `flux_down_dir_sfc`).
+  """
+  nx, ny, nzh = temperature.shape
+  nc = nx * ny
+
+  def field(x):
+    if x is None or jnp.ndim(x) == 0:
+      return x
+    x = jnp.broadcast_to(x, (nx, ny, nzh))
+    return jnp.moveaxis(x, 2, 0).reshape(nzh, nc)
+
+  def leading(x):
+    """`(n, nx, ny, nzh)` -> `(n, nzh, nc)`."""
+    if x is None:
+      return None
+    return jnp.moveaxis(x, 3, 1).reshape(x.shape[0], nzh, nc)
+
+  def plane(x):
+    if x is None or jnp.ndim(x) == 0:
+      return x
+    return jnp.broadcast_to(jnp.asarray(x), (nx, ny)).reshape(nc)
+
+  state = {
+      name: plane(getattr(atmos_state, name))
+      for name in ('zenith', 'irrad', 'sfc_alb', 'sfc_emis', 'toa_flux_lw')
+      if jnp.ndim(getattr(atmos_state, name)) > 0
+  }
+  args = dict(kwargs)
+  for name in (
+      'cloud_r_eff_liq', 'cloud_path_liq', 'cloud_r_eff_ice', 'cloud_path_ice',
+      'cloud_tau_scale_liq', 'cloud_tau_scale_ice',
+  ):
+    args[name] = field(args.get(name))
+  for name in ('cloud_path_liq_per_gpt', 'cloud_path_ice_per_gpt'):
+    args[name] = leading(args.get(name))
+  if args.get('aerosol_optics') is not None:
+    args['aerosol_optics'] = {
+        k: leading(v) for k, v in args['aerosol_optics'].items()
+    }
+  if args.get('vmr_fields') is not None:
+    args['vmr_fields'] = {k: field(v) for k, v in args['vmr_fields'].items()}
+  if 'sfc_temperature' in args:
+    args['sfc_temperature'] = plane(args['sfc_temperature'])
+  for name in ('sfc_alb_dir', 'sfc_alb_dif'):
+    if name in args:
+      a = args[name]
+      args[name] = (
+          a.reshape(a.shape[0], nc) if jnp.ndim(a) == 3 else plane(a)
+      )
+  out = solve_zc(
+      field(pressure),
+      field(temperature),
+      field(molecules),
+      optics_lib,
+      dataclasses.replace(atmos_state, **state) if state else atmos_state,
+      per_gpt_axis=0,
+      **args,
+  )
+  return {
+      k: (
+          v.reshape(nx, ny)
+          if v.ndim == 1
+          else jnp.moveaxis(v.reshape(nzh, nx, ny), 0, 2)
+      )
+      for k, v in out.items()
+  }

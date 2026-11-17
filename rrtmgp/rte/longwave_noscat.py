@@ -54,6 +54,7 @@ from typing import TypeAlias
 import jax
 import jax.numpy as jnp
 import numpy as np
+from rrtmgp.rte import monochromatic_two_stream
 from rrtmgp.rte import rte_utils
 
 Array: TypeAlias = jax.Array
@@ -138,6 +139,35 @@ def lw_noscat_layer_sources(
   return trans, source_up, source_down
 
 
+def _layer_fluxes(
+    optical_depth: Array,
+    ssa: Array,
+    planck_src: Array,
+    planck_src_top: Array,
+    planck_src_bottom: Array,
+    secant: float | Array,
+    weight: float,
+) -> tuple[Array, Array, Array, float]:
+  """Each layer's transmittance and emitted fluxes, for either layout.
+
+  Returns:
+    The transmittance, the upward and the downward flux each layer emits (the
+    radiances of `lw_noscat_layer_sources` times `pi * weight`), and that
+    radiance-to-flux factor.
+  """
+  # Optical depth is physically non-negative, but halo cells can carry negative
+  # values (an artifact of forming molecular column amounts from
+  # finite-differenced halo pressures); `exp(-D tau)` of those overflows. The
+  # halos are stripped before the recurrences, so clamping changes nothing
+  # forward and keeps the cotangents finite.
+  tau_abs = jnp.maximum(optical_depth * (1.0 - ssa), 0.0)
+  trans, source_up, source_down = lw_noscat_layer_sources(
+      secant * tau_abs, planck_src, planck_src_top, planck_src_bottom
+  )
+  flux_scale = np.pi * weight
+  return trans, flux_scale * source_up, flux_scale * source_down, flux_scale
+
+
 def lw_noscat_transport(
     optical_depth: Array,
     ssa: Array,
@@ -207,18 +237,15 @@ def lw_noscat_transport(
     A dictionary of fluxes [W/m^2] at the cell faces, laid out like
     `monochromatic_two_stream.lw_transport`: 'flux_up', 'flux_down', 'flux_net'.
   """
-  # Optical depth is physically non-negative, but halo cells can carry negative
-  # values (an artifact of forming molecular column amounts from
-  # finite-differenced halo pressures); `exp(-D tau)` of those overflows. The
-  # halos are stripped before the recurrences, so clamping changes nothing
-  # forward and keeps the cotangents finite.
-  tau_abs = jnp.maximum(optical_depth * (1.0 - ssa), 0.0)
-  trans, source_up, source_down = lw_noscat_layer_sources(
-      secant * tau_abs, planck_src, planck_src_top, planck_src_bottom
+  trans, source_up, source_down, flux_scale = _layer_fluxes(
+      optical_depth,
+      ssa,
+      planck_src,
+      planck_src_top,
+      planck_src_bottom,
+      secant,
+      weight,
   )
-  flux_scale = np.pi * weight
-  source_up = flux_scale * source_up
-  source_down = flux_scale * source_down
 
   def flux_down_op(
       flux_down_from_above: Array, trans: Array, source_down: Array
@@ -272,3 +299,56 @@ def lw_noscat_transport(
       'flux_down': flux_down,
       'flux_net': flux_up - flux_down,
   }
+
+
+def lw_noscat_transport_zc(
+    optical_depth: Array,
+    ssa: Array,
+    planck_src: Array,
+    planck_src_top: Array,
+    planck_src_bottom: Array,
+    toa_flux_down: Array,
+    sfc_src: Array,
+    sfc_emissivity: Array,
+    secant: float | Array = LW_NOSCAT_DEFAULT_SECANT,
+    weight: float = LW_NOSCAT_DEFAULT_WEIGHT,
+) -> StatesMap:
+  """`lw_noscat_transport` in the column-minor layout.
+
+  The arrays are `(n_layers, ..., n_columns)`, interior layers only, and the
+  fluxes are returned on the `n_layers + 1` faces from the surface up (see
+  `monochromatic_two_stream.solve_rte_absorbing_zc`, whose two recurrences are
+  this solver's).
+
+  Args:
+    optical_depth: Layer optical depth of the combined properties.
+    ssa: Single-scattering albedo of the combined properties.
+    planck_src: Planck radiance at the layer centres [W/m^2/sr].
+    planck_src_top: Planck radiance at the top face of each layer.
+    planck_src_bottom: Planck radiance at the bottom face of each layer.
+    toa_flux_down: The downward flux at the top of the atmosphere [W/m^2].
+    sfc_src: The surface Planck radiance.
+    sfc_emissivity: The surface emissivity.
+    secant: Secant of the propagation angle.
+    weight: The quadrature weight of that angle.
+
+  Returns:
+    'flux_up', 'flux_down', 'flux_net' [W/m^2] on the faces.
+  """
+  trans, source_up, source_down, flux_scale = _layer_fluxes(
+      optical_depth,
+      ssa,
+      planck_src,
+      planck_src_top,
+      planck_src_bottom,
+      secant,
+      weight,
+  )
+  return monochromatic_two_stream.solve_rte_absorbing_zc(
+      trans,
+      source_up,
+      source_down,
+      toa_flux_down,
+      sfc_emissivity * flux_scale * sfc_src,
+      1.0 - sfc_emissivity,
+  )

@@ -1459,8 +1459,8 @@ class SharedAerosolFreeTest(unittest.TestCase):
     )
 
   @parameterized.expand([
-      (band, chunk, with_mcica, with_clear_sky, lw_solver, hoisted)
-      for band, (chunk, with_mcica, with_clear_sky, lw_solver, hoisted)
+      (band, chunk, with_mcica, with_clear_sky, lw_solver, hoisted, layout)
+      for band, (chunk, with_mcica, with_clear_sky, lw_solver, hoisted, layout)
       in product(
           ('lw', 'sw'),
           # Broadcast cloud paths alone; McICA sub-columns with the clear sky
@@ -1469,17 +1469,21 @@ class SharedAerosolFreeTest(unittest.TestCase):
           # the hoisted gas optics with scanned recurrences (the jax-gcm
           # production placement), with and without the clear sky, since the
           # `gas_all_gpts is not None` branches build the properties
-          # differently.
-          ((1, False, False, 'two_stream', False),
-           (4, True, True, 'two_stream', False),
-           (2, False, True, 'noscat', False),
-           (8, True, False, 'two_stream', True),
-           (8, False, True, 'two_stream', True)),
+          # differently. That placement is solved column-minor
+          # (`two_stream.solve_lw_zc`); `'level_minor'` forces the level-minor
+          # solve of it, so both solvers' sharing is tested.
+          ((1, False, False, 'two_stream', False, None),
+           (4, True, True, 'two_stream', False, None),
+           (2, False, True, 'noscat', False, None),
+           (8, True, False, 'two_stream', True, None),
+           (8, False, True, 'two_stream', True, None),
+           (8, True, True, 'two_stream', True, 'level_minor')),
       )
       if not (band == 'sw' and lw_solver == 'noscat')
   ])
   def test_matches_separate_solves(
-      self, band, chunk, with_mcica, with_clear_sky, lw_solver, hoisted
+      self, band, chunk, with_mcica, with_clear_sky, lw_solver, hoisted,
+      layout,
   ):
     kwargs, no_aerosol = self._inputs(band, with_mcica)
     extra = dict(gpt_chunk=chunk, with_clear_sky=with_clear_sky)
@@ -1487,10 +1491,13 @@ class SharedAerosolFreeTest(unittest.TestCase):
       extra.update(gas_optics_mode='all_gpts', use_scan=True)
     if band == 'lw':
       extra['lw_solver'] = lw_solver
-    shared = self._solve(band, with_aerosol_free=True, **extra, **kwargs)
+    with two_stream._column_minor(  # pylint: disable=protected-access
+        False if layout == 'level_minor' else None
+    ):
+      shared = self._solve(band, with_aerosol_free=True, **extra, **kwargs)
+      want_with = self._solve(band, **extra, **kwargs)
+      want_without = self._solve(band, **extra, **no_aerosol)
     with_aer, no_aer = two_stream.split_aerosol_free_fluxes(shared)
-    want_with = self._solve(band, **extra, **kwargs)
-    want_without = self._solve(band, **extra, **no_aerosol)
     self.assertEqual(set(with_aer), set(want_with))
     self.assertEqual(set(no_aer), set(want_without))
     if with_clear_sky:

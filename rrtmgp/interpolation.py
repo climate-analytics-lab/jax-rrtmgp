@@ -566,6 +566,25 @@ weno5_z_face_to_node = functools.partial(weno5_face_to_node, method='Z')
 
 
 ##### Below this, WENO5 interpolation special for RRTMGP #####
+def set_at(f: Array, dim: int, index: int, value: Array | float) -> Array:
+  """`f` with entry `index` along `dim` replaced by `value`.
+
+  `value` is a scalar or an array broadcastable against the slice of `f` with
+  `dim` kept (length 1). A `dynamic_update_slice` at a static offset: updated
+  in place like `.at[...].set(...)`, for any layout, but not lowered to a
+  scatter (outside `vmap`). A select or a concatenation instead copies the
+  array, which cost the level-minor solve 2% on a TPU v5e (it reconstructs
+  the face temperatures per g-point).
+  """
+  n = f.shape[dim]
+  shape = list(f.shape)
+  shape[dim] = 1
+  start = [0] * f.ndim
+  start[dim] = index % n
+  value = jnp.broadcast_to(jnp.asarray(value, dtype=f.dtype), shape)
+  return jax.lax.dynamic_update_slice(f, value, start)
+
+
 def _weno5_nonlinear_weights(
     f_node: Array, dim: Literal[0, 1, 2], wall_bc: bool
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
@@ -628,8 +647,8 @@ def _weno5_nonlinear_weights(
   # node.  So if the halo node value is ok, then this should be fine.
   hw = 1  # Assumed halo width of 1.
   if wall_bc:
-    alpha1_plus = alpha1_plus.at[:, :, hw + 1].set(0)
-    alpha1_minus = alpha1_minus.at[:, :, -hw - 1].set(0)
+    alpha1_plus = set_at(alpha1_plus, dim, hw + 1, 0.0)
+    alpha1_minus = set_at(alpha1_minus, dim, -hw - 1, 0.0)
 
   # Compute the nonlinear weights.
   w1_plus = alpha1_plus / (alpha1_plus + alpha2_plus + alpha3_plus)
@@ -699,10 +718,11 @@ def weno5_node_to_face_for_rrtmgp(
     JCP 126, 202-228 (1996).
 
   Args:
-    f_node: A 3D array, evaluated on nodes.
+    f_node: An array evaluated on nodes: 3D `(nx, ny, nz)` with `dim=2`, or
+      column-minor `(nz, n_columns)` with `dim=0`.
     dim: The dimension along with the interpolation is performed.
     f_lower_bc: If not None, this value is used as the boundary condition for f
-      on the lower face (the wall).  This should be a 2D array.
+      on the lower face (the wall): `f_node` without the `dim` axis.
     neumann_upper_bc: If True, then a Neumann BC is used for f on the upper
       face.
 
@@ -739,10 +759,17 @@ def weno5_node_to_face_for_rrtmgp(
   hw = 1  # Assumed halo width.
   if f_lower_bc is not None:
     # Assign value in the halo ...
-    f_face_plus = f_face_plus.at[:, :, 0].set(f_lower_bc)
-    f_face_minus = f_face_minus.at[:, :, 0].set(f_lower_bc)
+    bc = jnp.expand_dims(f_lower_bc, dim)
+    f_face_plus = set_at(f_face_plus, dim, 0, bc)
+    f_face_minus = set_at(f_face_minus, dim, 0, bc)
 
   if neumann_upper_bc:
-    f_face_minus = f_face_minus.at[:, :, -hw].set(f_node[:, :, -hw - 1])
+    n = f_node.shape[dim]
+    f_face_minus = set_at(
+        f_face_minus,
+        dim,
+        -hw,
+        jax.lax.slice_in_dim(f_node, n - hw - 1, n - hw, axis=dim),
+    )
 
   return f_face_plus, f_face_minus

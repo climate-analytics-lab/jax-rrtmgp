@@ -15,15 +15,18 @@
 """Utility library for common operations on the RRTMGP tables."""
 
 import collections
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+import contextlib
 import dataclasses
 import inspect
+import math
 import os
 import string
 from typing import Callable, TypeAlias
 
 import jax
 import jax.numpy as jnp
+from rrtmgp import backend
 
 Array: TypeAlias = jax.Array
 
@@ -34,11 +37,15 @@ Array: TypeAlias = jax.Array
 #              climate-analytics-lab/jax-rrtmgp#6: ~2.8x faster radiation at GCM
 #              resolution).
 #   "matmul" — one-hot vectors + einsum. Avoids the gather op, which is slow on
-#              TPU; uses the matrix-multiply unit instead. TPU users should
-#              select this via $RRTMGP_LOOKUP_IMPL=matmul or `set_lookup_impl`.
+#              TPU; uses the matrix-multiply unit instead. Select it via
+#              $RRTMGP_LOOKUP_IMPL=matmul or `set_lookup_impl`.
+# Unless a backend was chosen explicitly (either way), the TPU kernels (see
+# `rrtmgp.backend`) contract the 1D tables -- cloud Mie curves and the Planck
+# `totplnk` -- on the MXU in `interpolate`, whatever the default says.
 _LOOKUP_IMPL = os.environ.get("RRTMGP_LOOKUP_IMPL", "gather")
 if _LOOKUP_IMPL not in ("matmul", "gather"):
   _LOOKUP_IMPL = "gather"
+_LOOKUP_IMPL_EXPLICIT = "RRTMGP_LOOKUP_IMPL" in os.environ
 
 
 def set_lookup_impl(impl: str) -> None:
@@ -47,15 +54,39 @@ def set_lookup_impl(impl: str) -> None:
   Must be set before the gas-optics functions are traced/compiled; changing it
   afterwards has no effect on already-compiled functions.
   """
-  global _LOOKUP_IMPL
+  global _LOOKUP_IMPL, _LOOKUP_IMPL_EXPLICIT
   if impl not in ("matmul", "gather"):
     raise ValueError(f"impl must be 'matmul' or 'gather', got {impl!r}")
   _LOOKUP_IMPL = impl
+  _LOOKUP_IMPL_EXPLICIT = True
 
 
 def get_lookup_impl() -> str:
   """Return the active table-lookup backend ('matmul' or 'gather')."""
   return _LOOKUP_IMPL
+
+
+@contextlib.contextmanager
+def lookup_impl(impl: str) -> Iterator[None]:
+  """`set_lookup_impl(impl)` inside the block; the prior selection after it.
+
+  Restores whether the backend had been chosen explicitly as well as which one
+  it was, so the block leaves the TPU 1D-table default (see `interpolate`) as
+  it found it.
+
+  Args:
+    impl: The table-lookup backend to select inside the block.
+
+  Yields:
+    Nothing; the selection is active until the block exits.
+  """
+  global _LOOKUP_IMPL, _LOOKUP_IMPL_EXPLICIT
+  prev = (_LOOKUP_IMPL, _LOOKUP_IMPL_EXPLICIT)
+  try:
+    set_lookup_impl(impl)
+    yield
+  finally:
+    _LOOKUP_IMPL, _LOOKUP_IMPL_EXPLICIT = prev
 
 
 @dataclasses.dataclass
@@ -242,7 +273,7 @@ def floor_idx(f: Array, reference_values: Array) -> Array:
   delta = reference_values[1] - reference_values[0]
   size = reference_values.shape[0]
   truncated_div = jnp.floor_divide(f - reference_values[0], delta)
-  truncated_div = truncated_div.astype(jnp.int_)
+  truncated_div = truncated_div.astype(int)
   return jnp.clip(truncated_div, 0, size - 1)
 
 
@@ -297,7 +328,7 @@ def _interval_idx(f: Array, reference_values: Array) -> Array:
   delta = reference_values[1] - reference_values[0]
   size = reference_values.shape[0]
   truncated_div = jnp.floor_divide(f - reference_values[0], delta)
-  truncated_div = truncated_div.astype(jnp.int_)
+  truncated_div = truncated_div.astype(int)
   return jnp.clip(truncated_div, 0, size - 2)
 
 
@@ -505,6 +536,67 @@ def interpolate_optimized(
   return weighted_sum
 
 
+# Size of the one-hot weights above which `interpolate_rows_1d`, with the TPU
+# kernels, contracts a 2D cell array one leading-axis slice at a time instead
+# of all of it at once.
+_TPU_ONE_HOT_BLOCK_BYTES = 16 * 1024 * 1024
+
+
+def interpolate_rows_1d(table: Array, interp: Interpolant) -> Array:
+  """Linear interpolation of every row of a `(n_rows, n_nodes)` table.
+
+  Each row is a 1D table on the nodes `interp` was built against, and each is
+  interpolated as `interpolate` interpolates a 1D table, all rows in one pass:
+  a row gather on CPU/GPU, and with the TPU kernels (`rrtmgp.backend`) a
+  contraction of the table with the cells' one-hot interpolation weights at
+  `Precision.HIGHEST`, the cells on the minor axis. A 2D cell array whose
+  one-hot weights would exceed `_TPU_ONE_HOT_BLOCK_BYTES` is contracted a
+  leading-axis slice (a level of a column-minor array) at a time.
+
+  Args:
+    table: `(n_rows, n_nodes)`.
+    interp: The cells' interpolant on the `n_nodes` nodes.
+
+  Returns:
+    `(n_rows, *cell_shape)`.
+  """
+  lo, hi = interp.interp_low, interp.interp_high
+  cell_shape = lo.idx.shape
+  n_rows, n_nodes = table.shape
+  n_cells = math.prod(cell_shape)
+  if not backend.use_tpu_kernels():
+    rows = table.T
+    out = rows[lo.idx.reshape(n_cells)] * lo.weight.reshape(n_cells, 1) + (
+        rows[hi.idx.reshape(n_cells)] * hi.weight.reshape(n_cells, 1)
+    )
+    return out.T.reshape(n_rows, *cell_shape)
+
+  def contract(idx_lo: Array, w_lo: Array, w_hi: Array) -> Array:
+    # The weights are a sum of two one-hots, which XLA fuses into the matmul's
+    # operand. The equivalent one-hot of `idx_lo` padded onto both nodes
+    # (`gas_optics._spread`) does not fuse here, and the level-minor solve,
+    # which calls this per g-point, measured 54% slower with it on a TPU v5e.
+    m = idx_lo.shape[0]
+    weights = w_lo.reshape(1, m) * jax.nn.one_hot(
+        idx_lo, n_nodes, dtype=table.dtype, axis=0
+    ) + w_hi.reshape(1, m) * jax.nn.one_hot(
+        idx_lo + 1, n_nodes, dtype=table.dtype, axis=0
+    )
+    return jnp.matmul(table, weights, precision=jax.lax.Precision.HIGHEST)
+
+  one_hot_bytes = n_nodes * n_cells * table.dtype.itemsize
+  if len(cell_shape) == 2 and one_hot_bytes > _TPU_ONE_HOT_BLOCK_BYTES:
+    out = jax.lax.map(
+        lambda args: contract(*args), (lo.idx, lo.weight, hi.weight)
+    )
+    return jnp.swapaxes(out, 0, 1)
+  return contract(
+      lo.idx.reshape(n_cells),
+      lo.weight.reshape(n_cells),
+      hi.weight.reshape(n_cells),
+  ).reshape(n_rows, *cell_shape)
+
+
 def interpolate(
     coeffs: Array,
     interpolant_fns: collections.OrderedDict[str, Callable[..., Interpolant]],
@@ -556,6 +648,17 @@ def interpolate(
     indices replaced by the interpolated coefficients.
   """
   if _LOOKUP_IMPL == "gather":
+    if (
+        backend.use_tpu_kernels()
+        and coeffs.ndim == 1
+        and len(interpolant_fns) == 1
+        and not _LOOKUP_IMPL_EXPLICIT
+    ):
+      # A 1D table (a cloud Mie curve, the Planck `totplnk`) is a single
+      # contraction on the TPU matrix unit, with no gather.
+      interp = next(iter(interpolant_fns.values()))()
+      if isinstance(interp, Interpolant):
+        return interpolate_rows_1d(coeffs[jnp.newaxis], interp)[0]
     # interpolate_orig routes through evaluate_weighted_lookup, which honours
     # the direct-indexing gather backend selected above.
     return interpolate_orig(coeffs, interpolant_fns)

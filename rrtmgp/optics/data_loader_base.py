@@ -86,9 +86,9 @@ def parse_nc_file(
       # datatype to arrays anyway, so skip these data types.
       continue
     if np.issubdtype(val.dtype, np.floating):
-      dtype = jnp.float_
+      dtype = float
     elif np.issubdtype(val.dtype, np.integer):
-      dtype = jnp.int_
+      dtype = int
     else:
       raise ValueError(f'Unexpected dtype: {val.dtype}')
     array_dict[key] = jnp.array(val, dtype=dtype)

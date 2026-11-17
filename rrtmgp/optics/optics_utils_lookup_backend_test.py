@@ -21,19 +21,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from rrtmgp import backend
 from rrtmgp.optics import optics_utils
 
 
 def _both(fn):
   """Run `fn` under each lookup backend, restoring the prior selection."""
-  prev = optics_utils.get_lookup_impl()
-  try:
-    optics_utils.set_lookup_impl("matmul")
+  with optics_utils.lookup_impl("matmul"):
     out_mm = fn()
-    optics_utils.set_lookup_impl("gather")
+  with optics_utils.lookup_impl("gather"):
     out_ga = fn()
-  finally:
-    optics_utils.set_lookup_impl(prev)
   return out_mm, out_ga
 
 
@@ -131,6 +128,33 @@ class LookupBackendEquivalenceTest(unittest.TestCase):
     g_mm, g_ga = _both(lambda: jax.grad(loss)(self.table3))
     np.testing.assert_allclose(np.asarray(g_mm), np.asarray(g_ga), rtol=1e-4,
                                atol=1e-4)
+
+
+class TpuOneDimensionalTableTest(unittest.TestCase):
+  """The TPU kernels contract 1D tables on the MXU unless told otherwise."""
+
+  def _program(self):
+    ref = jnp.linspace(160.0, 355.0, 14)
+    table = jnp.linspace(1.0, 2.0, 14)
+
+    def fn(t):
+      interp = optics_utils.create_linear_interpolant(t, ref)
+      return optics_utils.interpolate(
+          table, collections.OrderedDict({"t": lambda: interp})
+      )
+
+    with backend.tpu_kernels(True):
+      return jax.jit(fn).lower(jnp.full((4, 8), 250.0)).as_text()
+
+  def test_default_is_a_contraction(self):
+    self.assertEqual(self._program().count("stablehlo.gather"), 0)
+
+  def test_an_explicit_choice_is_respected(self):
+    # `set_lookup_impl("gather")` is an explicit choice, as the environment
+    # variable is, and keeps the gather.
+    with optics_utils.lookup_impl("gather"):
+      self.assertGreater(self._program().count("stablehlo.gather"), 0)
+    self.assertEqual(self._program().count("stablehlo.gather"), 0)
 
 
 if __name__ == "__main__":

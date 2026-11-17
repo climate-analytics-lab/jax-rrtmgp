@@ -16,11 +16,13 @@
 
 from typing import TypeAlias
 
-import unittest
+import collections
 from pathlib import Path
+import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from rrtmgp import backend
 from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import gas_optics
 from rrtmgp.optics import lookup_gas_optics_longwave
@@ -564,6 +566,226 @@ class GasOpticsTest(unittest.TestCase):
       self.assertTrue(np.all(np.isfinite(grad_p)), str(path))
       outside = (t_grid < 160.0) | (t_grid > 355.0)
       np.testing.assert_array_equal(np.asarray(grad_t)[outside], 0.0)
+
+  def test_mxu_relative_abundance_matches_the_gather_form(self):
+    """The TPU mixing-fraction interpolant equals the gather one."""
+    shape = (2, 3, 6)
+    n = int(np.prod(shape))
+    temp = jnp.linspace(190.0, 305.0, n, dtype=jnp.float32).reshape(shape)
+    pres = jnp.geomspace(1.0e5, 50.0, n, dtype=jnp.float32).reshape(shape)
+    for lookup in (self.gas_optics_lw, self.gas_optics_sw):
+      vmr_fields = {
+          lookup.idx_h2o: jnp.full(shape, 3.0e-3, dtype=jnp.float32),
+          lookup.idx_o3: jnp.full(shape, 1.5e-6, dtype=jnp.float32),
+      }
+      interp = gas_optics.CellInterpolation(
+          lookup, self.vmr_lib, temp, pres, vmr_fields
+      )
+      # A static species index reads the same mixing ratio as a traced one,
+      # for an overridden and for a global-mean species.
+      for sp in (lookup.idx_h2o, lookup.idx_o3, 0, 2):
+        np.testing.assert_allclose(
+            jnp.broadcast_to(
+                gas_optics.get_vmr(lookup, self.vmr_lib, int(sp), vmr_fields),
+                shape,
+            ),
+            jnp.broadcast_to(
+                gas_optics.get_vmr(
+                    lookup, self.vmr_lib, jnp.asarray(sp, jnp.int32),
+                    vmr_fields,
+                ),
+                shape,
+            ),
+            rtol=1e-6,
+        )
+      for ibnd in (0, 3):
+        for t_side in ('high', 'low'):
+          mxu, combined_vmr = interp.mix_mxu(ibnd, t_side)
+          for scale_by_mixture in (False, True):
+            ref = interp.mix(ibnd, t_side, scale_by_mixture)
+            factor = combined_vmr if scale_by_mixture else 1.0
+            np.testing.assert_array_equal(
+                mxu.interp_low.idx, ref.interp_low.idx
+            )
+            for side in ('interp_low', 'interp_high'):
+              np.testing.assert_allclose(
+                  getattr(mxu, side).weight * factor,
+                  getattr(ref, side).weight,
+                  rtol=1e-6,
+                  atol=1e-7 * np.max(np.abs(factor)),
+              )
+
+  def test_mxu_1d_interpolation_matches_the_gather_form(self):
+    lw = self.gas_optics_lw
+    shape = (3, 37, 45)
+    n = int(np.prod(shape))
+    # Includes temperatures beyond both ends of the Planck table.
+    temp = jnp.linspace(120.0, 380.0, n, dtype=jnp.float32).reshape(shape)
+    interp = optics_utils.create_linear_interpolant(temp, lw.t_planck)
+    fns = collections.OrderedDict({'t': lambda: interp})
+    want = optics_utils.interpolate_orig(lw.totplnk[0], fns)
+    with backend.tpu_kernels(True):
+      got = optics_utils.interpolate(lw.totplnk[0], fns)
+      # Every band's row at once, and a column-minor array big enough to be
+      # contracted a level at a time.
+      rows = optics_utils.interpolate_rows_1d(lw.totplnk, interp)
+      temp_zc = jnp.linspace(150.0, 340.0, 49 * 9216).reshape(49, 9216)
+      interp_zc = optics_utils.create_linear_interpolant(temp_zc, lw.t_planck)
+      rows_zc = optics_utils.interpolate_rows_1d(lw.totplnk[:2], interp_zc)
+    rows_zc_want = optics_utils.interpolate_rows_1d(lw.totplnk[:2], interp_zc)
+    np.testing.assert_allclose(rows_zc, rows_zc_want, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        rows[0],
+        want,
+        # Beyond the table the two weights have opposite signs and partly
+        # cancel, which costs a few ulp.
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        got,
+        want,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+  def _all_gpts_reference(self, lookup, is_lw, molecules, temperature, p, vmr):
+    tau = gas_optics.compute_optical_depth_all_gpts(
+        lookup, self.vmr_lib, molecules, temperature, p, vmr
+    )
+    if is_lw:
+      other = gas_optics.compute_planck_fraction_all_gpts(
+          lookup, self.vmr_lib, p, temperature, vmr
+      )
+    else:
+      other = gas_optics.compute_rayleigh_optical_depth_all_gpts(
+          lookup, self.vmr_lib, molecules, temperature, p, vmr
+      )
+    return tau, other
+
+  def test_all_gpts_mxu_matches_the_gather_form(self):
+    """The TPU all-g-point gas optics equal the gather form, on every path.
+
+    The level-at-a-time pressure window, a level spanning more of the
+    pressure table than the window (which reads the whole table), and the
+    multi-block solve of cells that are not `(n_levels, n_columns)`; with the
+    pressure varying across each level's columns, temperatures beyond both
+    ends of the table, and both output layouts.
+    """
+    rng = np.random.default_rng(0)
+    nz, nc = 12, 16
+    # Hybrid-sigma-like: each level's pressure varies by up to ~2.4x across
+    # its columns, which a 10-node window still covers.
+    p_top = jnp.geomspace(1.0e5, 50.0, nz, dtype=jnp.float32)[:, None]
+    sigma = jnp.linspace(0.45, 1.05, nc, dtype=jnp.float32)[None, :]
+    p_win = p_top * (1.0 + (sigma - 1.0) * p_top / 1.0e5)
+    t_win = jnp.asarray(
+        np.linspace(295.0, 210.0, nz)[:, None]
+        + rng.uniform(-8.0, 8.0, (nz, nc)),
+        jnp.float32,
+    )
+    # Beyond both ends of the temperature table (160-355 K).
+    t_win = t_win.at[0, :3].set(jnp.asarray([360.0, 375.0, 150.0]))
+    # One level spanning the whole pressure table: the window cannot hold it.
+    p_wide = p_win.at[5].set(jnp.geomspace(1.0e5, 2.0, nc, dtype=jnp.float32))
+    # 4995 cells in three dimensions: solved in two blocks of cells.
+    shape_3d = (3, 37, 45)
+    n_3d = int(np.prod(shape_3d))
+    p_3d = jnp.geomspace(1.0e5, 80.0, n_3d, dtype=jnp.float32).reshape(
+        shape_3d
+    )
+    t_3d = jnp.linspace(195.0, 300.0, n_3d, dtype=jnp.float32).reshape(
+        shape_3d
+    )
+    cases = {
+        'window': (p_win, t_win),
+        'fallback': (p_wide, t_win),
+        'blocks': (p_3d, t_3d),
+    }
+    for name, (p, t) in cases.items():
+      mol = jnp.full(p.shape, 1.0e24, dtype=jnp.float32)
+      for lookup, is_lw in (
+          (self.gas_optics_lw, True),
+          (self.gas_optics_sw, False),
+      ):
+        vmr = {
+            lookup.idx_h2o: jnp.asarray(
+                rng.uniform(1e-4, 1e-2, p.shape), jnp.float32
+            ),
+            lookup.idx_o3: jnp.full(p.shape, 1.5e-6, dtype=jnp.float32),
+        }
+        want = self._all_gpts_reference(lookup, is_lw, mol, t, p, vmr)
+        for z_leading in (False, True) if p.ndim == 2 else (False,):
+          with self.subTest(case=name, is_lw=is_lw, z_leading=z_leading):
+            got = gas_optics.compute_all_gpts_mxu(
+                lookup, self.vmr_lib, mol, t, p, vmr,
+                is_lw=is_lw, z_leading_output=z_leading,
+            )
+            if z_leading:
+              got = [jnp.swapaxes(g, 0, 1) for g in got]
+            for g, w in zip(got, want):
+              np.testing.assert_allclose(g, w, rtol=2e-5, atol=1e-12)
+
+  def test_all_gpts_mxu_gradients_match_the_gather_form(self):
+    nz, nc = 8, 16
+    p_top = jnp.geomspace(9.0e4, 100.0, nz, dtype=jnp.float32)[:, None]
+    sigma = jnp.linspace(0.6, 1.05, nc, dtype=jnp.float32)[None, :]
+    p = p_top * (1.0 + (sigma - 1.0) * p_top / 1.0e5)
+    t = jnp.asarray(
+        np.linspace(290.0, 215.0, nz)[:, None]
+        + np.linspace(-5.0, 5.0, nc)[None, :],
+        jnp.float32,
+    )
+    h2o = jnp.full((nz, nc), 3.0e-3, dtype=jnp.float32)
+    mol = jnp.full((nz, nc), 1.0e24, dtype=jnp.float32)
+    lw, sw = self.gas_optics_lw, self.gas_optics_sw
+    weights = jnp.asarray(
+        np.random.default_rng(1).uniform(size=(lw.kmajor.shape[-1], nz, nc)),
+        jnp.float32,
+    )
+
+    def loss(fn, t, p, h2o):
+      tau, pf = fn(lw, True, t, p, {lw.idx_h2o: h2o})
+      tau_sw, rayl = fn(sw, False, t, p, {sw.idx_h2o: h2o})
+      return (
+          jnp.sum(weights * jnp.log1p(tau)) + jnp.sum(weights * pf)
+          + jnp.sum(jnp.log1p(tau_sw)) + 1e3 * jnp.sum(rayl)
+      )
+
+    def mxu(lookup, is_lw, t, p, vmr):
+      return gas_optics.compute_all_gpts_mxu(
+          lookup, self.vmr_lib, mol, t, p, vmr, is_lw=is_lw
+      )
+
+    def ref(lookup, is_lw, t, p, vmr):
+      return self._all_gpts_reference(lookup, is_lw, mol, t, p, vmr)
+
+    got = jax.grad(lambda *a: loss(mxu, *a), argnums=(0, 1, 2))(t, p, h2o)
+    want = jax.grad(lambda *a: loss(ref, *a), argnums=(0, 1, 2))(t, p, h2o)
+    for g, w in zip(got, want):
+      self.assertTrue(bool(jnp.all(jnp.isfinite(g))))
+      np.testing.assert_allclose(
+          g, w, rtol=1e-3, atol=1e-4 * float(jnp.max(jnp.abs(w)))
+      )
+
+  def test_all_gpts_mxu_program_has_no_gather_or_scatter(self):
+    nz, nc = 6, 8
+    p = jnp.broadcast_to(
+        jnp.geomspace(1.0e5, 50.0, nz, dtype=jnp.float32)[:, None], (nz, nc)
+    )
+    t = jnp.full((nz, nc), 250.0, dtype=jnp.float32)
+    mol = jnp.full((nz, nc), 1.0e24, dtype=jnp.float32)
+    for lookup, is_lw in ((self.gas_optics_lw, True), (self.gas_optics_sw, False)):
+      text = jax.jit(
+          lambda t, p, h2o, lookup=lookup, is_lw=is_lw: (
+              gas_optics.compute_all_gpts_mxu(
+                  lookup, self.vmr_lib, mol, t, p, {lookup.idx_h2o: h2o},
+                  is_lw=is_lw, z_leading_output=True,
+              )
+          )
+      ).lower(t, p, jnp.full_like(t, 3e-3)).as_text()
+      self.assertEqual(text.count('stablehlo.gather'), 0)
+      self.assertEqual(text.count('stablehlo.scatter'), 0)
 
 if __name__ == '__main__':
   unittest.main()

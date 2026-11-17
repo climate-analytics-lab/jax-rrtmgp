@@ -277,6 +277,59 @@ class TwoStreamFloat32PrecisionTest(unittest.TestCase):
       for grad in grads:
         self.assertTrue(bool(jnp.isfinite(grad).all()), fn.__name__)
 
+  def test_lw_pure_absorption_cell_matches_general_and_float128(self):
+    """`lw_pure_absorption_two_stream_cell` matches `ssa = 0` reference & AD."""
+    tau = jnp.asarray(self.tau, jnp.float32)
+    s_bot = jnp.asarray(self.s_bottom, jnp.float32)
+    s_top = jnp.asarray(self.s_top, jnp.float32)
+    zeros = jnp.zeros_like(tau)
+
+    pure = monochromatic_two_stream.lw_pure_absorption_two_stream_cell(
+        tau, s_bot, s_top
+    )
+    gen = monochromatic_two_stream.lw_cell_source_and_properties(
+        tau, zeros, s_bot, s_top, zeros
+    )
+    ref = _lw_ref(
+        self.tau.astype(_Q),
+        np.zeros_like(self.tau, dtype=_Q),
+        self.s_bottom.astype(_Q),
+        self.s_top.astype(_Q),
+        np.zeros_like(self.tau, dtype=_Q),
+    )
+    for key, bound in (
+        ('t_diff', 1e-4),
+        ('src_up', 5e-4),
+        ('src_down', 5e-4),
+    ):
+      err = _max_rel(pure[key], ref[key])
+      self.assertLess(err, bound, f'{key}: float32 max rel error {err:.3e}')
+      np.testing.assert_allclose(pure[key], gen[key], rtol=5e-6, atol=1e-6)
+
+    zero_cell = monochromatic_two_stream.lw_pure_absorption_two_stream_cell(
+        jnp.zeros((1,), jnp.float32),
+        jnp.array([20.0], jnp.float32),
+        jnp.array([19.0], jnp.float32),
+    )
+    self.assertEqual(float(zero_cell['t_diff'][0]), 1.0)
+    self.assertEqual(float(zero_cell['src_up'][0]), 0.0)
+    self.assertEqual(float(zero_cell['src_down'][0]), 0.0)
+
+    tau_deg = jnp.array([0.0, 1e-8, 1e-4, 0.5, 100.0], jnp.float32)
+    sb_deg = jnp.full_like(tau_deg, 20.0)
+    st_deg = jnp.full_like(tau_deg, 19.0)
+    grads = jax.grad(
+        lambda t, b, u: sum(
+            jnp.sum(v)
+            for v in monochromatic_two_stream.lw_pure_absorption_two_stream_cell(
+                t, b, u
+            ).values()
+        ),
+        argnums=(0, 1, 2),
+    )(tau_deg, sb_deg, st_deg)
+    for grad in grads:
+      self.assertTrue(bool(jnp.isfinite(grad).all()))
+
 
 if __name__ == '__main__':
   unittest.main()

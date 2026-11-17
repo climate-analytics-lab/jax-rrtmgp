@@ -83,7 +83,7 @@ def from_config(
         'p_ref' in vmr_sounding
     ), f'Missing p_ref column in sounding file {vmr_sounding_filepath}'
     profiles = {
-        key: jnp.array(values, dtype=jnp.float_)
+        key: jnp.array(values, dtype=float)
         for key, values in vmr_sounding.items()
     }
 

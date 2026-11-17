@@ -21,45 +21,43 @@ from typing import TypeAlias
 import jax
 import jax.numpy as jnp
 from rrtmgp import interpolation
-from rrtmgp import kernel_ops
 
 Array: TypeAlias = jax.Array
 
 
-def _shift_up(f: Array) -> Array:
-  """output_i = f_{i-1}."""
-  return kernel_ops.shift_from_minus(f, 2)
-
-
-def _shift_down(f: Array) -> Array:
-  """output_i = f_{i+1}."""
-  return kernel_ops.shift_from_plus(f, 2)
-
-
-def reconstruct_face_values(f: Array, f_lower_bc: Array) -> tuple[Array, Array]:
+def reconstruct_face_values(
+    f: Array, f_lower_bc: Array, axis: int = 2
+) -> tuple[Array, Array]:
   """Reconstruct the face values using a high-order scheme.
 
-  This function performs an interpolation from nodes to faces.
+  This function performs an interpolation from nodes to faces (WENO5-JS, the
+  average of its left- and right-biased reconstructions), with the lower
+  halo set to the wall value `f_lower_bc` and a Neumann condition at the top.
 
   Args:
-    f: The cell-center values that will be interpolated.
-    f_lower_bc: The boundary condition for f on the lower face (wall).
+    f: The cell-center values that will be interpolated, with a halo cell at
+      each end of `axis`: `(nx, ny, nz)` with `axis=2`, or column-minor
+      `(nz, n_columns)` with `axis=0`.
+    f_lower_bc: The boundary condition for f on the lower face (wall): `f`
+      without the `axis` axis.
+    axis: The vertical axis of `f`.
 
   Returns:
     A tuple with the reconstructed temperature at the bottom and top face,
     respectively.
   """
-  # f is f_ccc.
-  # Use WENO5.
-
+  # Use WENO5. The halos are set in place (`interpolation.set_at`), in either
+  # layout.
+  n = f.shape[axis]
   # Set halo value to the BC wall value.
-  f = f.at[:, :, 0].set(f_lower_bc)
-
+  f = interpolation.set_at(f, axis, 0, jnp.expand_dims(f_lower_bc, axis))
   # Enforce Neumann BC on the upper halo value.
-  f = f.at[:, :, -1].set(f[:, :, -2])
+  f = interpolation.set_at(
+      f, axis, -1, jax.lax.slice_in_dim(f, n - 2, n - 1, axis=axis)
+  )
 
   f_face_plus, f_face_minus = interpolation.weno5_node_to_face_for_rrtmgp(
-      f, dim=2, f_lower_bc=f_lower_bc, neumann_upper_bc=True
+      f, dim=axis, f_lower_bc=f_lower_bc, neumann_upper_bc=True
   )
   # To get the final interpolation, just take the average of the plus and
   # minus reconstructions.
@@ -68,10 +66,16 @@ def reconstruct_face_values(f: Array, f_lower_bc: Array) -> tuple[Array, Array]:
   # Use centered interpolation: UNSTABLE.
   # f_bottom_ccf = interpolation.z_c_to_f(f)
 
-  f_top = _shift_down(f_bottom_ccf)
-  # Update the f_top face (wall) value.
+  # The top face of each cell is the bottom face of the next. The top face of
+  # the top halo (the wall) repeats the face below it.
   # Look into what is the appropriate BC here.
-  f_top = f_top.at[:, :, -1].set(f_top[:, :, -2])
+  f_top = jnp.concatenate(
+      [
+          jax.lax.slice_in_dim(f_bottom_ccf, 1, n, axis=axis),
+          jax.lax.slice_in_dim(f_bottom_ccf, n - 1, n, axis=axis),
+      ],
+      axis=axis,
+  )
   return f_bottom_ccf, f_top
 
 

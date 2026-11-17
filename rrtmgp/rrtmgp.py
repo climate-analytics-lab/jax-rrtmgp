@@ -44,11 +44,13 @@ def _humidity_to_volume_mixing_ratio(
   return mol_ratio * mix_ratio
 
 
-def _air_molecules_per_area(p_xxc: Array, vmr_h2o_xxc: Array) -> Array:
+def _air_molecules_per_area(
+    p_xxc: Array, vmr_h2o_xxc: Array, axis: int = 2
+) -> Array:
   """Compute the number of molecules in a grid cell per area."""
   # centered_difference returns p[k+1] - p[k-1], which spans two layers; the
   # thickness of the layer centered on k is half of it.
-  dp_xxc = 0.5 * kernel_ops.centered_difference(p_xxc, dim=2)
+  dp_xxc = 0.5 * kernel_ops.centered_difference(p_xxc, dim=axis)
   mol_m_air_xxc = (
       constants.DRY_AIR_MOL_MASS + constants.WATER_MOL_MASS * vmr_h2o_xxc
   )
@@ -67,19 +69,46 @@ def _compute_cloud_path(
   return rho * q_c * h
 
 
-def _horiz_mean(f: Array) -> Array:
-  """Compute the horizontal mean of `f`.
+def _horiz_mean(f: Array, axis: int = 2) -> Array:
+  """Compute the horizontal mean of `f`, whose vertical axis is `axis`.
 
-  Accumulate means in float64 to avoid potential numerical issues when
-  accumulating, but then convert back to float32.
+  Accumulate means in float64 (when x64 is enabled) to avoid potential
+  numerical issues when accumulating, but then convert back to float32.
 
   Args:
     f: The array to compute the horizontal mean of.
+    axis: Its vertical axis; the mean is over every other axis.
 
   Returns:
     The horizontal mean of `f`.
   """
-  return jnp.mean(f, axis=(0, 1), dtype=jnp.float64).astype(jnp.float32)
+  acc_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+  horizontal = tuple(a for a in range(f.ndim) if a != axis % f.ndim)
+  return jnp.mean(f, axis=horizontal, dtype=acc_dtype).astype(jnp.float32)
+
+
+def _level(f: Array, k: int, axis: int) -> Array:
+  """Level `k` of `f` along its vertical axis `axis` (a static slice)."""
+  return f[(slice(None),) * axis + (k,)]
+
+
+def _from_level(f: Array, k: int, axis: int) -> Array:
+  """Levels `k:` of `f` along its vertical axis `axis`."""
+  return f[(slice(None),) * axis + (slice(k, None),)]
+
+
+def _fill_halo(f: Array, axis: int) -> Array:
+  """`f` with each halo level linearly extrapolated from the two inside it."""
+  n = f.shape[axis]
+  take = lambda k: jax.lax.slice_in_dim(f, k, k + 1, axis=axis)
+  return jnp.concatenate(
+      [
+          2 * take(1) - take(2),
+          jax.lax.slice_in_dim(f, 1, n - 1, axis=axis),
+          2 * take(n - 2) - take(n - 3),
+      ],
+      axis=axis,
+  )
 
 
 class RRTMGP:
@@ -121,8 +150,8 @@ class RRTMGP:
       p_ref_xxc: Array,
       sg_map: dict[str, Array],
       use_scan: bool = False,
-      zenith: float | None = None,
-      irrad: float | None = None,
+      zenith: float | Array | None = None,
+      irrad: float | Array | None = None,
       cloud_path_liq_lw_per_gpt: Array | None = None,
       cloud_path_ice_lw_per_gpt: Array | None = None,
       cloud_path_liq_sw_per_gpt: Array | None = None,
@@ -272,39 +301,14 @@ class RRTMGP:
       the `*_clearsky_2d_xy` / `*_clearsky_1d_z` diagnostics listed in
       `diagnostic_fields`.
     """
-    atm_state = self.atmospheric_state
-    if (
-        zenith is not None
-        or irrad is not None
-        or sfc_alb is not None
-        or sfc_emis is not None
-    ):
-      # Per-call overrides of the configured atmospheric-state scalars.
-      # `sfc_alb` / `sfc_emis` may be traced per-column values (e.g. from a
-      # host model's surface scheme under vmap); the solvers broadcast them
-      # against the horizontal plane, so anything broadcastable against the
-      # `[nx, ny]` surface works.
-      atm_state = dataclasses.replace(
-          atm_state,
-          **({"zenith": zenith} if zenith is not None else {}),
-          **({"irrad": irrad} if irrad is not None else {}),
-          **({"sfc_alb": sfc_alb} if sfc_alb is not None else {}),
-          **({"sfc_emis": sfc_emis} if sfc_emis is not None else {}),
-      )
+    atm_state = self._atmospheric_state(zenith, irrad, sfc_alb, sfc_emis)
 
     # Temperature may have NaNs in the halos (this is intentional).  These NaNs
     # cause problems later on, so fill in the halo values with linear
     # extrapolations.  Note that NaNs in other fields do not cause issues
     # because halos are discarded later on, but there are places where the halos
     # of the temperature are used to determine interior values.
-    def fill_halo(f: Array) -> Array:
-      bottom_halo_val = 2 * f[:, :, 1] - f[:, :, 2]
-      top_halo_val = 2 * f[:, :, -2] - f[:, :, -3]
-      f = f.at[:, :, 0].set(bottom_halo_val)
-      f = f.at[:, :, -1].set(top_halo_val)
-      return f
-
-    temperature = fill_halo(temperature)
+    temperature = _fill_halo(temperature, axis=2)
 
     # Sometimes, the simulation can result in q_t or q_c with negative values.
     # Clip these to zero, otherwise there can be extremely deleterious effects
@@ -322,16 +326,7 @@ class RRTMGP:
     # CO2/CH4/N2O forcing, etc. Finally, h2o is always set from the simulation
     # humidity state so it stays consistent with q_t/q_c (any caller h2o entry
     # is intentionally clobbered).
-    vmr_lib = atm_state.vmr
-    merged_vmr_fields = (
-        lookup_volume_mixing_ratio.reconstruct_vmr_fields_from_pressure(
-            vmr_lib, p_ref_xxc
-        )
-    )
-    if vmr_fields is not None:
-      merged_vmr_fields.update(vmr_fields)
-    merged_vmr_fields['h2o'] = _humidity_to_volume_mixing_ratio(q_t, q_c)
-    vmr_fields = merged_vmr_fields
+    vmr_fields = self._vmr_fields(atm_state, p_ref_xxc, vmr_fields, q_t, q_c)
 
     # Compute molecules
     molecules_per_area = _air_molecules_per_area(p_ref_xxc, vmr_fields['h2o'])
@@ -396,6 +391,88 @@ class RRTMGP:
           gas_optics_mode=gas_optics_mode,
           with_aerosol_free=with_aerosol_free,
       )
+    return self._outputs(
+        lw_fluxes, sw_fluxes, p_ref_xxc, q_t - q_c, with_clear_sky,
+        with_aerosol_free, axis=2,
+    )
+
+  def _atmospheric_state(
+      self,
+      zenith: float | Array | None,
+      irrad: float | Array | None,
+      sfc_alb: float | Array | None,
+      sfc_emis: float | Array | None,
+  ) -> atmospheric_state.AtmosphericState:
+    """The configured atmospheric state with this call's overrides."""
+    overrides = {
+        name: value
+        for name, value in (
+            ('zenith', zenith),
+            ('irrad', irrad),
+            ('sfc_alb', sfc_alb),
+            ('sfc_emis', sfc_emis),
+        )
+        if value is not None
+    }
+    # Per-call overrides of the configured atmospheric-state scalars.
+    # `sfc_alb` / `sfc_emis` may be traced per-column values (e.g. from a host
+    # model's surface scheme under vmap); the solvers broadcast them against
+    # the horizontal plane.
+    if not overrides:
+      return self.atmospheric_state
+    return dataclasses.replace(self.atmospheric_state, **overrides)
+
+  def _vmr_fields(
+      self,
+      atm_state: atmospheric_state.AtmosphericState,
+      p: Array,
+      vmr_fields: dict[str, Array] | None,
+      q_t: Array,
+      q_c: Array,
+  ) -> dict[str, Array]:
+    """The volume mixing ratios of the solve.
+
+    Reconstruct the volume mixing ratio (vmr) of relevant gas species from
+    the sounding-based lookup. Then apply any caller-supplied per-cell
+    overrides on top; this is how upstream models inject ozone climatologies,
+    CO2/CH4/N2O forcing, etc. Finally, h2o is always set from the simulation
+    humidity state so it stays consistent with q_t/q_c (any caller h2o entry
+    is intentionally clobbered).
+    """
+    merged = lookup_volume_mixing_ratio.reconstruct_vmr_fields_from_pressure(
+        atm_state.vmr, p
+    )
+    if vmr_fields is not None:
+      merged.update(vmr_fields)
+    merged['h2o'] = _humidity_to_volume_mixing_ratio(q_t, q_c)
+    return merged
+
+  def _outputs(
+      self,
+      lw_fluxes: dict[str, Array],
+      sw_fluxes: dict[str, Array],
+      p: Array,
+      q_v: Array,
+      with_clear_sky: bool,
+      with_aerosol_free: bool,
+      axis: int,
+  ) -> dict[str, Array]:
+    """The heating rates, flux profiles and diagnostics of a solve.
+
+    Args:
+      lw_fluxes: The longwave fluxes, with any extra problems under their
+        prefixes.
+      sw_fluxes: Same as above, for the shortwave.
+      p: The pressure [Pa].
+      q_v: The water vapor specific humidity [kg/kg].
+      with_clear_sky: Whether the fluxes include the clear-sky problems.
+      with_aerosol_free: Whether they include the aerosol-free twins.
+      axis: The vertical axis of the fields (2 for `(nx, ny, nz)`, 0 for
+        column-minor `(nz, nc)`).
+
+    Returns:
+      The output dictionary of `compute_heating_rate`.
+    """
     # Take the extra problems apart: the aerosol-free twins first (they may
     # still hold `clear_` entries), then the clear sky of each half. `extra`
     # maps an output tag to its (lw, sw) flux dictionaries.
@@ -417,72 +494,14 @@ class RRTMGP:
       )
       extra['clearsky'] = (lw_fluxes_clearsky, sw_fluxes_clearsky)
 
-    # Compute the heating rate in K/s.
-    q_v = q_t - q_c
-    lw_heating_rate = two_stream.compute_heating_rate(
-        lw_fluxes['flux_net'], p_ref_xxc, q_v
-    )
-    sw_heating_rate = two_stream.compute_heating_rate(
-        sw_fluxes['flux_net'], p_ref_xxc, q_v
-    )
-    # Compute the total heating rate (temperature tendency due to radiation).
-    heating_rate = lw_heating_rate + sw_heating_rate
-
-    output = {rrtmgp_common.KEY_STORED_RADIATION: heating_rate}
-
-    # add LW, SW heating rate or fluxes if desired.
-    if self._save_lw_sw_heating_rates:
-      output['rad_heat_sw_3d'] = sw_heating_rate
-      output['rad_heat_lw_3d'] = lw_heating_rate
-
-    # Compute diagnostics, if desired.
-    lw_flux_down = lw_fluxes['flux_down']
-    lw_flux_up = lw_fluxes['flux_up']
-    sw_flux_down = sw_fluxes['flux_down']
-    sw_flux_up = sw_fluxes['flux_up']
-    hw = 1  # halo width.
-
-    # Add full flux profiles (remove surface halos)
-    output['sw_flux_up_full'] = sw_flux_up[:, :, hw:]  # Full profile (..., nlev+1)
-    output['sw_flux_down_full'] = sw_flux_down[:, :, hw:]  # Full profile (..., nlev+1)
-    output['lw_flux_up_full'] = lw_flux_up[:, :, hw:]  # Full profile (..., nlev+1)
-    output['lw_flux_down_full'] = lw_flux_down[:, :, hw:]  # Full profile (..., nlev+1)
-    # Direct beam at the surface, for the host's direct / diffuse partition.
-    output['sw_flux_down_dir_sfc'] = sw_fluxes['flux_down_dir_sfc']
-
-    # 2D diagnostics
-    if (v := 'surf_lw_flux_down_2d_xy') in self._diagnostic_fields:
-      output[v] = lw_flux_down[:, :, hw]
-    if (v := 'surf_lw_flux_up_2d_xy') in self._diagnostic_fields:
-      output[v] = lw_flux_up[:, :, hw]
-    if (v := 'surf_sw_flux_down_2d_xy') in self._diagnostic_fields:
-      output[v] = sw_flux_down[:, :, hw]
-    if (v:= 'surf_sw_flux_up_2d_xy') in self._diagnostic_fields:
-      output[v] = sw_flux_up[:, :, hw]
-    if (v := 'surf_sw_flux_down_dir_2d_xy') in self._diagnostic_fields:
-      output[v] = sw_fluxes['flux_down_dir_sfc']
-    # Add clear sky surf
-
-    if (v := 'toa_sw_flux_incoming_2d_xy') in self._diagnostic_fields:
-      output[v] = sw_flux_down[:, :, -hw]
-    if (v := 'toa_sw_flux_outgoing_2d_xy') in self._diagnostic_fields:
-      output[v] = sw_flux_up[:, :, -hw]
-    if (v := 'toa_lw_flux_outgoing_2d_xy') in self._diagnostic_fields:
-      output[v] = lw_flux_up[:, :, -hw]
-    # Add clear sky toa
-
-    # 1D diagnostics
-    if (v := 'rad_heat_lw_1d_z') in self._diagnostic_fields:
-      output[v] = _horiz_mean(lw_heating_rate)
-    if (v := 'rad_heat_sw_1d_z') in self._diagnostic_fields:
-      output[v] = _horiz_mean(sw_heating_rate)
-
+    output = {}
+    # The all-sky problem has no tag; its heating rate is the stored one.
+    self._add_tagged_outputs(output, '', lw_fluxes, sw_fluxes, p, q_v, axis)
     # The extra problems (clear sky, aerosol-free, aerosol-free clear sky):
     # the same profiles and diagnostics as the all-sky ones, each key tagged
     # with the problem's name. The fluxes were solved above.
     for tag, (lw_extra, sw_extra) in extra.items():
-      self._add_tagged_outputs(output, tag, lw_extra, sw_extra, p_ref_xxc, q_v)
-
+      self._add_tagged_outputs(output, tag, lw_extra, sw_extra, p, q_v, axis)
     return output
 
   def _add_tagged_outputs(
@@ -491,59 +510,219 @@ class RRTMGP:
       tag: str,
       lw_fluxes: dict[str, Array],
       sw_fluxes: dict[str, Array],
-      p_ref_xxc: Array,
+      p: Array,
       q_v: Array,
+      axis: int = 2,
   ) -> None:
-    """Adds one extra problem's profiles and diagnostics to `output`.
+    """Adds one problem's heating rates, profiles and diagnostics to `output`.
 
-    `tag` is `'clearsky'`, `'aerosolfree'` or `'aerosolfree_clearsky'`; each
-    all-sky key gets the tag before its `_full` / `_sfc` / `_2d_xy` / `_1d_z`
-    / `_3d` suffix (`sw_flux_up_clearsky_full`, ...). The 2D and 1D
-    diagnostics are added when their tagged name is in `diagnostic_fields`;
-    the heating rates when `save_lw_sw_heating_rates` is set.
+    `tag` is `''` for the all-sky problem, whose total heating rate is the
+    stored radiation, or `'clearsky'`, `'aerosolfree'` or
+    `'aerosolfree_clearsky'`; each other key gets the tag before its `_full` /
+    `_sfc` / `_2d_xy` / `_1d_z` / `_3d` suffix (`sw_flux_up_clearsky_full`,
+    ...). The 2D and 1D diagnostics are added when their tagged name is in
+    `diagnostic_fields`; the LW / SW heating rates when
+    `save_lw_sw_heating_rates` is set. `axis` is the vertical axis of the
+    fields: the "2D" diagnostics are a level of them, `(nx, ny)` or `(nc,)`.
     """
     hw = 1  # halo width.
+    t = f'_{tag}' if tag else ''
     lw_heating_rate = two_stream.compute_heating_rate(
-        lw_fluxes['flux_net'], p_ref_xxc, q_v
+        lw_fluxes['flux_net'], p, q_v, axis=axis
     )
     sw_heating_rate = two_stream.compute_heating_rate(
-        sw_fluxes['flux_net'], p_ref_xxc, q_v
+        sw_fluxes['flux_net'], p, q_v, axis=axis
     )
+    if not tag:
+      # Compute the total heating rate (temperature tendency due to radiation).
+      output[rrtmgp_common.KEY_STORED_RADIATION] = (
+          lw_heating_rate + sw_heating_rate
+      )
     if self._save_lw_sw_heating_rates:
-      output[f'rad_heat_sw_{tag}_3d'] = sw_heating_rate
-      output[f'rad_heat_lw_{tag}_3d'] = lw_heating_rate
+      output[f'rad_heat_sw{t}_3d'] = sw_heating_rate
+      output[f'rad_heat_lw{t}_3d'] = lw_heating_rate
 
     lw_flux_down = lw_fluxes['flux_down']
     lw_flux_up = lw_fluxes['flux_up']
     sw_flux_down = sw_fluxes['flux_down']
     sw_flux_up = sw_fluxes['flux_up']
 
-    # Full flux profiles (surface halo removed), shaped (..., nlev+1).
-    output[f'sw_flux_up_{tag}_full'] = sw_flux_up[:, :, hw:]
-    output[f'sw_flux_down_{tag}_full'] = sw_flux_down[:, :, hw:]
-    output[f'lw_flux_up_{tag}_full'] = lw_flux_up[:, :, hw:]
-    output[f'lw_flux_down_{tag}_full'] = lw_flux_down[:, :, hw:]
-    output[f'sw_flux_down_dir_{tag}_sfc'] = sw_fluxes['flux_down_dir_sfc']
+    # Full flux profiles (surface halo removed), nlev + 1 faces.
+    output[f'sw_flux_up{t}_full'] = _from_level(sw_flux_up, hw, axis)
+    output[f'sw_flux_down{t}_full'] = _from_level(sw_flux_down, hw, axis)
+    output[f'lw_flux_up{t}_full'] = _from_level(lw_flux_up, hw, axis)
+    output[f'lw_flux_down{t}_full'] = _from_level(lw_flux_down, hw, axis)
+    # Direct beam at the surface, for the host's direct / diffuse partition.
+    output[f'sw_flux_down_dir{t}_sfc'] = sw_fluxes['flux_down_dir_sfc']
 
     df = self._diagnostic_fields
-    # 2D diagnostics
-    if (v := f'surf_lw_flux_down_{tag}_2d_xy') in df:
-      output[v] = lw_flux_down[:, :, hw]
-    if (v := f'surf_lw_flux_up_{tag}_2d_xy') in df:
-      output[v] = lw_flux_up[:, :, hw]
-    if (v := f'surf_sw_flux_down_{tag}_2d_xy') in df:
-      output[v] = sw_flux_down[:, :, hw]
-    if (v := f'surf_sw_flux_up_{tag}_2d_xy') in df:
-      output[v] = sw_flux_up[:, :, hw]
-    if (v := f'surf_sw_flux_down_dir_{tag}_2d_xy') in df:
+    # 2D diagnostics: the surface and the top of the atmosphere.
+    for name, flux, k in (
+        ('surf_lw_flux_down', lw_flux_down, hw),
+        ('surf_lw_flux_up', lw_flux_up, hw),
+        ('surf_sw_flux_down', sw_flux_down, hw),
+        ('surf_sw_flux_up', sw_flux_up, hw),
+        ('toa_sw_flux_incoming', sw_flux_down, -hw),
+        ('toa_sw_flux_outgoing', sw_flux_up, -hw),
+        ('toa_lw_flux_outgoing', lw_flux_up, -hw),
+    ):
+      if (v := f'{name}{t}_2d_xy') in df:
+        output[v] = _level(flux, k, axis)
+    if (v := f'surf_sw_flux_down_dir{t}_2d_xy') in df:
       output[v] = sw_fluxes['flux_down_dir_sfc']
-    if (v := f'toa_sw_flux_outgoing_{tag}_2d_xy') in df:
-      output[v] = sw_flux_up[:, :, -hw]
-    if (v := f'toa_lw_flux_outgoing_{tag}_2d_xy') in df:
-      output[v] = lw_flux_up[:, :, -hw]
 
     # 1D diagnostics
-    if (v := f'rad_heat_lw_{tag}_1d_z') in df:
-      output[v] = _horiz_mean(lw_heating_rate)
-    if (v := f'rad_heat_sw_{tag}_1d_z') in df:
-      output[v] = _horiz_mean(sw_heating_rate)
+    if (v := f'rad_heat_lw{t}_1d_z') in df:
+      output[v] = _horiz_mean(lw_heating_rate, axis)
+    if (v := f'rad_heat_sw{t}_1d_z') in df:
+      output[v] = _horiz_mean(sw_heating_rate, axis)
+
+  def compute_heating_rate_zc(
+      self,
+      q_t: Array,
+      cloud_r_eff_liq: Array | None,
+      cloud_r_eff_ice: Array | None,
+      temperature: Array,
+      sfc_temperature: Array | float,
+      p_ref_zc: Array,
+      *,
+      rho_zc: Array | None = None,
+      q_liq: Array | None = None,
+      q_ice: Array | None = None,
+      q_c: Array | None = None,
+      dz_zc: float | Array | None = None,
+      zenith: float | Array | None = None,
+      irrad: float | Array | None = None,
+      cloud_path_liq: Array | None = None,
+      cloud_path_ice: Array | None = None,
+      cloud_path_liq_lw_per_gpt: Array | None = None,
+      cloud_path_ice_lw_per_gpt: Array | None = None,
+      cloud_path_liq_sw_per_gpt: Array | None = None,
+      cloud_path_ice_sw_per_gpt: Array | None = None,
+      cloud_mask_lw_per_gpt: Array | None = None,
+      cloud_mask_sw_per_gpt: Array | None = None,
+      vmr_fields: dict[str, Array] | None = None,
+      aerosol_optics_lw: dict[str, Array] | None = None,
+      aerosol_optics_sw: dict[str, Array] | None = None,
+      sfc_alb: float | Array | None = None,
+      sfc_emis: float | Array | None = None,
+      gpt_chunk: int = 64,
+      cloud_tau_scale_liq: float | Array | None = None,
+      cloud_tau_scale_ice: float | Array | None = None,
+      sfc_alb_dir: float | Array | None = None,
+      sfc_alb_dif: float | Array | None = None,
+      clear_sky_fluxes: bool = False,
+      lw_solver: str = two_stream.LW_SOLVER_TWO_STREAM,
+      lw_secant: float = longwave_noscat.LW_NOSCAT_DEFAULT_SECANT,
+      aerosol_free_fluxes: bool = False,
+      per_gpt_axis: int = 1,
+  ) -> dict[str, Array]:
+    """`compute_heating_rate` for a column-minor `(nz + 2, nc)` atmosphere.
+
+    The same physics and outputs, for profiles laid out with the levels
+    leading and the columns minor, which is how a host model that keeps its
+    columns contiguous holds them: nothing is transposed to a column-leading
+    layout, and the solve is the column-minor one on every backend
+    (`two_stream.solve_lw_zc`, which also documents the layout and the
+    measured costs). The gas optics are always hoisted out of the spectral loop
+    and the recurrences always scanned; `gpt_chunk` g-points are solved per
+    iteration (capped to fit vector memory with the TPU kernels, see
+    `two_stream.TPU_CHUNK_VMEM_BYTES`).
+
+    Inputs, with `nz` interior levels, `nc` columns and a halo level at each
+    end of a `(nz + 2, nc)` profile:
+
+      * `q_t`, `temperature`, `p_ref_zc`, `q_c` (and `rho_zc`, `q_liq`,
+        `q_ice`, `dz_zc` when the cloud paths are derived from them): `(nz +
+        2, nc)`. The temperature halos are re-filled by linear extrapolation,
+        as in `compute_heating_rate`.
+      * `cloud_r_eff_{liq,ice}` [m], `cloud_path_{liq,ice}` [kg/m^2]:
+        `(nz, nc)` or `(nz + 2, nc)`. Given cloud paths take precedence over
+        `rho_zc * q_{liq,ice} * dz_zc`.
+      * `cloud_path_{liq,ice}_{lw,sw}_per_gpt`: McICA paths, `(nz[+2], n_gpt,
+        nc)`, or `(n_gpt, nz[+2], nc)` with `per_gpt_axis=0`.
+      * `cloud_mask_{lw,sw}_per_gpt`: boolean McICA masks of the bulk paths,
+        in the same layout, as an alternative to per-g-point paths (one byte
+        per entry rather than four floats; see `two_stream.solve_lw_zc`).
+      * `aerosol_optics_{lw,sw}`: `(n_bnd, nz[+2], nc)` per key.
+      * `vmr_fields`: `(nz + 2, nc)` per gas.
+      * `zenith`, `irrad`, `sfc_alb`, `sfc_emis`, `sfc_temperature`: scalars
+        or `(nc,)`; `sfc_alb_{dir,dif}`: those, or per band `(n_bnd_sw, nc)`.
+      * `cloud_tau_scale_{liq,ice}`: a scalar, `(nc,)` or `(nz[+2], nc)`.
+
+    Returns:
+      The outputs of `compute_heating_rate`, column-minor: heating rates
+      `(nz + 2, nc)`, flux profiles `(nz + 1, nc)` from the surface up, and
+      surface / top-of-atmosphere diagnostics `(nc,)`.
+    """
+    assert isinstance(self.optics_lib, optics.RRTMOptics), (
+        'compute_heating_rate_zc requires the RRTMOptics scheme.'
+    )
+    axis = 0
+    atm_state = self._atmospheric_state(zenith, irrad, sfc_alb, sfc_emis)
+    temperature = _fill_halo(temperature, axis)
+    # See `compute_heating_rate` for the clipping.
+    q_t = jnp.clip(q_t, 0.0, None)
+    q_c = jnp.zeros_like(q_t) if q_c is None else jnp.clip(q_c, 0.0, None)
+    vmr_fields = self._vmr_fields(atm_state, p_ref_zc, vmr_fields, q_t, q_c)
+    molecules_per_area = _air_molecules_per_area(
+        p_ref_zc, vmr_fields['h2o'], axis
+    )
+    with_clear_sky = self._do_clear_sky or clear_sky_fluxes
+    with_aerosol_free = aerosol_free_fluxes
+
+    h = self._dz if dz_zc is None else dz_zc
+    if cloud_path_liq is None and q_liq is not None and rho_zc is not None:
+      cloud_path_liq = rho_zc * jnp.clip(q_liq, 0.0, None) * h
+    if cloud_path_ice is None and q_ice is not None and rho_zc is not None:
+      cloud_path_ice = rho_zc * jnp.clip(q_ice, 0.0, None) * h
+
+    common = dict(
+        cloud_r_eff_liq=cloud_r_eff_liq,
+        cloud_path_liq=cloud_path_liq,
+        cloud_r_eff_ice=cloud_r_eff_ice,
+        cloud_path_ice=cloud_path_ice,
+        gpt_chunk=gpt_chunk,
+        cloud_tau_scale_liq=cloud_tau_scale_liq,
+        cloud_tau_scale_ice=cloud_tau_scale_ice,
+        with_clear_sky=with_clear_sky,
+        with_aerosol_free=with_aerosol_free,
+        per_gpt_axis=per_gpt_axis,
+    )
+    with jax.named_scope('lw'):
+      lw_fluxes = two_stream.solve_lw_zc(
+          p_ref_zc,
+          temperature,
+          molecules_per_area,
+          self.optics_lib,
+          atm_state,
+          vmr_fields,
+          sfc_temperature,
+          cloud_path_liq_per_gpt=cloud_path_liq_lw_per_gpt,
+          cloud_path_ice_per_gpt=cloud_path_ice_lw_per_gpt,
+          aerosol_optics=aerosol_optics_lw,
+          lw_solver=lw_solver,
+          lw_secant=lw_secant,
+          cloud_mask_per_gpt=cloud_mask_lw_per_gpt,
+          **common,
+      )
+    with jax.named_scope('sw'):
+      sw_fluxes = two_stream.solve_sw_zc(
+          p_ref_zc,
+          temperature,
+          molecules_per_area,
+          self.optics_lib,
+          atm_state,
+          vmr_fields,
+          cloud_path_liq_per_gpt=cloud_path_liq_sw_per_gpt,
+          cloud_path_ice_per_gpt=cloud_path_ice_sw_per_gpt,
+          aerosol_optics=aerosol_optics_sw,
+          sfc_alb_dir=sfc_alb_dir,
+          sfc_alb_dif=sfc_alb_dif,
+          cloud_mask_per_gpt=cloud_mask_sw_per_gpt,
+          **common,
+      )
+    return self._outputs(
+        lw_fluxes, sw_fluxes, p_ref_zc, q_t - q_c, with_clear_sky,
+        with_aerosol_free, axis,
+    )

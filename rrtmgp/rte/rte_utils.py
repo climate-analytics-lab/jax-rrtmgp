@@ -19,6 +19,7 @@ from typing import Any, Callable, TypeAlias
 
 import jax
 import jax.numpy as jnp
+from rrtmgp import backend
 
 Array: TypeAlias = jax.Array
 
@@ -232,10 +233,12 @@ def recurrent_op_with_halos(
 ) -> tuple[Array, Array]:
   """Compute sequence of recurrent operations, accounting for halos in z.
 
-  The result is always returned through an `optimization_barrier` (see the end
-  of the function). `fence_chain` additionally fences the unrolled chain inside
-  `recurrent_op` before the halo pad is applied; see `recurrent_op` for why and
-  for when it pays. It has no effect with `use_scan`.
+  The result is returned through an `optimization_barrier` (see the end of the
+  function), except with the TPU kernels and `use_scan`, where the scan is a
+  loop of its own and there is no update chain to keep out of its consumers.
+  `fence_chain` additionally fences the unrolled chain inside `recurrent_op`
+  before the halo pad is applied; see `recurrent_op` for why and for when it
+  pays. It has no effect with `use_scan`.
 
   Args:
     f: The recurrent operation to apply.
@@ -261,6 +264,21 @@ def recurrent_op_with_halos(
   else:
     carry, output = recurrent_op(f, init, inputs, forward, fence_chain)
 
+  if backend.use_tpu_kernels():
+    # Restore halo layers via concatenation rather than `.at[...].set(...)`,
+    # which lowers to scatters (serial on a TPU), in every layout and under
+    # `vmap`. On CPU/GPU the indexed update is kept: there it is part of the
+    # in-place update chain the barrier below is about.
+    zeros_halo = jnp.zeros_like(init)[..., jnp.newaxis]
+    init_halo = init[..., jnp.newaxis]
+    if forward:
+      output = jnp.concatenate([init_halo, output, zeros_halo], axis=-1)
+    else:
+      output = jnp.concatenate([zeros_halo, output, init_halo], axis=-1)
+    if use_scan:
+      return carry, output
+    return jax.lax.optimization_barrier((carry, output))
+
   # Step 3. Pad result with halo layers that were removed so the output shape
   # matches the input shape. The values in the halos are set to be zero.
   output = jnp.pad(
@@ -284,3 +302,76 @@ def recurrent_op_with_halos(
   # re-evaluated per output element and its cost grows with its depth. The
   # barrier makes the result opaque to fusion without changing any value.
   return jax.lax.optimization_barrier((carry, output))
+
+
+def scan_levels(
+    f: Callable[[Any, Any], tuple[Any, Any]],
+    init: Any,
+    xs: Any,
+    *,
+    reverse: bool = False,
+    vacuum: Any = None,
+    block: int = 8,
+) -> tuple[Any, Any]:
+  """`jax.lax.scan` of a vertical recurrence over column-minor arrays.
+
+  The column-minor counterpart of `recurrent_op_with_halos`: every leaf of
+  `xs` has the levels on its leading axis (and no halo), and the recurrence
+  runs over them from the first level up (`reverse=False`) or from the last
+  level down.
+
+  With the TPU kernels (`rrtmgp.backend`) and a `vacuum` given, the scan takes
+  `block` levels per step, unrolled inside the step body, which amortises the
+  per-step cost of a TPU loop over that many levels. The levels are padded to a
+  multiple of `block` past the last one with `vacuum`: per-leaf values of `xs`
+  for which `f` is the identity on its carry (a transparent, non-emitting,
+  non-reflecting layer). Whichever way the scan runs, the padding then leaves
+  the carry through the real levels unchanged, and its outputs are dropped.
+
+  Args:
+    f: `(carry, x) -> (carry, y)`, the recurrence at one level.
+    init: The initial carry.
+    xs: Pytree of `(n_levels, ...)` arrays.
+    reverse: Run from the last level to the first.
+    vacuum: Pytree like `xs` of scalars that make `f` an identity on the
+      carry, or `None` to always scan a level per step.
+    block: Levels per scan step on the TPU.
+
+  Returns:
+    The final carry and the stacked per-level outputs, as `jax.lax.scan`.
+  """
+  n = jax.tree.leaves(xs)[0].shape[0]
+  if (
+      not backend.use_tpu_kernels()
+      or vacuum is None
+      or block <= 1
+      or n < 2 * block
+  ):
+    return jax.lax.scan(f, init, xs, reverse=reverse)
+
+  pad = (-n) % block
+  if pad:
+    xs = jax.tree.map(
+        lambda a, v: jnp.pad(
+            a,
+            ((0, pad),) + ((0, 0),) * (a.ndim - 1),
+            constant_values=jnp.asarray(v, dtype=a.dtype),
+        ),
+        xs,
+        vacuum,
+    )
+  n_padded = n + pad
+  xs = jax.tree.map(
+      lambda a: a.reshape(n_padded // block, block, *a.shape[1:]), xs
+  )
+  order = range(block - 1, -1, -1) if reverse else range(block)
+
+  def step(carry, x_block):
+    ys = [None] * block
+    for k in order:
+      carry, ys[k] = f(carry, jax.tree.map(lambda a, k=k: a[k], x_block))
+    return carry, jax.tree.map(lambda *y: jnp.stack(y, axis=0), *ys)
+
+  carry, ys = jax.lax.scan(step, init, xs, reverse=reverse)
+  ys = jax.tree.map(lambda a: a.reshape(n_padded, *a.shape[2:])[:n], ys)
+  return carry, ys

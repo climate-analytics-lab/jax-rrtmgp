@@ -393,12 +393,8 @@ def _expected_1d(x, ref, table, mode):
 
 
 def _with_lookup_impl(impl, fn):
-  prev = optics_utils.get_lookup_impl()
-  try:
-    optics_utils.set_lookup_impl(impl)
+  with optics_utils.lookup_impl(impl):
     return fn()
-  finally:
-    optics_utils.set_lookup_impl(prev)
 
 
 class OutOfRangeTest(unittest.TestCase):

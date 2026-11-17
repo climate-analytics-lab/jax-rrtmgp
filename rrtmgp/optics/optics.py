@@ -21,6 +21,7 @@ import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
+from rrtmgp import backend
 from rrtmgp import kernel_ops
 from rrtmgp.config import radiative_transfer
 from rrtmgp.optics import cloud_optics
@@ -477,6 +478,7 @@ class RRTMOptics(optics_base.OpticsScheme):
       vmr_fields: dict[int, Array] | None = None,
       *,
       is_lw: bool,
+      z_leading_output: bool = False,
   ) -> dict[str, Array]:
     """Gas optics of every g-point of the spectrum, in one pass.
 
@@ -490,17 +492,27 @@ class RRTMOptics(optics_base.OpticsScheme):
     axis; see `gas_optics.compute_optical_depth_all_gpts`. The values equal the
     per-g-point ones.
 
+    With the TPU kernels (`rrtmgp.backend`) the tables are read by
+    contractions on the matrix unit instead (`gas_optics.compute_all_gpts_mxu`),
+    with the same values to float32 rounding. Those are evaluated a level at a
+    time, so a `(nx, ny, nz)` atmosphere is first laid out as
+    `(nz, nx * ny)`, levels leading.
+
     The arrays are `n_gpt` times the size of a field: at T63L47 about 460 MB
     for each longwave array and 400 MB for each shortwave array.
 
     Args:
       pressure: The pressure field [Pa].
-      temperature: The temperature [K].
+      temperature: The temperature [K]. Any cell shape: `(nx, ny, nz)`, or the
+        column-minor `(nz, n_columns)` of `two_stream.solve_lw_zc`.
       molecules: The number of molecules in an atmospheric grid cell per area
         [molecules / m^2].
       vmr_fields: An optional dictionary containing precomputed volume mixing
         ratio fields, keyed by gas index, that will overwrite the global means.
       is_lw: `True` for the longwave problem, `False` for the shortwave one.
+      z_leading_output: For column-minor `(nz, n_columns)` cells, return each
+        array as `(nz, n_gpt, n_columns)` rather than `(n_gpt, nz,
+        n_columns)`.
 
     Returns:
       Longwave: `{'optical_depth', 'planck_fraction'}`. Shortwave:
@@ -509,6 +521,45 @@ class RRTMOptics(optics_base.OpticsScheme):
       forms the Rayleigh sum itself.
     """
     lookup = self.gas_optics_lw if is_lw else self.gas_optics_sw
+    second = 'planck_fraction' if is_lw else 'rayleigh'
+    if (
+        backend.use_tpu_kernels()
+        and temperature.ndim > 0
+        and temperature.size > 0
+    ):
+      if temperature.ndim == 3:
+        nx, ny, nz = temperature.shape
+
+        def to_zc(x: Array) -> Array:
+          if jnp.ndim(x) == 0:
+            return x
+          x = jnp.broadcast_to(x, (nx, ny, nz))
+          return jnp.moveaxis(x, 2, 0).reshape(nz, nx * ny)
+
+        out_zc = self.compute_gas_optics_all_gpts(
+            to_zc(pressure),
+            to_zc(temperature),
+            to_zc(molecules),
+            None if vmr_fields is None else jax.tree.map(to_zc, vmr_fields),
+            is_lw=is_lw,
+        )
+        return {
+            k: jnp.moveaxis(v.reshape(v.shape[0], nz, nx, ny), 1, -1)
+            for k, v in out_zc.items()
+        }
+      with jax.named_scope('gas_optics'):
+        tau, other = gas_optics.compute_all_gpts_mxu(
+            lookup,
+            self.vmr_lib,
+            molecules,
+            temperature,
+            pressure,
+            vmr_fields,
+            is_lw=is_lw,
+            z_leading_output=z_leading_output,
+        )
+      return {'optical_depth': tau, second: other}
+
     interp = gas_optics.CellInterpolation(
         lookup, self.vmr_lib, temperature, pressure, vmr_fields
     )
@@ -531,6 +582,8 @@ class RRTMOptics(optics_base.OpticsScheme):
               lookup, self.vmr_lib, molecules, temperature, pressure,
               vmr_fields, interp=interp,
           )
+    if z_leading_output and temperature.ndim == 2:
+      out = {k: jnp.swapaxes(v, 0, 1) for k, v in out.items()}
     return out
 
   def gas_optical_properties_from_all_gpts(
@@ -1003,7 +1056,7 @@ class GrayAtmosphereOptics(optics_base.OpticsScheme):
   @property
   def solar_fraction_by_gpt(self) -> Array:
     """Mapping from g-point to the fraction of total solar radiation."""
-    return jnp.array([1.0], dtype=jnp.float_)
+    return jnp.array([1.0], dtype=float)
 
 
 def optics_factory(
